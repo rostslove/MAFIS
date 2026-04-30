@@ -1,228 +1,201 @@
+import json
 import logging
-import asyncio
+from typing import Dict, Any, Optional, Tuple
+
 from .base_agent import BaseAgent
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LinearRegression, Ridge, LogisticRegression
-from sklearn.svm import SVR, SVC
-from sklearn.ensemble import RandomForestClassifier
-from xgboost import XGBRegressor, XGBClassifier
+from .schemas import (
+    DataContext, FedotConfig, ArchitectResult, CriticFeedback,
+    ALL_PROBLEM_TYPES, is_ts_task,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class Architect(BaseAgent):
-    """Architect analyzes data and generates ML pipelines"""
-    
-    SYSTEM_PROMPT = """You are an ML Architect analyzing data for machine learning.
+    """Architect: analyzes data, selects baselines, proposes Fedot.Industrial config."""
 
-AVAILABLE PIPELINES:
+    ALLOWED_TOOLS = [
+        "get_data_profile", "get_available_baselines",
+        "get_available_operations", "propose_fedot_config", "mutate_fedot_config",
+    ]
 
-For Regression:
-- baseline_lr: LinearRegression with StandardScaler (simple, fast, good baseline)
-- ridge: Ridge regression with StandardScaler (regularized linear, handles multicollinearity)
-- svr: Support Vector Regression with StandardScaler (non-linear, good for complex patterns)
-- xgb_reg: XGBoost regression with StandardScaler (powerful ensemble, handles non-linearity well)
+    SYSTEM_PROMPT = """You are an ML Architect. Your job is to analyze a dataset and propose the best ML strategy.
 
-For Classification:
-- baseline_lr: LogisticRegression with StandardScaler (simple, fast, interpretable)
-- svc: Support Vector Classifier with StandardScaler (non-linear decision boundaries)
-- xgb_clf: XGBoost classifier with StandardScaler (powerful ensemble, handles imbalance)
-- rf: RandomForest classifier with StandardScaler (robust, good feature importance)
+You have access to MCP tools:
+1. get_data_profile - Analyze the dataset (statistics, issues, recommendations).
+2. get_available_baselines - Get sklearn baselines (only for classification/regression).
+3. get_available_operations - Get Fedot.Industrial models/preprocessing/strategies for ANY task type.
+4. propose_fedot_config - Propose a FedotIndustrial configuration with all parameters.
+5. mutate_fedot_config - Modify existing config based on Critic feedback.
 
-Analyze the data and provide:
+SUPPORTED TASK TYPES: classification, regression, ts_forecasting, ts_classification, ts_regression, anomaly_detection.
 
-ANALYSIS: What issues or patterns you see (missing values, class imbalance, data size, etc.)
+WORKFLOW:
+1. Call get_data_profile to understand the data.
+2. Call get_available_operations to see available models/strategies for this task.
+3. For classification/regression: call get_available_baselines.
+4. Call propose_fedot_config with your configuration.
+   - For ts_forecasting: MUST set task_params='{"forecast_length": N}'.
+   - Choose appropriate strategy (e.g. "forecasting_assumptions" for ts_forecasting).
+5. If previous feedback exists, call mutate_fedot_config to apply suggested changes.
 
-TASK: Is this regression or classification?
-
-SELECTED_PIPELINES: Which 2-3 pipelines you recommend (comma-separated: e.g., baseline_lr, xgb_reg)
-
-REASONING: Why these specific pipelines? Consider the data profile and issues.
+After using tools, provide:
+ANALYSIS: Your data analysis.
+REASONING: Why you chose this configuration.
 """
 
-    async def execute(self, profile, iteration, prev_feedback, task_type):
-        """
-        Execute architect analysis and generate pipelines
-        
-        Args:
-            X_train: Training features
-            y_train: Training target
-            profile: Data profile dict
-            iteration: Current iteration number
-            prev_feedback: Feedback from previous iteration
-            task_type: "regression" or "classification"
-        
-        Returns:
-            tuple: (pipelines dict, analysis dict with full_response)
-        """
-        try:
-            logger.info(f"[Architect] Iteration {iteration} starting")
-            
-            context = self._prepare_context(profile, iteration, prev_feedback, task_type)
-            response = await self.call_ollama(context)
-            
-            if not response.get("success"):
-                logger.warning("[Architect] LLM call failed, using fallback")
-                return self._get_pipelines(task_type), {
-                    "analysis": "Data analysis fallback",
-                    "task": task_type,
-                    "reasoning": "Fallback mode",
-                    "selected_pipelines": list(self._get_pipelines(task_type).keys())[:2],
-                    "expected": "Unknown",
-                    "full_response": "LLM failed - using fallback"
-                }
-            
-            text = response.get("full_response", "")
-            
-            parsed = {
-                "analysis": self.extract_field(text, "ANALYSIS"),
-                "task": self.extract_field(text, "TASK"),
-                "selected_pipelines": self.extract_pipelines(text, "SELECTED_PIPELINES", task_type),
-                "reasoning": self.extract_field(text, "REASONING"),
-                "expected": self.extract_field(text, "EXPECTED"),
-                "full_response": text  # Save full LLM response for display
-            }
-            
-            # Get only selected pipelines
-            all_pipelines = self._get_pipelines(task_type)
-            pipelines = {k: v for k, v in all_pipelines.items() if k in parsed["selected_pipelines"]}
-            
-            # If no valid pipelines selected, use all
-            if not pipelines:
-                pipelines = all_pipelines
-                parsed["selected_pipelines"] = list(all_pipelines.keys())
-            
-            logger.info(f"[Architect] Analysis complete. Selected {len(pipelines)} pipelines: {parsed['selected_pipelines']}")
-            
-            return pipelines, parsed
-        
-        except Exception as e:
-            logger.error(f"[Architect] Error: {str(e)}")
-            return self._get_pipelines(task_type), {
-                "analysis": f"Error: {str(e)}",
-                "error": str(e),
-                "full_response": f"Error: {str(e)}"
-            }
+    def __init__(self, name: str = "Architect", mcp_client=None):
+        super().__init__(name=name, mcp_client=mcp_client)
 
-    def _prepare_context(self, profile, iteration, prev_feedback, task_type):
-        """Prepare context for LLM"""
-        context = f"""Iteration: {iteration}
+    async def execute(
+        self,
+        data_context: DataContext,
+        iteration: int,
+        prev_feedback: Optional[CriticFeedback] = None,
+        task_type: str = "classification",
+    ) -> Tuple[Dict[str, Any], ArchitectResult]:
+        """Run the Architect agent. Returns (baselines_dict, ArchitectResult)."""
+        self._tool_call_log = []
+        result = ArchitectResult()
+
+        try:
+            logger.info(f"[Architect] Iteration {iteration}, task: {task_type}")
+            context = self._build_user_message(data_context, iteration, prev_feedback, task_type)
+            response = await self.call_llm(context)
+
+            if not response.get("success"):
+                logger.warning("[Architect] LLM failed, using fallback")
+                fb = self._fallback(data_context, task_type)
+                return fb.baseline_pipelines, fb
+
+            text = response.get("full_response", "")
+
+            # Extract Fedot config from tool call results
+            fedot_config = self._extract_fedot_config_from_log(task_type, data_context)
+            baselines = self._extract_baselines_from_log()
+
+            # If LLM didn't call get_available_baselines, use defaults for non-TS tasks
+            if not baselines and task_type in _DEFAULT_BASELINES:
+                default = _DEFAULT_BASELINES[task_type]
+                baselines = {name: {"model": info, "steps": []} for name, info in default.items()}
+                logger.info(f"[Architect] LLM didn't select baselines, using defaults: {list(baselines.keys())}")
+
+            result.fedot_config = fedot_config
+            result.baseline_pipelines = baselines
+            result.selected_baselines = list(baselines.keys()) if baselines else []
+            result.analysis = self.extract_field(text, "ANALYSIS") or text[:500]
+            result.reasoning = self.extract_field(text, "REASONING") or ""
+            result.tool_calls = self.get_tool_calls()
+
+            logger.info(f"[Architect] Done. Baselines: {result.selected_baselines}, Config: {fedot_config.to_dict() if fedot_config else 'default'}")
+            return baselines, result
+
+        except Exception as e:
+            logger.error(f"[Architect] Error: {e}")
+            fb = self._fallback(data_context, task_type)
+            return fb.baseline_pipelines, fb
+
+    def _build_user_message(self, dc: DataContext, iteration, prev_feedback, task_type):
+        profile = dc.profile
+        msg = f"""Iteration: {iteration}
 Task Type: {task_type}
+Is Time Series: {is_ts_task(task_type)}
+CSV Path: {dc.csv_path}
+Target Column: {dc.target_column}
 
 Data Profile:
 - Samples: {profile.get('n_samples', 'Unknown')}
 - Features: {profile.get('n_features', 'Unknown')}
-- Issues: {', '.join(profile.get('issues', []))}
-- Feature list: {', '.join(profile.get('features', [])[:5])}...
+- Issues: {', '.join(profile.get('issues', ['Unknown']))}
 """
-        
+        if dc.forecast_length:
+            msg += f"- Forecast Length: {dc.forecast_length}\n"
+
+        # Cross-iteration memory
+        if dc.iteration_history:
+            msg += "\nPREVIOUS ITERATIONS:\n"
+            for rec in dc.iteration_history:
+                msg += (
+                    f"  Iter {rec.iteration}: best={rec.best_model} ({rec.best_score:.4f}), "
+                    f"fedot={rec.fedot_score:.4f}, winner={rec.winner}"
+                )
+                if rec.failed_baselines:
+                    msg += f", FAILED: {rec.failed_baselines}"
+                msg += f", config={rec.fedot_config_used}\n"
+            msg += "\nAvoid repeating failed approaches. Build on what worked.\n"
+
+        msg += "\nPlease use tools to analyze data and propose configuration.\n"
+
         if prev_feedback:
-            context += f"\nPrevious iteration feedback: {prev_feedback}\n"
-        
-        context += "\nBased on this data profile, which pipelines would you select?"
-        return context
+            msg += f"""
+PREVIOUS ITERATION FEEDBACK:
+- Winner: {prev_feedback.winner}
+- Assessment: {prev_feedback.score_assessment}
+- Suggested Fedot changes: {json.dumps(prev_feedback.suggested_fedot_changes)}
+- Weaknesses: {prev_feedback.weaknesses}
 
-    def _get_pipelines(self, task_type):
-        """Get ML pipelines based on task type"""
-        
-        if task_type == "regression":
-            return {
-                "baseline_lr": Pipeline([
-                    ("scaler", StandardScaler()),
-                    ("model", LinearRegression())
-                ]),
-                "ridge": Pipeline([
-                    ("scaler", StandardScaler()),
-                    ("model", Ridge(alpha=1.0))
-                ]),
-                "svr": Pipeline([
-                    ("scaler", StandardScaler()),
-                    ("model", SVR(kernel='rbf'))
-                ]),
-                "xgb_reg": Pipeline([
-                    ("scaler", StandardScaler()),
-                    ("model", XGBRegressor(n_estimators=100, random_state=42))
-                ])
-            }
-        
-        else:  # classification
-            return {
-                "baseline_lr": Pipeline([
-                    ("scaler", StandardScaler()),
-                    ("model", LogisticRegression(max_iter=1000))
-                ]),
-                "svc": Pipeline([
-                    ("scaler", StandardScaler()),
-                    ("model", SVC(probability=True))
-                ]),
-                "xgb_clf": Pipeline([
-                    ("scaler", StandardScaler()),
-                    ("model", XGBClassifier(n_estimators=100, random_state=42))
-                ]),
-                "rf": Pipeline([
-                    ("scaler", StandardScaler()),
-                    ("model", RandomForestClassifier(n_estimators=100, random_state=42))
-                ])
-            }
+Use mutate_fedot_config to apply the suggested changes.
+"""
+        return msg
 
-    def extract_field(self, text, field_name):
-        """Extract field from LLM response"""
-        try:
-            if field_name not in text:
-                return "N/A"
-            
-            start = text.find(field_name) + len(field_name)
-            # Skip colon and whitespace
-            while start < len(text) and text[start] in ":\n \t":
-                start += 1
-            
-            # Find end (next double newline or field name)
-            end = text.find("\n\n", start)
-            if end == -1:
-                end = text.find("\n", start + 1)
-            if end == -1:
-                end = len(text)
-            
-            result = text[start:end].strip()
-            return result[:500] if result else "N/A"
-        except Exception as e:
-            logger.warning(f"[Architect] Failed to extract {field_name}: {e}")
-            return "N/A"
+    def _extract_fedot_config_from_log(self, task_type, dc):
+        """Extract FedotConfig from tool call results in the log."""
+        for tc in self._tool_call_log:
+            if tc.tool_name in ("propose_fedot_config", "mutate_fedot_config") and tc.success:
+                result = tc.result
+                if isinstance(result, dict):
+                    cfg = result.get("fedot_config") or result.get("new_config")
+                    if cfg:
+                        return FedotConfig.from_dict(cfg)
 
-    def extract_pipelines(self, text, field_name, task_type):
-        """Extract pipeline names from LLM response"""
-        try:
-            if field_name not in text:
-                return []
-            
-            start = text.find(field_name) + len(field_name)
-            # Skip colon and whitespace
-            while start < len(text) and text[start] in ":\n \t":
-                start += 1
-            
-            # Find end
-            end = text.find("\n\n", start)
-            if end == -1:
-                end = text.find("\n", start + 1)
-            if end == -1:
-                end = len(text)
-            
-            section = text[start:end].strip()
-            
-            # Get valid pipeline names for this task
-            all_pipelines = self._get_pipelines(task_type)
-            valid_names = set(all_pipelines.keys())
-            
-            # Parse comma-separated or line-separated names
-            items = []
-            for part in section.split(","):
-                name = part.strip().lower()
-                if name in valid_names:
-                    items.append(name)
-            
-            return items if items else []
-        
-        except Exception as e:
-            logger.warning(f"[Architect] Failed to extract pipelines: {e}")
-            return []
+        # Default config
+        config = FedotConfig(problem=task_type)
+        if task_type == "ts_forecasting" and dc.forecast_length:
+            config.task_params = {"forecast_length": dc.forecast_length}
+        return config
+
+    def _extract_baselines_from_log(self):
+        """Extract baseline pipeline names from tool call results."""
+        for tc in self._tool_call_log:
+            if tc.tool_name == "get_available_baselines" and tc.success:
+                result = tc.result
+                if isinstance(result, dict):
+                    pipelines = result.get("pipelines", {})
+                    # Return pipeline names as dict (actual Pipeline objects are in MCP server)
+                    return {name: info for name, info in pipelines.items()}
+        return {}
+
+    def _fallback(self, dc, task_type):
+        config = FedotConfig(problem=task_type)
+        if task_type == "ts_forecasting" and dc.forecast_length:
+            config.task_params = {"forecast_length": dc.forecast_length}
+
+        # Include default sklearn baselines for classification/regression
+        baselines = _DEFAULT_BASELINES.get(task_type, {})
+
+        result = ArchitectResult(
+            baseline_pipelines={name: {"model": info, "steps": []} for name, info in baselines.items()},
+            selected_baselines=list(baselines.keys()),
+            fedot_config=config,
+            analysis="Fallback: LLM unavailable, using all default baselines",
+            reasoning="Default configuration",
+            tool_calls=self.get_tool_calls(),
+        )
+        return result
+
+
+# Default baselines used by fallback path. Matches mcp_server.py _get_pipelines().
+_DEFAULT_BASELINES = {
+    "classification": {
+        "baseline_lr": "LogisticRegression",
+        "svc": "SVC",
+        "xgb_clf": "XGBClassifier",
+        "rf": "RandomForest",
+    },
+    "regression": {
+        "baseline_lr": "LinearRegression",
+        "ridge": "Ridge",
+        "svr": "SVR",
+        "xgb_reg": "XGBRegressor",
+    },
+}
