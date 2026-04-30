@@ -1,155 +1,160 @@
-import json
 import logging
 import os
-from typing import Dict, Any, List, Optional, Callable, AsyncGenerator
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
+from typing import Any, AsyncGenerator, Dict, Optional
+
 import pandas as pd
 
-from agents import Architect, Engineer, Critic, Scribe, DataContext, FedotConfig, CriticFeedback
-from agents.schemas import is_ts_task, ALL_PROBLEM_TYPES, IterationRecord
+from agents import Architect, ArchitectResult, Critic, CriticFeedback, DataContext, Engineer, IterationRecord, Scribe
 from data_profiler import DataProfiler
+from graph_engine import SUPPORTED_TASKS, PipelineGraph, is_ts_task
 from mcp_client import MCPToolClient
 
 logger = logging.getLogger("Orchestrator")
+
+
+def _event(event_type: str, **data) -> Dict[str, Any]:
+    return {"event": event_type, **data}
+
+
+def _profile_data(csv_path: str, target_column: str, task_type: str, forecast_length: Optional[int]) -> Dict[str, Any]:
+    df = pd.read_csv(csv_path)
+    if target_column not in df.columns:
+        raise ValueError(f"Target '{target_column}' not found")
+
+    X = df.drop(columns=[target_column])
+    y = df[target_column]
+    profile = DataProfiler.profile(X=X, y=y, task_type=task_type)
+    profile["is_time_series"] = is_ts_task(task_type)
+    if forecast_length:
+        profile["forecast_length"] = forecast_length
+    return profile
+
+
+async def _connect_mcp() -> MCPToolClient:
+    client = MCPToolClient()
+    server_script = os.path.join(os.path.dirname(__file__), "mcp_server.py")
+    await client.connect(server_script=server_script)
+    return client
 
 
 async def run_orchestration_stream(
     csv_path: str,
     target_column: str,
     task_type: str = "classification",
-    fedot_url: str = "http://fedot-server:8000",
+    fedot_url: str = "",
     iterations: int = 2,
+    initial_graph: Optional[Dict[str, Any]] = None,
     initial_fedot_config: Optional[Dict[str, Any]] = None,
     forecast_length: Optional[int] = None,
 ) -> AsyncGenerator[Dict[str, Any], None]:
-    """
-    Streaming orchestration — yields progress events as SSE.
+    """Run Architect -> Engineer -> Critic iterations and yield SSE-friendly events."""
+    del fedot_url, initial_fedot_config
 
-    Event types:
-      - status: general status message
-      - agent_start: agent begins work
-      - agent_done: agent finished with summary
-      - tool_call: MCP tool was called
-      - iteration_done: iteration completed with results
-      - error: something failed
-      - complete: orchestration finished, final result attached
-    """
-
-    def event(event_type: str, **data) -> Dict[str, Any]:
-        return {"event": event_type, **data}
-
-    # ============== VALIDATE ==============
-    if task_type not in ALL_PROBLEM_TYPES:
-        yield event("error", message=f"Unknown task type: {task_type}")
+    if task_type not in SUPPORTED_TASKS:
+        yield _event("error", message=f"Unknown task type: {task_type}. Available: {SUPPORTED_TASKS}")
         return
     if task_type == "ts_forecasting" and not forecast_length:
-        yield event("error", message="ts_forecasting requires forecast_length")
+        yield _event("error", message="ts_forecasting requires forecast_length")
         return
 
-    yield event("status", message="Loading data...")
-
-    # ============== LOAD DATA ==============
     try:
-        df = pd.read_csv(csv_path)
-    except Exception as e:
-        yield event("error", message=f"Failed to load CSV: {e}")
+        yield _event("status", message="Loading and profiling data...")
+        profile = _profile_data(csv_path, target_column, task_type, forecast_length)
+    except Exception as exc:
+        yield _event("error", message=f"Failed to load data: {exc}")
         return
-
-    if target_column not in df.columns:
-        yield event("error", message=f"Target '{target_column}' not found")
-        return
-
-    y = df[target_column]
-    X = df.drop(columns=[target_column])
-
-    if task_type in ("classification", "ts_classification") and y.dtype == "object":
-        y = pd.Series(LabelEncoder().fit_transform(y), name=target_column)
-
-    if task_type == "ts_forecasting":
-        idx = int(len(X) * 0.8)
-        X_train, X_val = X.iloc[:idx], X.iloc[idx:]
-        y_train, y_val = y.iloc[:idx], y.iloc[idx:]
-    else:
-        stratify = y if task_type in ("classification", "ts_classification") else None
-        X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42, stratify=stratify)
-
-    yield event("status", message=f"Data loaded: {len(X_train)} train, {len(X_val)} val")
-
-    # ============== PROFILE ==============
-    profile = DataProfiler.profile(X=X_train, y=y_train, task_type=task_type)
-    profile["is_time_series"] = is_ts_task(task_type)
-    if forecast_length:
-        profile["forecast_length"] = forecast_length
-
-    yield event("status", message=f"Data profiled. Issues: {profile.get('issues', [])}")
 
     data_context = DataContext(
-        csv_path=csv_path, target_column=target_column, task_type=task_type,
-        profile=profile, n_train_samples=len(X_train), n_val_samples=len(X_val),
-        forecast_length=forecast_length, is_time_series=is_ts_task(task_type),
+        csv_path=csv_path,
+        target_column=target_column,
+        task_type=task_type,
+        profile=profile,
+        forecast_length=forecast_length,
+    )
+    yield _event(
+        "status",
+        message=f"Data profiled: {profile.get('n_samples')} samples, {profile.get('n_features')} numeric features",
     )
 
-    # ============== MCP CLIENT ==============
-    mcp_client = MCPToolClient()
+    mcp_client: Optional[MCPToolClient] = None
     try:
-        server_script = os.path.join(os.path.dirname(__file__), "mcp_server.py")
-        await mcp_client.connect(server_script=server_script, fedot_url=fedot_url)
-        yield event("status", message="MCP server connected")
-    except Exception as e:
-        yield event("error", message=f"MCP connection failed: {e}")
-        return
+        mcp_client = await _connect_mcp()
+        yield _event("status", message="MCP graph tools connected")
 
-    try:
-        architect = Architect(name="Architect", mcp_client=mcp_client)
-        engineer = Engineer(name="Engineer", mcp_client=mcp_client)
-        critic = Critic(name="Critic", mcp_client=mcp_client)
-        scribe = Scribe(name="Scribe", mcp_client=mcp_client)
+        architect = Architect(mcp_client=mcp_client)
+        engineer = Engineer(mcp_client=mcp_client)
+        critic = Critic(mcp_client=mcp_client)
+        scribe = Scribe(mcp_client=mcp_client)
 
         all_results = []
         prev_feedback: Optional[CriticFeedback] = None
+        prev_graph = initial_graph
+        approved_initial: Optional[ArchitectResult] = None
 
-        # ============== ITERATION LOOP ==============
-        for iteration in range(1, iterations + 1):
-            yield event("status", message=f"Iteration {iteration}/{iterations}")
+        if initial_graph:
+            graph = PipelineGraph.from_dict(initial_graph)
+            ok, message = graph.validate()
+            if not ok:
+                yield _event("error", message=f"Initial graph is invalid: {message}")
+                return
+            approved_initial = ArchitectResult(
+                graph=graph.to_dict(),
+                mermaid=graph.to_mermaid(),
+                analysis="User-approved initial graph",
+                reasoning="The first iteration trains the approved graph without structural changes.",
+            )
+
+        for iteration in range(1, max(1, iterations) + 1):
+            yield _event("status", message=f"Iteration {iteration}/{iterations}")
 
             try:
-                # 1. ARCHITECT
-                yield event("agent_start", agent="Architect", iteration=iteration, step="1/3")
-                baselines, architect_result = await architect.execute(data_context, iteration, prev_feedback, task_type)
-
-                # Force-merge Critic feedback
-                if prev_feedback and prev_feedback.suggested_fedot_changes and architect_result.fedot_config:
-                    for key, value in prev_feedback.suggested_fedot_changes.items():
-                        if hasattr(architect_result.fedot_config, key):
-                            setattr(architect_result.fedot_config, key, value)
-
-                fc = architect_result.fedot_config
-                yield event("agent_done", agent="Architect", iteration=iteration,
-                            summary=f"Baselines: {architect_result.selected_baselines}, Fedot preset: {fc.preset if fc else 'N/A'}",
-                            tool_calls_count=len(architect_result.tool_calls))
-
-                # 2. ENGINEER
-                yield event("agent_start", agent="Engineer", iteration=iteration, step="2/3")
-                engineer_result = await engineer.execute(architect_result, data_context)
-
-                baseline_summary = ", ".join(
-                    f"{r.name}={r.score:.3f}" for r in engineer_result.baseline_results if r.score > 0
+                yield _event("agent_start", agent="Architect", iteration=iteration, step="1/3")
+                if iteration == 1 and approved_initial:
+                    architect_result = approved_initial
+                else:
+                    architect_result = await architect.execute(
+                        data_context=data_context,
+                        iteration=iteration,
+                        prev_feedback=prev_feedback,
+                        prev_graph=prev_graph,
+                    )
+                yield _event(
+                    "agent_done",
+                    agent="Architect",
+                    iteration=iteration,
+                    summary=f"Graph nodes: {len(architect_result.graph.get('nodes', []))}",
+                    graph=architect_result.graph,
+                    mermaid=architect_result.mermaid,
+                    tool_calls_count=len(architect_result.tool_calls),
                 )
-                fedot_score = engineer_result.fedot_result.get("score", 0)
-                yield event("agent_done", agent="Engineer", iteration=iteration,
-                            summary=f"Baselines: [{baseline_summary}], Fedot: {fedot_score:.4f}, Best: {engineer_result.best_model}",
-                            tool_calls_count=len(engineer_result.tool_calls))
 
-                # 3. CRITIC
-                yield event("agent_start", agent="Critic", iteration=iteration, step="3/3")
-                critic_result = await critic.execute(engineer_result, data_context, iteration)
+                yield _event("agent_start", agent="Engineer", iteration=iteration, step="2/3")
+                engineer_result = await engineer.execute(architect_result, data_context)
+                yield _event(
+                    "agent_done",
+                    agent="Engineer",
+                    iteration=iteration,
+                    summary=(
+                        f"Graph score: {engineer_result.graph_score:.4f}; "
+                        f"best baseline: {engineer_result.best_baseline_name or 'none'} "
+                        f"{engineer_result.best_baseline_score:.4f}"
+                    ),
+                    tool_calls_count=len(engineer_result.tool_calls),
+                )
 
-                yield event("agent_done", agent="Critic", iteration=iteration,
-                            summary=f"Winner: {critic_result.winner}, Stop: {critic_result.should_stop}, Changes: {critic_result.suggested_fedot_changes}",
-                            tool_calls_count=len(critic_result.tool_calls))
+                yield _event("agent_start", agent="Critic", iteration=iteration, step="3/3")
+                critic_result = await critic.execute(architect_result, engineer_result, data_context, iteration)
+                yield _event(
+                    "agent_done",
+                    agent="Critic",
+                    iteration=iteration,
+                    summary=(
+                        f"Winner: {critic_result.winner}; stop={critic_result.should_stop}; "
+                        f"mutations={len(critic_result.suggested_mutations)}"
+                    ),
+                    tool_calls_count=len(critic_result.tool_calls),
+                )
 
-                # Store results
                 iter_data = {
                     "iteration": iteration,
                     "architect": architect_result.to_dict(),
@@ -157,56 +162,57 @@ async def run_orchestration_stream(
                     "critic": critic_result.to_dict(),
                 }
                 all_results.append(iter_data)
+                data_context.iteration_history.append(
+                    IterationRecord(
+                        iteration=iteration,
+                        graph=architect_result.graph,
+                        graph_score=engineer_result.graph_score,
+                        best_baseline_score=engineer_result.best_baseline_score,
+                        winner=critic_result.winner,
+                        suggested_mutations=critic_result.suggested_mutations,
+                    )
+                )
 
-                # Record for history
-                failed_bl = [r.name for r in engineer_result.baseline_results if r.error]
-                data_context.iteration_history.append(IterationRecord(
+                yield _event(
+                    "iteration_done",
                     iteration=iteration,
-                    best_model=engineer_result.best_model,
-                    best_score=engineer_result.best_score,
-                    fedot_score=engineer_result.fedot_result.get("score", 0),
-                    fedot_config_used=engineer_result.fedot_config_used.to_dict() if engineer_result.fedot_config_used else {},
+                    graph_score=engineer_result.graph_score,
+                    best_baseline_score=engineer_result.best_baseline_score,
                     winner=critic_result.winner,
-                    suggested_changes=critic_result.suggested_fedot_changes,
-                    failed_baselines=failed_bl,
-                ))
-
-                yield event("iteration_done", iteration=iteration,
-                            best_score=engineer_result.best_score,
-                            best_model=engineer_result.best_model,
-                            winner=critic_result.winner)
+                    graph=architect_result.graph,
+                    mermaid=architect_result.mermaid,
+                )
 
                 prev_feedback = critic_result
+                prev_graph = architect_result.graph
 
-                # Stop criteria
                 if critic_result.should_stop:
-                    yield event("status", message=f"Early stop: Critic recommends stopping")
+                    yield _event("status", message="Early stop: Critic accepted the graph")
                     break
 
-                history = data_context.iteration_history
-                if len(history) >= 2:
-                    improvement = history[-1].best_score - history[-2].best_score
-                    if improvement < 0.001 and history[-1].best_score > 0:
-                        yield event("status", message=f"Early stop: No improvement (delta={improvement:.4f})")
+                if len(data_context.iteration_history) >= 2:
+                    last = data_context.iteration_history[-1]
+                    before = data_context.iteration_history[-2]
+                    if abs(last.graph_score - before.graph_score) < 0.001 and last.graph_score > 0:
+                        yield _event("status", message="Early stop: graph score plateaued")
                         break
 
-            except Exception as e:
-                logger.error(f"Iteration {iteration} failed: {e}", exc_info=True)
-                all_results.append({"iteration": iteration, "error": str(e), "status": "failed"})
-                yield event("error", message=f"Iteration {iteration} failed: {str(e)[:200]}")
+            except Exception as exc:
+                logger.exception("Iteration %s failed", iteration)
+                all_results.append({"iteration": iteration, "error": str(exc), "status": "failed"})
+                yield _event("error", message=f"Iteration {iteration} failed: {str(exc)[:200]}")
 
-        # ============== SCRIBE ==============
-        yield event("agent_start", agent="Scribe", iteration=0, step="final")
-        try:
-            scribe_result = await scribe.execute(all_results, data_context)
-            report = scribe_result.to_dict()
-        except Exception as e:
-            report = {"title": "Report failed", "error": str(e)}
-        yield event("agent_done", agent="Scribe", iteration=0, summary=f"Report: {report.get('title', 'N/A')}")
+        yield _event("agent_start", agent="Scribe", iteration=0, step="final")
+        scribe_result = await scribe.execute(all_results, data_context)
+        yield _event(
+            "agent_done",
+            agent="Scribe",
+            iteration=0,
+            summary=f"Report: {scribe_result.title}",
+            tool_calls_count=len(scribe_result.tool_calls),
+        )
 
         mcp_tools = await mcp_client.list_tools()
-
-        # Final result
         final_result = {
             "status": "success",
             "task_type": task_type,
@@ -216,64 +222,136 @@ async def run_orchestration_stream(
             "iterations": all_results,
             "best_iteration": _get_best_iteration(all_results),
             "summary": _create_summary(all_results, task_type),
-            "report": report,
+            "report": scribe_result.to_dict(),
             "mcp_tools": mcp_tools,
         }
-
-        yield event("complete", result=final_result)
+        yield _event("complete", result=final_result)
 
     finally:
-        await mcp_client.cleanup()
+        if mcp_client:
+            await mcp_client.cleanup()
 
 
-# Keep non-streaming version for backward compatibility
 async def run_orchestration(
     csv_path: str,
     target_column: str,
     task_type: str = "classification",
-    fedot_url: str = "http://fedot-server:8000",
+    fedot_url: str = "",
     iterations: int = 2,
+    initial_graph: Optional[Dict[str, Any]] = None,
     initial_fedot_config: Optional[Dict[str, Any]] = None,
     forecast_length: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Non-streaming wrapper — collects all events and returns final result."""
-    final_result = {"error": "No result", "status": "failed"}
+    """Collect streaming events and return the final result."""
+    final_result: Dict[str, Any] = {"status": "failed", "error": "No result"}
     async for evt in run_orchestration_stream(
-        csv_path, target_column, task_type, fedot_url, iterations,
-        initial_fedot_config, forecast_length,
+        csv_path=csv_path,
+        target_column=target_column,
+        task_type=task_type,
+        fedot_url=fedot_url,
+        iterations=iterations,
+        initial_graph=initial_graph,
+        initial_fedot_config=initial_fedot_config,
+        forecast_length=forecast_length,
     ):
         if evt.get("event") == "complete":
             final_result = evt.get("result", final_result)
-        elif evt.get("event") == "error" and "result" not in final_result:
-            final_result = {"error": evt.get("message", "Unknown error"), "status": "failed"}
+        elif evt.get("event") == "error" and final_result.get("status") == "failed":
+            final_result = {"status": "failed", "error": evt.get("message", "Unknown error")}
     return final_result
 
 
+async def propose_architecture(
+    csv_path: str,
+    target_column: str,
+    task_type: str,
+    message: str = "",
+    current_graph: Optional[Dict[str, Any]] = None,
+    forecast_length: Optional[int] = None,
+) -> Dict[str, Any]:
+    """One-shot Architect interaction for the frontend graph approval flow."""
+    if task_type not in SUPPORTED_TASKS:
+        return {"error": f"Unknown task type: {task_type}"}
+
+    profile = _profile_data(csv_path, target_column, task_type, forecast_length)
+    data_context = DataContext(
+        csv_path=csv_path,
+        target_column=target_column,
+        task_type=task_type,
+        profile=profile,
+        forecast_length=forecast_length,
+    )
+
+    mcp_client = await _connect_mcp()
+    try:
+        architect = Architect(mcp_client=mcp_client)
+        feedback = None
+        if message:
+            feedback = CriticFeedback(
+                winner="user",
+                weaknesses=[message],
+                suggested_mutations=[],
+            )
+        result = await architect.execute(
+            data_context=data_context,
+            iteration=1,
+            prev_feedback=feedback,
+            prev_graph=current_graph,
+        )
+        return {
+            "profile": profile,
+            "graph": result.graph,
+            "mermaid": result.mermaid,
+            "analysis": result.analysis,
+            "reasoning": result.reasoning,
+            "tool_calls": [tc.to_dict() for tc in result.tool_calls],
+        }
+    finally:
+        await mcp_client.cleanup()
+
+
+def mutate_graph_locally(graph: Dict[str, Any], mutation: Dict[str, Any]) -> Dict[str, Any]:
+    pipeline_graph = PipelineGraph.from_dict(graph)
+    mutated = pipeline_graph.apply_mutation(mutation)
+    ok, message = mutated.validate()
+    return {
+        "valid": ok,
+        "message": message,
+        "graph": mutated.to_dict(),
+        "mermaid": mutated.to_mermaid() if ok else "",
+    }
+
+
 def _get_best_iteration(all_results):
-    best, best_score = None, -1
-    for r in all_results:
-        if "error" not in r:
-            score = r.get("engineer", {}).get("best_score", -1)
-            if score > best_score:
-                best_score, best = score, r
+    best, best_score = None, -1.0
+    for item in all_results:
+        if "error" in item:
+            continue
+        score = float(item.get("engineer", {}).get("graph_score", 0) or 0)
+        if score > best_score:
+            best_score = score
+            best = item
     return best or (all_results[-1] if all_results else {})
 
 
 def _create_summary(all_results, task_type):
-    ok = [r for r in all_results if "error" not in r]
+    ok = [item for item in all_results if "error" not in item]
     if not ok:
-        return {"status": "no successful iterations"}
-    a_scores = [r.get("engineer", {}).get("best_score", 0) for r in ok]
-    f_scores = [r.get("engineer", {}).get("fedot_result", {}).get("score", 0) for r in ok]
+        return {"status": "no successful iterations", "task_type": task_type}
+
+    graph_scores = [float(item.get("engineer", {}).get("graph_score", 0) or 0) for item in ok]
+    baseline_scores = [float(item.get("engineer", {}).get("best_baseline_score", 0) or 0) for item in ok]
     return {
         "total_iterations": len(all_results),
         "successful_iterations": len(ok),
         "task_type": task_type,
         "is_time_series": is_ts_task(task_type),
-        "avg_architect_score": sum(a_scores) / len(a_scores),
-        "avg_fedot_score": sum(f_scores) / len(f_scores),
-        "max_architect_score": max(a_scores),
-        "max_fedot_score": max(f_scores),
-        "architect_wins_count": sum(1 for r in ok if r.get("engineer", {}).get("comparison", {}).get("architect_wins", False)),
-        "early_stopped": any(r.get("critic", {}).get("should_stop", False) for r in ok),
+        "avg_graph_score": sum(graph_scores) / len(graph_scores),
+        "avg_baseline_score": sum(baseline_scores) / len(baseline_scores),
+        "max_graph_score": max(graph_scores),
+        "max_baseline_score": max(baseline_scores),
+        "graph_wins_count": sum(
+            1 for item in ok if item.get("critic", {}).get("winner") == "graph"
+        ),
+        "early_stopped": any(item.get("critic", {}).get("should_stop", False) for item in ok),
     }

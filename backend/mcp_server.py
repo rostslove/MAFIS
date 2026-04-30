@@ -1,82 +1,91 @@
 """
-MCP Server for Industrial Learning Agent.
+MCP server hosting all tools for the GraphAutoML multi-agent system.
 
-Single server exposing ALL tools: data profiling, sklearn baselines,
-Fedot.Industrial (via proxy to fedot-server), analysis, config, reporting.
-
-Run with: python mcp_server.py (stdio transport)
+Tools call Fedot.Industrial directly (no HTTP proxy). Run with:
+    python mcp_server.py
 """
 
-import sys
+import json
+import logging
 import os
+import sys
+from typing import Any, Dict, List, Optional
 
-# Ensure backend directory is on path (for subprocess execution)
+# Make backend importable when launched as subprocess
 _backend_dir = os.path.dirname(os.path.abspath(__file__))
 if _backend_dir not in sys.path:
     sys.path.insert(0, _backend_dir)
 
-import json
-import logging
-from typing import Optional
-
 import numpy as np
 import pandas as pd
-import requests
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LinearRegression, Ridge, LogisticRegression
-from sklearn.svm import SVR, SVC
+from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from xgboost import XGBRegressor, XGBClassifier
-from sklearn.metrics import (
-    roc_auc_score, precision_score, recall_score, f1_score,
-    r2_score, mean_squared_error, mean_absolute_error,
-)
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.pipeline import Pipeline as SkPipeline
 from sklearn.model_selection import train_test_split
+from xgboost import XGBClassifier, XGBRegressor
 
 from mcp.server.fastmcp import FastMCP
 
 from data_profiler import DataProfiler
-from agents.schemas import (
-    AVAILABLE_OPERATIONS, INDUSTRIAL_STRATEGIES, METRICS_BY_TASK,
-    ALL_PROBLEM_TYPES, TS_PROBLEM_TYPES, is_ts_task,
+from graph_engine import (
+    OPERATIONS, METRICS_BY_TASK, SUPPORTED_TASKS, DEFAULT_GRAPHS,
+    PipelineGraph, compute_metrics, is_ts_task,
+    load_input_data, split_input_data,
 )
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("MCP-Server")
+logger = logging.getLogger("MCP")
 
-FEDOT_URL = os.environ.get("FEDOT_URL", os.environ.get("FEDOT_HOST", "http://fedot-server:8000"))
-
-mcp = FastMCP("IndustrialLearningTools")
+mcp = FastMCP("GraphAutoMLTools")
 
 
-# ============== SKLEARN PIPELINES REGISTRY ==============
+# ============== Trained-model store (single-process) ==============
 
-def _get_pipelines(task_type: str) -> dict:
-    if task_type == "regression":
+_LAST: Dict[str, Any] = {"pipeline": None, "graph": None, "input_data": None, "predictions": None}
+
+
+def _store_run(pipeline, graph, input_data, predictions) -> None:
+    _LAST["pipeline"] = pipeline
+    _LAST["graph"] = graph
+    _LAST["input_data"] = input_data
+    _LAST["predictions"] = predictions
+
+
+def _predict_pipeline(pipeline, data, task_type: str) -> np.ndarray:
+    if task_type in ("classification", "ts_classification"):
+        try:
+            return np.asarray(pipeline.predict(data, output_mode="labels").predict)
+        except Exception:
+            pass
+    return np.asarray(pipeline.predict(data).predict)
+
+
+# ============== Sklearn baselines ==============
+
+def _baselines(task_type: str) -> Dict[str, SkPipeline]:
+    if task_type in ("classification", "ts_classification"):
         return {
-            "baseline_lr": ("LinearRegression", Pipeline([("scaler", StandardScaler()), ("model", LinearRegression())])),
-            "ridge": ("Ridge", Pipeline([("scaler", StandardScaler()), ("model", Ridge(alpha=1.0))])),
-            "svr": ("SVR", Pipeline([("scaler", StandardScaler()), ("model", SVR(kernel="rbf"))])),
-            "xgb_reg": ("XGBRegressor", Pipeline([("scaler", StandardScaler()), ("model", XGBRegressor(n_estimators=100, random_state=42))])),
+            "logreg": SkPipeline([("scaler", StandardScaler()), ("model", LogisticRegression(max_iter=1000))]),
+            "rf": SkPipeline([("scaler", StandardScaler()), ("model", RandomForestClassifier(n_estimators=100, random_state=42))]),
+            "xgb": SkPipeline([("scaler", StandardScaler()), ("model", XGBClassifier(n_estimators=100, random_state=42))]),
         }
-    elif task_type == "classification":
+    if task_type in ("regression", "ts_regression"):
         return {
-            "baseline_lr": ("LogisticRegression", Pipeline([("scaler", StandardScaler()), ("model", LogisticRegression(max_iter=1000))])),
-            "svc": ("SVC", Pipeline([("scaler", StandardScaler()), ("model", SVC(probability=True))])),
-            "xgb_clf": ("XGBClassifier", Pipeline([("scaler", StandardScaler()), ("model", XGBClassifier(n_estimators=100, random_state=42))])),
-            "rf": ("RandomForest", Pipeline([("scaler", StandardScaler()), ("model", RandomForestClassifier(n_estimators=100, random_state=42))])),
+            "ridge": SkPipeline([("scaler", StandardScaler()), ("model", Ridge(alpha=1.0))]),
+            "rf": SkPipeline([("scaler", StandardScaler()), ("model", RandomForestRegressor(n_estimators=100, random_state=42))]),
+            "xgb": SkPipeline([("scaler", StandardScaler()), ("model", XGBRegressor(n_estimators=100, random_state=42))]),
         }
     return {}
 
 
 # ================================================================
-#                     DATA PROFILING TOOLS
+#                          DATA / OPERATIONS
 # ================================================================
 
 @mcp.tool()
 def get_data_profile(csv_path: str, target_column: str, task_type: str = "classification") -> str:
-    """Profile a CSV dataset: statistics, issues, recommendations. Returns JSON with n_samples, n_features, issues, recommendations."""
+    """Profile a CSV: returns JSON with n_samples, n_features, issues, recommendations."""
     try:
         df = pd.read_csv(csv_path)
         y = df[target_column] if target_column in df.columns else None
@@ -88,403 +97,387 @@ def get_data_profile(csv_path: str, target_column: str, task_type: str = "classi
         return json.dumps({"error": str(e)})
 
 
-# ================================================================
-#                     BASELINE TOOLS
-# ================================================================
-
-@mcp.tool()
-def get_available_baselines(task_type: str) -> str:
-    """Get available sklearn baseline pipelines for classification or regression. Returns JSON with pipeline names and model types. Not available for time series tasks."""
-    if is_ts_task(task_type):
-        return json.dumps({"note": f"Sklearn baselines not available for '{task_type}'. Use Fedot.Industrial via call_fedot.", "pipelines": {}})
-
-    pipelines = _get_pipelines(task_type)
-    info = {name: {"model": model_name, "steps": ["StandardScaler", model_name]} for name, (model_name, _) in pipelines.items()}
-    return json.dumps({"task_type": task_type, "pipelines": info})
-
-
-@mcp.tool()
-def train_baseline(
-    csv_path: str,
-    target_column: str,
-    pipeline_name: str,
-    task_type: str = "classification",
-    test_size: float = 0.2,
-) -> str:
-    """Train a sklearn baseline pipeline by name. Returns JSON with score and metrics (roc_auc/f1 for classification, r2/mse for regression)."""
-    try:
-        if is_ts_task(task_type):
-            return json.dumps({"error": f"Baselines not available for '{task_type}'", "score": 0})
-
-        pipelines = _get_pipelines(task_type)
-        if pipeline_name not in pipelines:
-            return json.dumps({"error": f"Unknown pipeline '{pipeline_name}'. Available: {list(pipelines.keys())}", "score": 0})
-
-        df = pd.read_csv(csv_path)
-        y = df[target_column]
-        X = df.drop(columns=[target_column])
-
-        # Encode if needed
-        if task_type == "classification" and y.dtype == "object":
-            from sklearn.preprocessing import LabelEncoder
-            y = pd.Series(LabelEncoder().fit_transform(y))
-
-        X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=test_size, random_state=42)
-
-        _, pipe = pipelines[pipeline_name]
-        pipe.fit(X_train, y_train)
-        y_pred = pipe.predict(X_val)
-
-        metrics = {}
-        if task_type == "classification":
-            y_proba = y_pred
-            if hasattr(pipe, "predict_proba"):
-                try:
-                    y_proba = pipe.predict_proba(X_val)[:, 1]
-                except Exception:
-                    pass
-            score = float(roc_auc_score(y_val, y_proba))
-            metrics = {
-                "roc_auc": score,
-                "precision": float(precision_score(y_val, y_pred, zero_division=0)),
-                "recall": float(recall_score(y_val, y_pred, zero_division=0)),
-                "f1": float(f1_score(y_val, y_pred, zero_division=0)),
-            }
-        else:
-            score = float(r2_score(y_val, y_pred))
-            mse = float(mean_squared_error(y_val, y_pred))
-            metrics = {"r2": score, "mse": mse, "rmse": float(np.sqrt(mse)), "mae": float(mean_absolute_error(y_val, y_pred))}
-
-        return json.dumps({"name": pipeline_name, "score": score, "metrics": metrics})
-
-    except Exception as e:
-        return json.dumps({"name": pipeline_name, "score": 0, "error": str(e)})
-
-
-# ================================================================
-#                  FEDOT.INDUSTRIAL TOOLS (proxy)
-# ================================================================
-
 @mcp.tool()
 def get_available_operations(task_type: str) -> str:
-    """Get available Fedot.Industrial operations (models, preprocessing, strategies, metrics) for a task type. Supports: classification, regression, ts_forecasting, ts_classification, ts_regression, anomaly_detection."""
-    if task_type not in AVAILABLE_OPERATIONS:
-        return json.dumps({"error": f"Unknown task type: {task_type}. Available: {ALL_PROBLEM_TYPES}"})
-
-    ops = AVAILABLE_OPERATIONS[task_type]
-    strategies_info = {}
-    for s_name, s_info in INDUSTRIAL_STRATEGIES.items():
-        if task_type in s_info["applicable"]:
-            strategies_info[s_name] = {"description": s_info["description"], "params": s_info["params"]}
-
+    """Get atomic operations available for a task type. Returns models, preprocessing, metrics."""
+    if task_type not in OPERATIONS:
+        return json.dumps({"error": f"Unknown task '{task_type}'. Available: {SUPPORTED_TASKS}"})
+    ops = OPERATIONS[task_type]
     return json.dumps({
         "task_type": task_type,
         "is_time_series": is_ts_task(task_type),
-        "models": ops["models"],
         "preprocessing": ops["preprocessing"],
-        "strategies": strategies_info,
+        "models": ops["models"],
         "metrics": METRICS_BY_TASK.get(task_type, []),
-        "requires_forecast_length": task_type == "ts_forecasting",
+        "default_graph": DEFAULT_GRAPHS.get(task_type, []),
     })
 
 
-@mcp.tool()
-def call_fedot(
-    csv_path: str,
-    target_column: str,
-    problem: str = "classification",
-    timeout: float = 5.0,
-    preset: str = "auto",
-    metric: Optional[str] = None,
-    n_jobs: int = 2,
-    strategy: Optional[str] = None,
-    strategy_params: Optional[str] = None,
-    task_params: Optional[str] = None,
-    available_operations: Optional[str] = None,
-    cv_folds: Optional[int] = None,
-    pop_size: Optional[int] = None,
-    max_depth: Optional[int] = None,
-    with_tuning: Optional[bool] = None,
-    use_meta_rules: Optional[bool] = None,
-) -> str:
-    """Call Fedot.Industrial for training. Supports ALL task types including time series. For ts_forecasting, task_params must be JSON with forecast_length. Returns JSON with score, metrics, config_used."""
-    try:
-        payload = {
-            "datapath": csv_path,
-            "target": target_column,
-            "problem": problem,
-            "timeout": timeout,
-            "preset": preset,
-            "n_jobs": n_jobs,
-        }
-        if metric:
-            payload["metric"] = metric
-        if strategy:
-            payload["strategy"] = strategy
-        if cv_folds:
-            payload["cv_folds"] = cv_folds
-        if pop_size:
-            payload["pop_size"] = pop_size
-        if max_depth:
-            payload["max_depth"] = max_depth
-        if with_tuning is not None:
-            payload["with_tuning"] = with_tuning
-        if use_meta_rules is not None:
-            payload["use_meta_rules"] = use_meta_rules
-
-        # Parse JSON string params
-        if task_params:
-            payload["task_params"] = json.loads(task_params) if isinstance(task_params, str) else task_params
-        if strategy_params:
-            payload["strategy_params"] = json.loads(strategy_params) if isinstance(strategy_params, str) else strategy_params
-        if available_operations:
-            payload["available_operations"] = json.loads(available_operations) if isinstance(available_operations, str) else available_operations
-
-        logger.info(f"Calling Fedot: {FEDOT_URL}/mcp with {payload}")
-        resp = requests.post(f"{FEDOT_URL}/mcp", json=payload, timeout=600)
-
-        if resp.status_code == 200:
-            result = resp.json()
-            return json.dumps({
-                "score": result.get("score", 0),
-                "metrics": result.get("metrics", {}),
-                "config_used": result.get("config_used", payload),
-                "shape": result.get("shape"),
-                "status": "success",
-            })
-        else:
-            return json.dumps({"score": 0, "status": "error", "error": f"HTTP {resp.status_code}: {resp.text[:300]}"})
-
-    except Exception as e:
-        logger.error(f"call_fedot error: {e}")
-        return json.dumps({"score": 0, "status": "error", "error": str(e)})
-
-
-@mcp.tool()
-def explain_model(method: str = "point", window: int = 5, samples: int = 1) -> str:
-    """Explain the last trained Fedot.Industrial model. Methods: point, recurrence, shap, lime. Requires a prior call_fedot."""
-    try:
-        resp = requests.post(f"{FEDOT_URL}/explain", json={"method": method, "window": window, "samples": samples}, timeout=120)
-        if resp.status_code == 200:
-            return json.dumps(resp.json())
-        else:
-            return json.dumps({"error": f"HTTP {resp.status_code}", "status": "error"})
-    except Exception as e:
-        return json.dumps({"error": str(e), "status": "error"})
-
-
-@mcp.tool()
-def get_additional_metrics(metric_names: str) -> str:
-    """Calculate additional metrics on last trained Fedot model. metric_names is comma-separated (e.g. 'rmse,mae,mape')."""
-    try:
-        names = [m.strip() for m in metric_names.split(",")]
-        resp = requests.post(f"{FEDOT_URL}/get_metrics", json={"metric_names": names}, timeout=60)
-        if resp.status_code == 200:
-            return json.dumps(resp.json())
-        else:
-            return json.dumps({"error": f"HTTP {resp.status_code}", "status": "error"})
-    except Exception as e:
-        return json.dumps({"error": str(e), "status": "error"})
-
-
 # ================================================================
-#                     ANALYSIS TOOLS
+#                          GRAPH OPS (no training)
 # ================================================================
 
 @mcp.tool()
-def analyze_errors(baseline_results_json: str, fedot_score: float, task_type: str) -> str:
-    """Analyze and compare model results. baseline_results_json is a JSON array of {name, score, metrics}. Returns comparison statistics."""
+def propose_graph(graph_json: str) -> str:
+    """Validate and register a pipeline graph. Input is JSON: {task_type, nodes:[{id, operation, params, inputs}]}."""
     try:
-        baselines = json.loads(baseline_results_json) if isinstance(baseline_results_json, str) else baseline_results_json
-        scores = [b["score"] for b in baselines if b.get("score", 0) > 0]
-        failed = [b["name"] for b in baselines if b.get("error")]
-
-        analysis = {
-            "task_type": task_type,
-            "is_ts": is_ts_task(task_type),
-            "fedot_score": fedot_score,
-        }
-
-        if scores:
-            best_bl = max(baselines, key=lambda b: b.get("score", 0))
-            analysis["baseline_stats"] = {
-                "mean": round(float(np.mean(scores)), 4),
-                "std": round(float(np.std(scores)), 4),
-                "min": round(float(min(scores)), 4),
-                "max": round(float(max(scores)), 4),
-                "count": len(scores),
-            }
-            analysis["best_baseline"] = {"name": best_bl["name"], "score": best_bl["score"], "metrics": best_bl.get("metrics", {})}
-
-        if failed:
-            analysis["failed_pipelines"] = failed
-
-        return json.dumps(analysis)
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-
-
-@mcp.tool()
-def get_feature_importance(csv_path: str, target_column: str, model_name: str = "rf", task_type: str = "classification") -> str:
-    """Get feature importance from a tree-based sklearn model. Only for classification/regression."""
-    try:
-        if is_ts_task(task_type):
-            return json.dumps({"note": "Feature importance not available for TS. Use explain_model.", "available": False})
-
-        df = pd.read_csv(csv_path)
-        y = df[target_column]
-        X = df.drop(columns=[target_column])
-
-        if task_type == "classification" and y.dtype == "object":
-            from sklearn.preprocessing import LabelEncoder
-            y = pd.Series(LabelEncoder().fit_transform(y))
-
-        pipelines = _get_pipelines(task_type)
-        if model_name not in pipelines:
-            return json.dumps({"error": f"Model '{model_name}' not found", "available": False})
-
-        _, pipe = pipelines[model_name]
-        pipe.fit(X, y)
-        model = pipe.named_steps.get("model")
-
-        if not hasattr(model, "feature_importances_"):
-            return json.dumps({"note": f"Model '{model_name}' has no feature_importances_", "available": False})
-
-        importances = model.feature_importances_
-        imp_dict = {col: round(float(imp), 4) for col, imp in sorted(zip(X.columns, importances), key=lambda x: x[1], reverse=True)[:10]}
-        return json.dumps({"available": True, "model": model_name, "features": imp_dict})
-
-    except Exception as e:
-        return json.dumps({"error": str(e), "available": False})
-
-
-@mcp.tool()
-def compare_results(results_json: str) -> str:
-    """Compare all model results (baselines + Fedot). results_json is JSON array of {name, score, type, metrics}. Returns best model, comparison text."""
-    try:
-        results = json.loads(results_json) if isinstance(results_json, str) else results_json
-        results.sort(key=lambda x: x.get("score", 0), reverse=True)
-
-        best = results[0] if results else {"name": "none", "score": 0}
-        baselines = [r for r in results if r.get("type") == "baseline"]
-        best_bl = max(baselines, key=lambda x: x.get("score", 0), default={"name": "none", "score": 0})
-        fedot = next((r for r in results if r.get("type") == "automl"), {"name": "fedot", "score": 0})
-
+        graph = PipelineGraph.from_dict(json.loads(graph_json))
+        ok, msg = graph.validate()
         return json.dumps({
-            "all_models": results,
-            "best_overall": best["name"],
-            "best_overall_score": best.get("score", 0),
-            "best_baseline": best_bl["name"],
-            "best_baseline_score": best_bl.get("score", 0),
-            "fedot_score": fedot.get("score", 0),
-            "architect_wins": best_bl.get("score", 0) > fedot.get("score", 0),
-            "comparison_text": f"Best baseline: {best_bl['name']} ({best_bl.get('score', 0):.4f}) vs Fedot ({fedot.get('score', 0):.4f})",
+            "valid": ok,
+            "message": msg,
+            "graph": graph.to_dict(),
+            "mermaid": graph.to_mermaid() if ok else "",
         })
     except Exception as e:
-        return json.dumps({"error": str(e)})
-
-
-# ================================================================
-#                     CONFIG TOOLS
-# ================================================================
-
-@mcp.tool()
-def propose_fedot_config(
-    task_type: str,
-    preset: str = "auto",
-    timeout: float = 5.0,
-    metric: Optional[str] = None,
-    n_jobs: int = 2,
-    strategy: Optional[str] = None,
-    task_params: Optional[str] = None,
-    available_operations: Optional[str] = None,
-    cv_folds: Optional[int] = None,
-    pop_size: Optional[int] = None,
-    max_depth: Optional[int] = None,
-    with_tuning: Optional[bool] = None,
-    use_meta_rules: Optional[bool] = None,
-) -> str:
-    """Propose a validated Fedot.Industrial configuration. For ts_forecasting, task_params MUST be JSON with forecast_length (e.g. '{"forecast_length": 14}')."""
-    config = {"problem": task_type, "preset": preset, "timeout": timeout, "n_jobs": n_jobs}
-
-    if metric:
-        config["metric"] = metric
-    if strategy:
-        config["strategy"] = strategy
-    if cv_folds:
-        config["cv_folds"] = cv_folds
-    if pop_size:
-        config["pop_size"] = pop_size
-    if max_depth:
-        config["max_depth"] = max_depth
-    if with_tuning is not None:
-        config["with_tuning"] = with_tuning
-    if use_meta_rules is not None:
-        config["use_meta_rules"] = use_meta_rules
-
-    if task_params:
-        config["task_params"] = json.loads(task_params) if isinstance(task_params, str) else task_params
-    if available_operations:
-        config["available_operations"] = json.loads(available_operations) if isinstance(available_operations, str) else available_operations
-
-    # Validate
-    if task_type == "ts_forecasting" and not config.get("task_params", {}).get("forecast_length"):
-        return json.dumps({"error": "ts_forecasting requires task_params with forecast_length", "status": "invalid"})
-
-    return json.dumps({"fedot_config": config, "status": "proposed"})
+        return json.dumps({"valid": False, "message": str(e), "graph": None})
 
 
 @mcp.tool()
-def mutate_fedot_config(current_config_json: str, changes_json: str) -> str:
-    """Apply changes to an existing Fedot config. Both arguments are JSON strings."""
+def mutate_graph(graph_json: str, mutation_json: str) -> str:
+    """Apply a mutation: type=add|remove|replace|set_params|connect plus details. Returns the new graph."""
     try:
-        config = json.loads(current_config_json) if isinstance(current_config_json, str) else current_config_json
-        changes = json.loads(changes_json) if isinstance(changes_json, str) else changes_json
+        graph = PipelineGraph.from_dict(json.loads(graph_json))
+        mutation = json.loads(mutation_json)
+        new_graph = graph.apply_mutation(mutation)
+        ok, msg = new_graph.validate()
+        return json.dumps({
+            "valid": ok,
+            "message": msg,
+            "graph": new_graph.to_dict(),
+            "mermaid": new_graph.to_mermaid() if ok else "",
+        })
+    except Exception as e:
+        return json.dumps({"valid": False, "message": str(e)})
 
-        applied = {}
-        for key, value in changes.items():
-            config[key] = value
-            applied[key] = value
 
-        return json.dumps({"applied_changes": applied, "new_config": config})
+@mcp.tool()
+def visualize_graph(graph_json: str) -> str:
+    """Render a graph to Mermaid markup."""
+    try:
+        graph = PipelineGraph.from_dict(json.loads(graph_json))
+        return json.dumps({"mermaid": graph.to_mermaid()})
     except Exception as e:
         return json.dumps({"error": str(e)})
 
 
 # ================================================================
-#                     REPORT TOOLS
+#                          BASELINES
+# ================================================================
+
+@mcp.tool()
+def get_baselines(task_type: str) -> str:
+    """List sklearn baseline names for the task. Empty for ts_forecasting."""
+    if task_type == "ts_forecasting":
+        return json.dumps({"baselines": [], "note": "Baselines unavailable for ts_forecasting"})
+    return json.dumps({"baselines": list(_baselines(task_type).keys())})
+
+
+@mcp.tool()
+def train_baseline(csv_path: str, target_column: str, baseline_name: str, task_type: str = "classification") -> str:
+    """Train an sklearn baseline. Returns score and metrics."""
+    try:
+        if task_type == "ts_forecasting":
+            return json.dumps({"name": baseline_name, "score": 0, "error": "Baselines unavailable for ts_forecasting"})
+
+        baselines = _baselines(task_type)
+        if baseline_name not in baselines:
+            return json.dumps({"name": baseline_name, "score": 0, "error": f"Unknown baseline; available: {list(baselines.keys())}"})
+
+        df = pd.read_csv(csv_path)
+        y = df[target_column].values
+        X = df.drop(columns=[target_column]).select_dtypes(include=[np.number]).values
+        if task_type in ("classification", "ts_classification") and not np.issubdtype(np.asarray(y).dtype, np.number):
+            y = LabelEncoder().fit_transform(y)
+
+        stratify = y if task_type in ("classification", "ts_classification") else None
+        X_tr, X_va, y_tr, y_va = train_test_split(X, y, test_size=0.2, random_state=42, stratify=stratify)
+
+        pipe = baselines[baseline_name]
+        pipe.fit(X_tr, y_tr)
+        preds = pipe.predict(X_va)
+        metrics = compute_metrics(task_type, y_va, preds)
+        return json.dumps({"name": baseline_name, "score": metrics["primary_score"], "metrics": metrics})
+    except Exception as e:
+        return json.dumps({"name": baseline_name, "score": 0, "error": str(e)})
+
+
+# ================================================================
+#                          GRAPH TRAIN / TUNE
+# ================================================================
+
+@mcp.tool()
+def train_graph(graph_json: str, csv_path: str, target_column: str, forecast_length: Optional[int] = None) -> str:
+    """Train a pipeline graph as-is on the data. Returns score and per-task metrics."""
+    try:
+        graph = PipelineGraph.from_dict(json.loads(graph_json))
+        ok, msg = graph.validate()
+        if not ok:
+            return json.dumps({"score": 0, "error": f"Invalid graph: {msg}"})
+
+        input_data = load_input_data(csv_path, target_column, graph.task_type, forecast_length)
+        train, val = split_input_data(input_data)
+
+        pipeline = graph.to_fedot_pipeline()
+        pipeline.fit(train)
+        preds = _predict_pipeline(pipeline, val, graph.task_type)
+
+        metrics = compute_metrics(graph.task_type, val.target, preds)
+        _store_run(pipeline, graph, input_data, preds)
+
+        return json.dumps({
+            "score": metrics["primary_score"],
+            "metrics": metrics,
+            "graph": graph.to_dict(),
+            "n_train": len(train.features),
+            "n_val": len(val.features),
+        })
+    except Exception as e:
+        logger.exception("train_graph failed")
+        return json.dumps({"score": 0, "error": str(e)})
+
+
+@mcp.tool()
+def tune_graph_hyperparameters(
+    graph_json: str,
+    csv_path: str,
+    target_column: str,
+    iterations: int = 20,
+    forecast_length: Optional[int] = None,
+) -> str:
+    """Tune node hyperparameters of a graph using Fedot's PipelineTuner. Returns tuned graph + score."""
+    try:
+        from fedot.core.pipelines.tuning.tuner_builder import TunerBuilder
+
+        graph = PipelineGraph.from_dict(json.loads(graph_json))
+        ok, msg = graph.validate()
+        if not ok:
+            return json.dumps({"score": 0, "error": f"Invalid graph: {msg}"})
+
+        input_data = load_input_data(csv_path, target_column, graph.task_type, forecast_length)
+        train, val = split_input_data(input_data)
+
+        pipeline = graph.to_fedot_pipeline()
+
+        try:
+            tuner = TunerBuilder(input_data.task).with_iterations(iterations).build(train)
+            pipeline = tuner.tune(pipeline)
+        except Exception as e:
+            logger.warning(f"Tuning failed, using untuned pipeline: {e}")
+
+        pipeline.fit(train)
+        preds = _predict_pipeline(pipeline, val, graph.task_type)
+        metrics = compute_metrics(graph.task_type, val.target, preds)
+        _store_run(pipeline, graph, input_data, preds)
+
+        # Extract tuned params back per node
+        tuned_nodes = []
+        try:
+            for fnode, gnode in zip(pipeline.nodes, graph.nodes):
+                tuned_nodes.append({"id": gnode.id, "operation": gnode.operation, "tuned_params": dict(getattr(fnode, "parameters", {}) or {})})
+        except Exception:
+            pass
+
+        return json.dumps({
+            "score": metrics["primary_score"],
+            "metrics": metrics,
+            "graph": graph.to_dict(),
+            "tuned_nodes": tuned_nodes,
+        })
+    except Exception as e:
+        logger.exception("tune_graph_hyperparameters failed")
+        return json.dumps({"score": 0, "error": str(e)})
+
+
+@mcp.tool()
+def validate_graph(graph_json: str, csv_path: str, target_column: str, cv_folds: int = 3, forecast_length: Optional[int] = None) -> str:
+    """Cross-validate the graph. Returns mean & std of the primary metric across folds."""
+    try:
+        graph = PipelineGraph.from_dict(json.loads(graph_json))
+        ok, msg = graph.validate()
+        if not ok:
+            return json.dumps({"score": 0, "error": f"Invalid graph: {msg}"})
+
+        input_data = load_input_data(csv_path, target_column, graph.task_type, forecast_length)
+
+        # Simple CV: rotate validation cuts
+        n = len(input_data.features)
+        scores: List[float] = []
+        for fold in range(cv_folds):
+            offset = fold / cv_folds
+            cut_lo = int(n * offset)
+            cut_hi = cut_lo + n // cv_folds
+            mask = np.ones(n, dtype=bool)
+            mask[cut_lo:cut_hi] = False
+
+            from fedot.core.data.data import InputData
+            train = InputData(
+                idx=np.arange(mask.sum()), features=input_data.features[mask],
+                target=input_data.target[mask], task=input_data.task, data_type=input_data.data_type,
+            )
+            val = InputData(
+                idx=np.arange((~mask).sum()), features=input_data.features[~mask],
+                target=input_data.target[~mask], task=input_data.task, data_type=input_data.data_type,
+            )
+
+            pipeline = graph.to_fedot_pipeline()
+            pipeline.fit(train)
+            preds = _predict_pipeline(pipeline, val, graph.task_type)
+            m = compute_metrics(graph.task_type, val.target, preds)
+            scores.append(m["primary_score"])
+
+        return json.dumps({
+            "score_mean": float(np.mean(scores)),
+            "score_std": float(np.std(scores)),
+            "fold_scores": scores,
+            "cv_folds": cv_folds,
+        })
+    except Exception as e:
+        logger.exception("validate_graph failed")
+        return json.dumps({"error": str(e)})
+
+
+# ================================================================
+#                          ANALYSIS
+# ================================================================
+
+@mcp.tool()
+def analyze_errors(baseline_results_json: str, graph_score: float, task_type: str) -> str:
+    """Compare graph score against sklearn baselines. Returns winner + statistics."""
+    try:
+        baselines = json.loads(baseline_results_json)
+        scores = [b["score"] for b in baselines if b.get("score", 0) > 0]
+        out: Dict[str, Any] = {
+            "task_type": task_type,
+            "graph_score": graph_score,
+            "n_baselines": len(baselines),
+        }
+        if scores:
+            best = max(baselines, key=lambda b: b.get("score", 0))
+            out["best_baseline"] = {"name": best["name"], "score": best["score"]}
+            out["graph_beats_baselines"] = graph_score > best["score"]
+            out["delta"] = round(graph_score - best["score"], 4)
+            out["baseline_mean"] = round(float(np.mean(scores)), 4)
+        else:
+            out["graph_beats_baselines"] = True
+        out["failed_baselines"] = [b["name"] for b in baselines if b.get("error")]
+        return json.dumps(out)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def get_node_importance(graph_json: str, csv_path: str, target_column: str, forecast_length: Optional[int] = None) -> str:
+    """Estimate per-node importance via leave-one-out ablation (training-only, can be slow)."""
+    try:
+        graph = PipelineGraph.from_dict(json.loads(graph_json))
+        input_data = load_input_data(csv_path, target_column, graph.task_type, forecast_length)
+        train, val = split_input_data(input_data)
+
+        # Baseline: full graph
+        full_pipe = graph.to_fedot_pipeline()
+        full_pipe.fit(train)
+        full_score = compute_metrics(
+            graph.task_type,
+            val.target,
+            _predict_pipeline(full_pipe, val, graph.task_type),
+        )["primary_score"]
+
+        importances: Dict[str, float] = {}
+        for node in graph.nodes:
+            # Skip the root model - removing it breaks the pipeline
+            if node.id == graph.root_id():
+                continue
+            try:
+                ablated = graph.apply_mutation({"type": "remove", "node_id": node.id})
+                ok, _ = ablated.validate()
+                if not ok:
+                    continue
+                pipe = ablated.to_fedot_pipeline()
+                pipe.fit(train)
+                score = compute_metrics(
+                    graph.task_type,
+                    val.target,
+                    _predict_pipeline(pipe, val, graph.task_type),
+                )["primary_score"]
+                importances[node.id] = round(full_score - score, 4)
+            except Exception as e:
+                importances[node.id] = None
+
+        return json.dumps({"full_score": full_score, "node_importance": importances})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def explain_graph(top_k: int = 10) -> str:
+    """Explain the last trained graph: feature importance from the model node if available."""
+    pipeline = _LAST.get("pipeline")
+    graph = _LAST.get("graph")
+    if pipeline is None or graph is None:
+        return json.dumps({"error": "No trained graph yet. Call train_graph or tune_graph_hyperparameters first."})
+
+    try:
+        # Find the root (model) node and try to extract feature_importances_
+        out: Dict[str, Any] = {"graph": graph.to_dict()}
+        try:
+            root_fn = pipeline.root_node
+            operation = getattr(root_fn, "operation", None)
+            fitted = getattr(operation, "fitted_operation", None) if operation else None
+            if fitted is not None and hasattr(fitted, "feature_importances_"):
+                imp = fitted.feature_importances_
+                top = sorted(enumerate(imp), key=lambda x: x[1], reverse=True)[:top_k]
+                out["feature_importance"] = {f"f{i}": round(float(v), 4) for i, v in top}
+        except Exception as e:
+            out["feature_importance_error"] = str(e)
+
+        out["pipeline_structure"] = graph.to_mermaid()
+        return json.dumps(out)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# ================================================================
+#                          REPORT
 # ================================================================
 
 @mcp.tool()
 def generate_report(iterations_json: str) -> str:
-    """Compile iteration results into a structured report. iterations_json is a JSON array of iteration data."""
+    """Compile per-iteration data into a structured report (best score, summaries, mermaid of best graph)."""
     try:
-        iterations = json.loads(iterations_json) if isinstance(iterations_json, str) else iterations_json
-        n = len(iterations)
-        best_score = 0
-        best_model = "N/A"
-        summaries = []
+        iterations = json.loads(iterations_json)
+        best_score = -1.0
+        best_iter = None
+        summaries: List[Dict[str, Any]] = []
 
         for it in iterations:
             eng = it.get("engineer", {})
-            score = eng.get("best_score", 0)
-            model = eng.get("best_model", "N/A")
-            fedot_score = eng.get("fedot_result", {}).get("score", 0)
+            score = float(eng.get("graph_score", 0))
             summaries.append({
                 "iteration": it.get("iteration", "?"),
-                "best_score": score,
-                "best_model": model,
-                "fedot_score": fedot_score,
+                "graph_score": score,
+                "best_baseline": eng.get("best_baseline_score", 0),
+                "winner": it.get("critic", {}).get("winner", "?"),
+                "stop": it.get("critic", {}).get("should_stop", False),
             })
             if score > best_score:
                 best_score = score
-                best_model = model
+                best_iter = it
+
+        best_graph = (best_iter or {}).get("architect", {}).get("graph", {})
+        best_mermaid = ""
+        if best_graph:
+            try:
+                best_mermaid = PipelineGraph.from_dict(best_graph).to_mermaid()
+            except Exception:
+                pass
 
         return json.dumps({
-            "n_iterations": n,
+            "n_iterations": len(iterations),
             "iteration_summaries": summaries,
-            "best_overall_score": best_score,
-            "best_overall_model": best_model,
+            "best_score": best_score,
+            "best_graph": best_graph,
+            "best_graph_mermaid": best_mermaid,
         })
     except Exception as e:
         return json.dumps({"error": str(e)})

@@ -1,47 +1,46 @@
+"""Architect: synthesizes a pipeline graph for the task using MCP tools."""
+
 import json
 import logging
-from typing import Dict, Any, Optional, Tuple
+from typing import Optional
 
-from .base_agent import BaseAgent
-from .schemas import (
-    DataContext, FedotConfig, ArchitectResult, CriticFeedback,
-    ALL_PROBLEM_TYPES, is_ts_task,
-)
+from .base_agent import BaseAgent, extract_json_block
+from .schemas import ArchitectResult, CriticFeedback, DataContext
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("Architect")
 
 
 class Architect(BaseAgent):
-    """Architect: analyzes data, selects baselines, proposes Fedot.Industrial config."""
-
     ALLOWED_TOOLS = [
-        "get_data_profile", "get_available_baselines",
-        "get_available_operations", "propose_fedot_config", "mutate_fedot_config",
+        "get_data_profile", "get_available_operations",
+        "propose_graph", "mutate_graph", "visualize_graph",
     ]
 
-    SYSTEM_PROMPT = """You are an ML Architect. Your job is to analyze a dataset and propose the best ML strategy.
+    SYSTEM_PROMPT = """You are an ML Architect. You design pipeline GRAPHS by composing atomic operations.
 
-You have access to MCP tools:
-1. get_data_profile - Analyze the dataset (statistics, issues, recommendations).
-2. get_available_baselines - Get sklearn baselines (only for classification/regression).
-3. get_available_operations - Get Fedot.Industrial models/preprocessing/strategies for ANY task type.
-4. propose_fedot_config - Propose a FedotIndustrial configuration with all parameters.
-5. mutate_fedot_config - Modify existing config based on Critic feedback.
+A graph is JSON: {"task_type": "...", "nodes": [{"id": "n1", "operation": "fourier_basis", "params": {}, "inputs": []}, {"id": "n2", "operation": "industrial_freq_clf", "params": {}, "inputs": ["n1"]}]}.
 
-SUPPORTED TASK TYPES: classification, regression, ts_forecasting, ts_classification, ts_regression, anomaly_detection.
+Each node has:
+  - id: unique string
+  - operation: an atomic op (call get_available_operations to see valid ops for the task)
+  - params: dict of hyperparameters (use {} to let Engineer tune)
+  - inputs: list of upstream node IDs (empty = consumes raw data)
+
+The graph must be a DAG with exactly ONE root (node nobody else inputs from). The root is the model.
 
 WORKFLOW:
 1. Call get_data_profile to understand the data.
-2. Call get_available_operations to see available models/strategies for this task.
-3. For classification/regression: call get_available_baselines.
-4. Call propose_fedot_config with your configuration.
-   - For ts_forecasting: MUST set task_params='{"forecast_length": N}'.
-   - Choose appropriate strategy (e.g. "forecasting_assumptions" for ts_forecasting).
-5. If previous feedback exists, call mutate_fedot_config to apply suggested changes.
+2. Call get_available_operations(task_type) to see valid operations.
+3. Build a graph as JSON, then call propose_graph(graph_json) to validate it.
+4. If you have prior feedback with suggested_mutations, call mutate_graph for each one and finally re-propose.
+5. After tools, output ANALYSIS and REASONING in plain text.
 
-After using tools, provide:
-ANALYSIS: Your data analysis.
-REASONING: Why you chose this configuration.
+Think step-by-step (Chain-of-Thought):
+"For ECG classification, FFT features matter, then statistical extraction, then a freq classifier:
+ - n1: fourier_basis (frequency features) <- raw
+ - n2: quantile_extractor (statistics from spectrum) <- n1
+ - n3: industrial_freq_clf (model) <- n2
+The root is n3."
 """
 
     def __init__(self, name: str = "Architect", mcp_client=None):
@@ -52,150 +51,116 @@ REASONING: Why you chose this configuration.
         data_context: DataContext,
         iteration: int,
         prev_feedback: Optional[CriticFeedback] = None,
-        task_type: str = "classification",
-    ) -> Tuple[Dict[str, Any], ArchitectResult]:
-        """Run the Architect agent. Returns (baselines_dict, ArchitectResult)."""
+        prev_graph: Optional[dict] = None,
+    ) -> ArchitectResult:
         self._tool_call_log = []
         result = ArchitectResult()
 
         try:
-            logger.info(f"[Architect] Iteration {iteration}, task: {task_type}")
-            context = self._build_user_message(data_context, iteration, prev_feedback, task_type)
-            response = await self.call_llm(context)
-
-            if not response.get("success"):
-                logger.warning("[Architect] LLM failed, using fallback")
-                fb = self._fallback(data_context, task_type)
-                return fb.baseline_pipelines, fb
-
+            user_msg = self._build_user_message(data_context, iteration, prev_feedback, prev_graph)
+            response = await self.call_llm(user_msg)
             text = response.get("full_response", "")
 
-            # Extract Fedot config from tool call results
-            fedot_config = self._extract_fedot_config_from_log(task_type, data_context)
-            baselines = self._extract_baselines_from_log()
+            # Find the latest valid graph in tool call log
+            graph, mermaid = self._extract_graph_from_log()
 
-            # If LLM didn't call get_available_baselines, use defaults for non-TS tasks
-            if not baselines and task_type in _DEFAULT_BASELINES:
-                default = _DEFAULT_BASELINES[task_type]
-                baselines = {name: {"model": info, "steps": []} for name, info in default.items()}
-                logger.info(f"[Architect] LLM didn't select baselines, using defaults: {list(baselines.keys())}")
+            # If LLM didn't successfully propose, fall back to default
+            if not graph:
+                graph, mermaid = self._fallback_graph(data_context.task_type, prev_graph)
+                logger.info("[Architect] Using fallback graph for %s", data_context.task_type)
 
-            result.fedot_config = fedot_config
-            result.baseline_pipelines = baselines
-            result.selected_baselines = list(baselines.keys()) if baselines else []
-            result.analysis = self.extract_field(text, "ANALYSIS") or text[:500]
-            result.reasoning = self.extract_field(text, "REASONING") or ""
+            result.graph = graph
+            result.mermaid = mermaid
+            result.analysis = self._extract_section(text, "ANALYSIS") or text[:500]
+            result.reasoning = self._extract_section(text, "REASONING") or ""
             result.tool_calls = self.get_tool_calls()
-
-            logger.info(f"[Architect] Done. Baselines: {result.selected_baselines}, Config: {fedot_config.to_dict() if fedot_config else 'default'}")
-            return baselines, result
+            return result
 
         except Exception as e:
-            logger.error(f"[Architect] Error: {e}")
-            fb = self._fallback(data_context, task_type)
-            return fb.baseline_pipelines, fb
+            logger.exception(f"[Architect] error")
+            result.graph, result.mermaid = self._fallback_graph(data_context.task_type, prev_graph)
+            result.analysis = f"Fallback: {e}"
+            result.tool_calls = self.get_tool_calls()
+            return result
 
-    def _build_user_message(self, dc: DataContext, iteration, prev_feedback, task_type):
+    @staticmethod
+    def _fallback_graph(task_type: str, prev_graph: Optional[dict] = None):
+        from graph_engine import PipelineGraph
+
+        if prev_graph:
+            try:
+                graph = PipelineGraph.from_dict(prev_graph)
+                ok, _ = graph.validate()
+                if ok:
+                    return graph.to_dict(), graph.to_mermaid()
+            except Exception:
+                pass
+        default = PipelineGraph.default(task_type)
+        return default.to_dict(), default.to_mermaid()
+
+    def _build_user_message(self, dc: DataContext, iteration: int, prev_fb, prev_graph) -> str:
         profile = dc.profile
-        msg = f"""Iteration: {iteration}
-Task Type: {task_type}
-Is Time Series: {is_ts_task(task_type)}
-CSV Path: {dc.csv_path}
-Target Column: {dc.target_column}
-
-Data Profile:
-- Samples: {profile.get('n_samples', 'Unknown')}
-- Features: {profile.get('n_features', 'Unknown')}
-- Issues: {', '.join(profile.get('issues', ['Unknown']))}
-"""
+        msg = (
+            f"Iteration: {iteration}\n"
+            f"Task: {dc.task_type} (TS: {dc.is_time_series})\n"
+            f"CSV: {dc.csv_path}\n"
+            f"Target: {dc.target_column}\n"
+            f"Profile: {profile.get('n_samples')} samples x {profile.get('n_features')} features\n"
+            f"Issues: {profile.get('issues', [])}\n"
+        )
         if dc.forecast_length:
-            msg += f"- Forecast Length: {dc.forecast_length}\n"
+            msg += f"Forecast length: {dc.forecast_length}\n"
 
-        # Cross-iteration memory
         if dc.iteration_history:
             msg += "\nPREVIOUS ITERATIONS:\n"
             for rec in dc.iteration_history:
-                msg += (
-                    f"  Iter {rec.iteration}: best={rec.best_model} ({rec.best_score:.4f}), "
-                    f"fedot={rec.fedot_score:.4f}, winner={rec.winner}"
-                )
-                if rec.failed_baselines:
-                    msg += f", FAILED: {rec.failed_baselines}"
-                msg += f", config={rec.fedot_config_used}\n"
-            msg += "\nAvoid repeating failed approaches. Build on what worked.\n"
+                msg += f"  Iter {rec.iteration}: graph_score={rec.graph_score:.4f}, baseline={rec.best_baseline_score:.4f}, winner={rec.winner}\n"
+            msg += "Avoid repeating approaches that didn't improve. Build on what worked.\n"
 
-        msg += "\nPlease use tools to analyze data and propose configuration.\n"
+        if prev_graph:
+            msg += f"\nPREVIOUS GRAPH:\n{json.dumps(prev_graph)}\n"
 
-        if prev_feedback:
-            msg += f"""
-PREVIOUS ITERATION FEEDBACK:
-- Winner: {prev_feedback.winner}
-- Assessment: {prev_feedback.score_assessment}
-- Suggested Fedot changes: {json.dumps(prev_feedback.suggested_fedot_changes)}
-- Weaknesses: {prev_feedback.weaknesses}
+        if prev_fb:
+            msg += (
+                f"\nFEEDBACK:\n"
+                f"  source/winner: {prev_fb.winner}\n"
+                f"  assessment: {prev_fb.assessment}\n"
+                f"  weaknesses/user notes: {prev_fb.weaknesses}\n"
+                f"  suggested_mutations: {json.dumps(prev_fb.suggested_mutations)}\n"
+            )
+            if prev_fb.suggested_mutations:
+                msg += "Apply these mutations using the mutate_graph tool.\n"
+            else:
+                msg += "Use this feedback to propose a revised validated graph.\n"
 
-Use mutate_fedot_config to apply the suggested changes.
-"""
+        msg += "\nUse the tools to build a validated graph, then output ANALYSIS and REASONING.\n"
         return msg
 
-    def _extract_fedot_config_from_log(self, task_type, dc):
-        """Extract FedotConfig from tool call results in the log."""
+    def _extract_graph_from_log(self):
+        """Find the most recent successful propose_graph or mutate_graph result."""
+        graph, mermaid = None, ""
         for tc in self._tool_call_log:
-            if tc.tool_name in ("propose_fedot_config", "mutate_fedot_config") and tc.success:
-                result = tc.result
-                if isinstance(result, dict):
-                    cfg = result.get("fedot_config") or result.get("new_config")
-                    if cfg:
-                        return FedotConfig.from_dict(cfg)
+            if tc.tool_name in ("propose_graph", "mutate_graph") and tc.success:
+                r = tc.result
+                if isinstance(r, dict) and r.get("valid") and r.get("graph"):
+                    graph = r["graph"]
+                    mermaid = r.get("mermaid", "")
+        return graph, mermaid
 
-        # Default config
-        config = FedotConfig(problem=task_type)
-        if task_type == "ts_forecasting" and dc.forecast_length:
-            config.task_params = {"forecast_length": dc.forecast_length}
-        return config
-
-    def _extract_baselines_from_log(self):
-        """Extract baseline pipeline names from tool call results."""
-        for tc in self._tool_call_log:
-            if tc.tool_name == "get_available_baselines" and tc.success:
-                result = tc.result
-                if isinstance(result, dict):
-                    pipelines = result.get("pipelines", {})
-                    # Return pipeline names as dict (actual Pipeline objects are in MCP server)
-                    return {name: info for name, info in pipelines.items()}
-        return {}
-
-    def _fallback(self, dc, task_type):
-        config = FedotConfig(problem=task_type)
-        if task_type == "ts_forecasting" and dc.forecast_length:
-            config.task_params = {"forecast_length": dc.forecast_length}
-
-        # Include default sklearn baselines for classification/regression
-        baselines = _DEFAULT_BASELINES.get(task_type, {})
-
-        result = ArchitectResult(
-            baseline_pipelines={name: {"model": info, "steps": []} for name, info in baselines.items()},
-            selected_baselines=list(baselines.keys()),
-            fedot_config=config,
-            analysis="Fallback: LLM unavailable, using all default baselines",
-            reasoning="Default configuration",
-            tool_calls=self.get_tool_calls(),
-        )
-        return result
-
-
-# Default baselines used by fallback path. Matches mcp_server.py _get_pipelines().
-_DEFAULT_BASELINES = {
-    "classification": {
-        "baseline_lr": "LogisticRegression",
-        "svc": "SVC",
-        "xgb_clf": "XGBClassifier",
-        "rf": "RandomForest",
-    },
-    "regression": {
-        "baseline_lr": "LinearRegression",
-        "ridge": "Ridge",
-        "svr": "SVR",
-        "xgb_reg": "XGBRegressor",
-    },
-}
+    @staticmethod
+    def _extract_section(text: str, name: str) -> str:
+        if not text:
+            return ""
+        idx = text.upper().find(name + ":")
+        if idx == -1:
+            return ""
+        start = idx + len(name) + 1
+        # Stop at next ALL CAPS heading or end of text
+        end = len(text)
+        for next_h in ("ANALYSIS:", "REASONING:", "WINNER:", "ASSESSMENT:", "STRENGTHS:", "WEAKNESSES:"):
+            if next_h == name + ":":
+                continue
+            i = text.upper().find(next_h, start)
+            if i != -1 and i < end:
+                end = i
+        return text[start:end].strip()

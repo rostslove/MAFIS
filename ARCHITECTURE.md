@@ -1,329 +1,158 @@
-# Architecture: Multi-Agent ML System with Fedot.Industrial
+# GraphAutoML Architecture
 
-## High-Level Overview
+GraphAutoML is a multi-agent system where LLM agents compose, tune, validate, and explain Fedot.Industrial pipeline graphs through MCP tools.
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        DOCKER COMPOSE                               │
-│                        (ml-network)                                 │
-│                                                                     │
-│  ┌──────────────┐    ┌──────────────┐    ┌───────────────────────┐ │
-│  │   FRONTEND    │    │   BACKEND    │    │    FEDOT SERVER       │ │
-│  │  (Streamlit)  │───▶│  (FastAPI)   │───▶│    (FastAPI)          │ │
-│  │  :8502        │    │  :8001       │    │    :8000              │ │
-│  └──────────────┘    └──────┬───────┘    └───────────┬───────────┘ │
-│                             │                        │              │
-│                             │                   ┌────▼────┐        │
-│                      ┌──────▼───────┐           │ Fedot   │        │
-│                      │   OLLAMA     │           │Industrial│        │
-│                      │  (llama3.1)  │           │ Library  │        │
-│                      │  :11434      │           └─────────┘        │
-│                      └──────────────┘                               │
-└─────────────────────────────────────────────────────────────────────┘
-```
+The important design choice is that the LLM controls graph structure. Fedot.Industrial is used to materialize and train the graph, and the Engineer may tune node hyperparameters, but structural evolution is performed by the Architect/Critic loop.
 
-## Agent Orchestration Flow
+## Runtime Layout
 
-```
-                    ┌─────────────────────┐
-                    │     USER INPUT      │
-                    │  CSV + Task Type +  │
-                    │  Fedot Config       │
-                    └─────────┬───────────┘
-                              │
-                              ▼
-                    ┌─────────────────────┐
-                    │    ORCHESTRATOR     │
-                    │  (orchestrator.py)  │
-                    │                     │
-                    │  1. Load CSV        │
-                    │  2. DataProfiler    │
-                    │  3. Build Context   │
-                    └─────────┬───────────┘
-                              │
-              ┌───────────────┼───────────────────────┐
-              │          ITERATION LOOP                │
-              │                                        │
-              │   ┌──────────────────────────┐        │
-              │   │   STEP 1: ARCHITECT      │        │
-              │   │                          │        │
-              │   │   Tools:                 │        │
-              │   │   ├─ get_data_profile    │───┐    │
-              │   │   ├─ get_available_ops   │   │    │
-              │   │   ├─ propose_baselines   │   │    │
-              │   │   ├─ propose_fedot_config│   │    │
-              │   │   └─ mutate_fedot_config │   │    │
-              │   │                          │   │    │
-              │   │   Output:                │   │    │
-              │   │   ├─ Baseline pipelines  │   │    │
-              │   │   └─ FedotConfig         │   │    │
-              │   └──────────┬───────────────┘   │    │
-              │              │                   │    │
-              │              ▼                   │    │
-              │   ┌──────────────────────────┐   │    │
-              │   │   STEP 2: ENGINEER       │   │    │
-              │   │                          │   │    │
-              │   │   Tools:                 │   │    │
-              │   │   ├─ train_baseline ─────┤   │    │
-              │   │   ├─ call_fedot ─────────┤───┤    │
-              │   │   └─ compare_results     │   │    │
-              │   │                          │   │    │
-              │   │   Output:                │   │    │
-              │   │   ├─ Baseline scores     │   │    │
-              │   │   ├─ Fedot score         │   │    │
-              │   │   └─ Comparison          │   │    │
-              │   └──────────┬───────────────┘   │    │
-              │              │                   │    │
-              │              ▼                   │    │
-              │   ┌──────────────────────────┐   │    │
-              │   │   STEP 3: CRITIC         │   │    │
-              │   │                          │   │    │
-              │   │   Tools:                 │   │    │
-              │   │   ├─ analyze_errors      │   │    │
-              │   │   ├─ get_feature_import  │   │    │
-              │   │   ├─ explain_model ──────┤───┤    │
-              │   │   ├─ get_add_metrics ────┤───┘    │
-              │   │   └─ gen_struct_feedback │        │
-              │   │                          │        │
-              │   │   Output:                │        │
-              │   │   ├─ CriticFeedback      │        │
-              │   │   │  ├─ winner           │        │
-              │   │   │  ├─ fedot_changes ───┤──┐     │
-              │   │   │  └─ should_stop      │  │     │
-              │   └──────────┬───────────────┘  │     │
-              │              │                  │     │
-              │              │    ┌─────────────┘     │
-              │              │    │ structured        │
-              │              │    │ feedback           │
-              │              │    │                    │
-              │              ▼    ▼                    │
-              │   ┌──────────────────────┐            │
-              │   │  should_stop?        │            │
-              │   │  YES ──▶ break       │            │
-              │   │  NO  ──▶ next iter ──┤──▶ ARCHITECT
-              │   └──────────────────────┘            │
-              │                                        │
-              └────────────────────────────────────────┘
-                              │
-                              ▼
-                    ┌─────────────────────┐
-                    │   STEP 4: SCRIBE    │
-                    │   (called ONCE)     │
-                    │                     │
-                    │   Tools:            │
-                    │   └─ generate_report│
-                    │                     │
-                    │   Output:           │
-                    │   └─ ScribeReport   │
-                    └─────────────────────┘
+```text
+Streamlit frontend (:8502)
+        |
+        | HTTP / SSE
+        v
+FastAPI backend (:8001)
+        |
+        | MCP stdio subprocess
+        v
+MCP graph tools
+        |
+        | direct Python calls
+        v
+Fedot.Industrial + sklearn
 ```
 
-## Tool Calling Mechanism
+There is no separate `fedot_server` service anymore. The old double serialization path (`MCP -> HTTP -> Fedot server`) was removed; MCP tools now call graph and training code directly in the backend container.
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    BaseAgent.call_llm()                      │
-│                                                              │
-│   ┌──────────┐     ┌──────────────┐     ┌────────────────┐ │
-│   │  System   │     │   Ollama     │     │  Tool          │ │
-│   │  Prompt + │────▶│   llama3.1   │────▶│  Registry      │ │
-│   │  User Msg │     │              │     │                │ │
-│   │  + Tools  │     │  tool_calls? │     │ _tool_handlers │ │
-│   └──────────┘     └──────┬───────┘     └───────┬────────┘ │
-│                           │                      │          │
-│                    ┌──────▼───────┐              │          │
-│                    │  Has tool    │  YES         │          │
-│                    │  calls?  ────┤─────────────▶│          │
-│                    │              │   execute     │          │
-│                    │  NO ─────┐   │   tool       │          │
-│                    └──────────┘   │              │          │
-│                           │       │     ┌────────▼───────┐ │
-│                           ▼       │     │ Tool result    │ │
-│                    ┌──────────┐   │     │ appended to    │ │
-│                    │  Final   │   │     │ messages as    │ │
-│                    │  text    │   │     │ role: "tool"   │ │
-│                    │  response│   │     └────────┬───────┘ │
-│                    └──────────┘   │              │          │
-│                                   │     ┌────────▼───────┐ │
-│                                   │     │ Call LLM again │ │
-│                                   │     │ (next round)   │ │
-│                                   │     └────────────────┘ │
-│                                   │                         │
-│                    max_rounds = 10                          │
-└─────────────────────────────────────────────────────────────┘
-```
+## Agents
 
-## Data Flow Between Agents
+### Architect
 
-```
-┌──────────────┐                              ┌──────────────┐
-│  DataContext  │──────────────────────────────│  Shared by   │
-│              │                              │  ALL agents  │
-│  X_train     │                              │              │
-│  y_train     │                              │              │
-│  X_val       │                              │              │
-│  y_val       │                              │              │
-│  csv_path    │                              │              │
-│  task_type   │                              │              │
-│  profile     │                              │              │
-│  forecast_len│                              │              │
-└──────────────┘                              └──────────────┘
+Input: user task, CSV profile, optional previous graph, optional Critic or user feedback.
 
-┌──────────────┐     ┌──────────────┐     ┌──────────────────┐
-│  Architect   │     │  Engineer    │     │     Critic       │
-│  Result      │────▶│  Result      │────▶│     Feedback     │
-│              │     │              │     │                  │
-│ baselines:   │     │ baseline_    │     │ winner:          │
-│  {lr, xgb..} │     │  results[]   │     │  "architect"     │
-│              │     │              │     │                  │
-│ fedot_config:│     │ fedot_result:│     │ suggested_fedot_ │
-│  preset:auto │     │  score: 0.92 │     │  changes:        │
-│  strategy:   │     │  metrics:{}  │     │  {timeout: 10,   │
-│   kernel_    │     │              │     │   preset: best_, │
-│   automl     │     │ comparison:  │     │   strategy:      │
-│  task_params:│     │  best: fedot │     │   kernel_automl} │
-│  {forecast:  │     │              │     │                  │
-│    14}       │     │ fedot_config │     │ should_stop:     │
-│              │     │  _used: {}   │     │  false           │
-└──────────────┘     └──────────────┘     └────────┬─────────┘
-                                                   │
-                                          ┌────────▼─────────┐
-                                          │  Back to         │
-                                          │  ARCHITECT       │
-                                          │  (next iteration)│
-                                          └──────────────────┘
+Main tools:
+
+- `get_data_profile`
+- `get_available_operations`
+- `propose_graph`
+- `mutate_graph`
+- `visualize_graph`
+
+Output: `PipelineGraph` JSON and Mermaid markup.
+
+### Engineer
+
+Input: validated graph from Architect.
+
+Main tools:
+
+- `get_baselines`
+- `train_baseline`
+- `tune_graph_hyperparameters`
+- `train_graph`
+
+Output: graph score, metrics, tuned node parameters, baseline comparison.
+
+Engineer does not change graph structure. It only fits the graph and tunes node parameters.
+
+### Critic
+
+Input: graph, Engineer metrics, baseline metrics.
+
+Main tools:
+
+- `validate_graph`
+- `analyze_errors`
+- `get_node_importance`
+- `explain_graph`
+
+Output: assessment, winner (`graph` or `baseline`), strengths, weaknesses, suggested graph mutations, stop decision.
+
+### Scribe
+
+Input: all iteration records.
+
+Main tools:
+
+- `generate_report`
+- `visualize_graph`
+
+Output: final report, best graph visualization.
+
+## Iteration Flow
+
+```text
+1. Backend profiles the CSV.
+2. Architect creates or mutates a graph candidate.
+3. MCP validates the graph shape and allowed operations.
+4. Engineer trains simple baselines and the proposed graph.
+5. Critic cross-validates, analyzes errors, and suggests mutations.
+6. If Critic stops or scores plateau, the loop ends.
+7. Otherwise feedback returns to Architect for the next graph.
+8. Scribe creates the final report.
 ```
 
-## External Service Interactions
+## Graph Format
 
-```
-┌─────────────────────────────────────────────────────┐
-│                    BACKEND                           │
-│                                                      │
-│  Architect ──tool──▶ DataProfiler.profile()          │
-│                      (local, no HTTP)                │
-│                                                      │
-│  Engineer  ──tool──▶ sklearn.fit() / .predict()      │
-│            │         (local, no HTTP)                │
-│            │                                         │
-│            └─tool──▶ POST fedot-server:8000/mcp      │
-│                      {datapath, target, problem,     │
-│                       timeout, preset, strategy,     │
-│                       task_params, available_ops...}  │
-│                                                      │
-│  Critic   ──tool──▶ POST fedot-server:8000/explain   │
-│            │         {method: "point"|"shap"|...}    │
-│            │                                         │
-│            └─tool──▶ POST fedot-server:8000/get_metrics│
-│                      {metric_names: ["rmse","mae"]}  │
-│                                                      │
-│  ALL agents ──LLM──▶ ollama:11434                    │
-│                      model: llama3.1                 │
-│                      + tools: [...]                  │
-└─────────────────────────────────────────────────────┘
+```json
+{
+  "task_type": "classification",
+  "nodes": [
+    {"id": "scale", "operation": "scaling", "params": {}, "inputs": []},
+    {"id": "model", "operation": "rf", "params": {}, "inputs": ["scale"]}
+  ]
+}
 ```
 
-## Supported Task Types
+Rules:
 
-```
-┌────────────────────────────────────────────────────────────┐
-│                    TASK TYPES                               │
-│                                                             │
-│  Standard ML:                                               │
-│  ├─ classification ── sklearn baselines + Fedot            │
-│  └─ regression ────── sklearn baselines + Fedot            │
-│                                                             │
-│  Time Series:                                               │
-│  ├─ ts_forecasting ── Fedot only (needs forecast_length)   │
-│  │   Models: ar, stl_arima, ets, nbeats, tcn, deepar      │
-│  │   Strategies: forecasting_assumptions, exogenous        │
-│  │                                                          │
-│  ├─ ts_classification ── Fedot only                        │
-│  │   Models: stat_clf, freq_clf, manifold_clf, inception   │
-│  │   Preprocessing: wavelet, fourier, topological, rocket  │
-│  │                                                          │
-│  ├─ ts_regression ── Fedot only                            │
-│  │   Models: stat_reg, freq_reg, manifold_reg, tst         │
-│  │                                                          │
-│  └─ anomaly_detection ── Fedot only                        │
-│      Models: sst, iforest, one_class_svm, kalman           │
-│      Models (DL): conv_ae_detector, lstm_ae_detector       │
-└────────────────────────────────────────────────────────────┘
-```
+- `task_type` must be one of `classification`, `regression`, `ts_classification`, `ts_regression`, `ts_forecasting`.
+- Each node has a unique `id`.
+- `operation` must be allowed for the selected task type.
+- `inputs` contain upstream node IDs.
+- The graph must be a DAG with exactly one root node.
+- The root node is the final model.
 
-## Docker Services
+## Supported Tasks
 
-```
-┌─────────────────────────────────────────────────────┐
-│  docker-compose.yml                                  │
-│                                                      │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐ │
-│  │   ollama     │  │ fedot-server│  │   backend   │ │
-│  │             │  │             │  │             │ │
-│  │ ollama/     │  │ Python 3.10 │  │ Python 3.10 │ │
-│  │ ollama:     │  │ + Fedot.Ind │  │ + FastAPI   │ │
-│  │ latest      │  │ + FastAPI   │  │ + sklearn   │ │
-│  │             │  │             │  │ + xgboost   │ │
-│  │ Model:      │  │ Port: 8000  │  │ + ollama    │ │
-│  │ llama3.1    │  │             │  │             │ │
-│  │ Port: 11434 │  │ Endpoints:  │  │ Port: 8001  │ │
-│  │             │  │ /mcp        │  │             │ │
-│  │             │  │ /explain    │  │ Endpoints:  │ │
-│  │             │  │ /get_metrics│  │ /orchestrate│ │
-│  │             │  │ /params     │  │ /health     │ │
-│  │             │  │ /avail_ops  │  │ /config     │ │
-│  └─────────────┘  └─────────────┘  └─────────────┘ │
-│                                                      │
-│  ┌─────────────┐                                    │
-│  │  frontend   │  Shared volume: ./data:/app/data   │
-│  │ Streamlit   │  Network: ml-network (bridge)      │
-│  │ Port: 8502  │                                    │
-│  └─────────────┘                                    │
-└─────────────────────────────────────────────────────┘
-```
+Current scope:
 
-## Architectural Decisions
+- classification
+- regression
+- ts_classification
+- ts_regression
+- ts_forecasting
 
-### Double Serialization (MCP + HTTP)
+Anomaly detection was removed from the active flow to keep the first graph-oriented version focused.
 
-Agent calls to Fedot.Industrial go through two serialization layers:
-```
-Agent → JSON-RPC (MCP stdio) → MCP Server → HTTP JSON → Fedot Server → FedotIndustrial
-```
+## Frontend Flow
 
-This is an accepted trade-off because:
-- Fedot Server runs in a separate Docker container (heavy dependencies)
-- MCP Server runs as subprocess in the backend container
-- Without HTTP, we'd need to embed FedotIndustrial in the backend container (breaks isolation)
-- Latency overhead is negligible compared to model training time (minutes)
+The Streamlit app is organized around graph approval:
 
-### Tool Filtering per Agent
+1. Upload CSV and choose target/task.
+2. Ask Architect to propose a graph.
+3. Inspect available operations and graph visualization.
+4. Optionally edit the graph by adding/removing/replacing nodes or setting params.
+5. Approve the graph and run iterative GraphAutoML.
+6. Review metrics, Critic feedback, and final Scribe report.
 
-Each agent sees ONLY its tools via `ALLOWED_TOOLS`:
-- Architect: 5 tools (profiling, baselines, config)
-- Engineer: 3 tools (train, fedot, compare)
-- Critic: 4 tools (errors, importance, explain, metrics)
-- Scribe: 1 tool (report)
+## Main Files
 
-This prevents LLM confusion from seeing 15+ tools and improves tool selection accuracy.
+- `backend/graph_engine.py` - graph schema, validation, mutation, Fedot conversion, metrics.
+- `backend/mcp_server.py` - MCP tools for profiling, graph validation, training, validation, reporting.
+- `backend/orchestrator.py` - agent loop and Architect chat helper.
+- `backend/agents/` - agent implementations and shared dataclasses.
+- `backend/app.py` - FastAPI endpoints.
+- `frontend/streamlit_app.py` - interactive graph-first UI.
 
-### Cross-Iteration Memory
+## API Endpoints
 
-`DataContext.iteration_history` stores `IterationRecord` for each completed iteration:
-- Best model and score
-- Fedot config used
-- Failed baselines
-- Critic's winner and suggested changes
+- `GET /health`
+- `GET /config`
+- `GET /tools`
+- `POST /architect/chat`
+- `POST /graph/mutate`
+- `POST /orchestrate`
+- `POST /orchestrate/stream`
 
-Architect receives this history in its prompt to avoid repeating failed approaches.
-
-### Forced Feedback Merge
-
-Orchestrator force-merges `CriticFeedback.suggested_fedot_changes` into Architect's FedotConfig
-AFTER the Architect runs. This guarantees Critic feedback is applied even if the LLM ignores it.
-
-### Stop Criteria
-
-Two stop conditions:
-1. Critic sets `should_stop=True` (score good enough)
-2. Score-based: no improvement > 0.001 for 2 consecutive iterations
+`/orchestrate/file` was removed because the frontend writes uploaded CSVs into the shared `data` volume and calls `/orchestrate/stream`.

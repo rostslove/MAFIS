@@ -1,91 +1,106 @@
+"""Scribe: turns GraphAutoML iterations into a compact final report."""
+
 import json
 import logging
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, List
 
-from .base_agent import BaseAgent
+from .base_agent import BaseAgent, extract_json_block
 from .schemas import DataContext, ScribeReport
 
 logger = logging.getLogger("Scribe")
 
 
 class Scribe(BaseAgent):
-    """Scribe: generates final report via MCP tools. Called ONCE at end."""
+    """Reporting agent called once after the iterative loop."""
 
     ALLOWED_TOOLS = ["generate_report"]
 
-    SYSTEM_PROMPT = """You are a Solution Architect writing a comprehensive ML report.
-
-You have access to MCP tool:
-1. generate_report - Compile iteration history into a structured report.
-
-Call generate_report with iteration data, then provide a polished summary.
-
-Your report should include:
-TITLE: Solution name
-SUMMARY: Executive summary
-METHODOLOGY: What was tried
-RESULTS: Final metrics
-RECOMMENDATIONS: Next steps
-"""
+    SYSTEM_PROMPT = """You are the Scribe Agent for GraphAutoML.
+Write a concise technical report from the iteration summary.
+Return JSON only:
+{
+  "title": "...",
+  "summary": "...",
+  "methodology": "...",
+  "results": "...",
+  "recommendations": ["..."]
+}"""
 
     def __init__(self, name: str = "Scribe", mcp_client=None):
         super().__init__(name=name, mcp_client=mcp_client)
 
     async def execute(self, all_iterations: List[Dict[str, Any]], data_context: DataContext) -> ScribeReport:
-        """Generate final report."""
         self._tool_call_log = []
-        result = ScribeReport()
+        report = ScribeReport()
 
         try:
-            logger.info("[Scribe] Generating final report")
-
-            # Build iterations summary for context
-            iterations_text = ""
-            for it in all_iterations:
-                it_num = it.get("iteration", "?")
-                eng = it.get("engineer", {})
-                crit = it.get("critic", {})
-                iterations_text += f"""
---- Iteration {it_num} ---
-Best model: {eng.get('best_model', 'N/A')} (score: {eng.get('best_score', 0):.4f})
-Fedot score: {eng.get('fedot_result', {}).get('score', 0):.4f}
-Winner: {crit.get('winner', 'N/A')}
-Suggested changes: {crit.get('suggested_fedot_changes', {})}
-"""
-
-            context = f"""Generate a comprehensive report for this ML experiment.
-
-Data: {data_context.csv_path}
-Task: {data_context.task_type}
-Samples: {data_context.profile.get('n_samples', 'N/A')}
-Features: {data_context.profile.get('n_features', 'N/A')}
-
-ITERATION RESULTS:
-{iterations_text}
-
-Please call generate_report with the iteration data, then provide a polished summary.
-"""
-
-            response = await self.call_llm(context)
-            text = response.get("full_response", "")
-
-            result.title = self.extract_field(text, "TITLE") or "ML Experiment Report"
-            result.summary = self.extract_field(text, "SUMMARY") or text[:500]
-            result.methodology = self.extract_field(text, "METHODOLOGY") or ""
-            result.results = self.extract_field(text, "RESULTS") or ""
-            result.recommendations = self.extract_list(text, "RECOMMENDATIONS") or ["Monitor model performance"]
-            result.full_response = text
-            result.tool_calls = self.get_tool_calls()
-
-            logger.info(f"[Scribe] Report: {result.title}")
-            return result
-
-        except Exception as e:
-            logger.error(f"[Scribe] Error: {e}")
-            return ScribeReport(
-                title="ML Experiment Report",
-                summary="Report generation failed",
-                recommendations=["Review logs"],
-                full_response=str(e),
-                tool_calls=self.get_tool_calls(),
+            tool_report = await self.call_mcp_tool(
+                "generate_report",
+                {"iterations_json": json.dumps(all_iterations, ensure_ascii=False)},
             )
+            if not isinstance(tool_report, dict):
+                tool_report = {}
+
+            llm_report = await self._ask_llm(all_iterations, data_context, tool_report)
+            best_score = tool_report.get("best_score", 0)
+            n_iterations = tool_report.get("n_iterations", len(all_iterations))
+
+            report.title = llm_report.get("title") or f"GraphAutoML report: {data_context.task_type}"
+            report.summary = llm_report.get("summary") or (
+                f"Completed {n_iterations} iteration(s). Best graph score: {best_score:.4f}."
+            )
+            report.methodology = llm_report.get("methodology") or (
+                "Architect proposed graph structures, Engineer tuned graph parameters and trained baselines, "
+                "Critic validated results and suggested graph mutations."
+            )
+            report.results = llm_report.get("results") or self._default_results(tool_report)
+            report.recommendations = llm_report.get("recommendations") or self._default_recommendations(all_iterations)
+            report.best_graph_mermaid = tool_report.get("best_graph_mermaid", "")
+            report.full_response = json.dumps(llm_report, ensure_ascii=False) if llm_report else json.dumps(tool_report, ensure_ascii=False)
+            report.tool_calls = self.get_tool_calls()
+            logger.info("[Scribe] report ready")
+            return report
+
+        except Exception as exc:
+            logger.exception("[Scribe] failed")
+            report.title = "GraphAutoML report"
+            report.summary = f"Report generation failed: {exc}"
+            report.recommendations = ["Review backend logs and rerun the orchestration"]
+            report.tool_calls = self.get_tool_calls()
+            return report
+
+    async def _ask_llm(
+        self,
+        iterations: List[Dict[str, Any]],
+        dc: DataContext,
+        tool_report: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        context = f"""Task: {dc.task_type}
+Data profile: {json.dumps(dc.profile, ensure_ascii=False)}
+Tool summary: {json.dumps(tool_report, ensure_ascii=False)}
+Iterations: {json.dumps(iterations, ensure_ascii=False)[:8000]}
+Return the report JSON only."""
+        response = await self.call_llm(context, max_rounds=1, use_tools=False)
+        return extract_json_block(response.get("full_response", "")) or {}
+
+    @staticmethod
+    def _default_results(tool_report: Dict[str, Any]) -> str:
+        summaries = tool_report.get("iteration_summaries", [])
+        if not summaries:
+            return "No successful iteration summaries were produced."
+        lines = [
+            f"Iteration {item.get('iteration')}: graph={item.get('graph_score', 0):.4f}, "
+            f"baseline={item.get('best_baseline', 0):.4f}, winner={item.get('winner', 'n/a')}"
+            for item in summaries
+        ]
+        return "\n".join(lines)
+
+    @staticmethod
+    def _default_recommendations(iterations: List[Dict[str, Any]]) -> List[str]:
+        if not iterations:
+            return ["Run at least one GraphAutoML iteration"]
+        last = iterations[-1].get("critic", {})
+        suggestions = last.get("suggested_mutations", [])
+        if suggestions:
+            return ["Review the final Critic mutations before another run", "Increase tuning iterations for the approved graph"]
+        return ["Export and validate the best graph on a held-out dataset"]

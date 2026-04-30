@@ -1,45 +1,44 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
-from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
 import json
 import logging
-import tempfile
 import os
-from typing import Optional, Dict, Any
+from typing import Any, Dict, Optional
 
-from orchestrator import run_orchestration, run_orchestration_stream
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
+
 from agents.base_agent import LLM_MODEL
+from graph_engine import METRICS_BY_TASK, OPERATIONS, SUPPORTED_TASKS
+from orchestrator import mutate_graph_locally, propose_architecture, run_orchestration, run_orchestration_stream
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="ML Multi-Agent System (MCP)", version="3.0.0")
+app = FastAPI(title="GraphAutoML MCP System", version="4.0.0")
 
-# Agent → Tool mapping
+
 AGENT_TOOLS = {
-    "architect": [
-        "get_data_profile", "get_available_baselines",
-        "get_available_operations", "propose_fedot_config", "mutate_fedot_config",
-    ],
-    "engineer": ["train_baseline", "call_fedot", "compare_results"],
-    "critic": ["analyze_errors", "get_feature_importance", "explain_model", "get_additional_metrics"],
-    "scribe": ["generate_report"],
+    "architect": ["get_data_profile", "get_available_operations", "propose_graph", "mutate_graph", "visualize_graph"],
+    "engineer": ["get_baselines", "train_baseline", "tune_graph_hyperparameters", "train_graph"],
+    "critic": ["validate_graph", "analyze_errors", "get_node_importance", "explain_graph"],
+    "scribe": ["generate_report", "visualize_graph"],
 }
 
 TOOL_DESCRIPTIONS = {
-    "get_data_profile": "Profile dataset: statistics, issues, recommendations",
-    "get_available_baselines": "Get sklearn baselines for classification/regression",
-    "get_available_operations": "Get Fedot.Industrial models/preprocessing/strategies for any task type",
-    "propose_fedot_config": "Propose Fedot.Industrial configuration (preset, strategy, operations...)",
-    "mutate_fedot_config": "Modify config based on Critic feedback",
-    "train_baseline": "Train a sklearn pipeline and get metrics",
-    "call_fedot": "Call Fedot.Industrial with full parameter control (all task types)",
-    "compare_results": "Compare all models and determine the best",
-    "analyze_errors": "Analyze prediction errors, baseline vs Fedot comparison",
-    "get_feature_importance": "Feature importance from tree-based models",
-    "explain_model": "Explain Fedot model predictions (point/recurrence/shap/lime)",
-    "get_additional_metrics": "Calculate additional metrics from Fedot",
-    "generate_report": "Compile iteration results into structured report",
+    "get_data_profile": "Profile dataset shape, target distribution, issues and recommendations",
+    "get_available_operations": "Return atomic graph operations allowed for a task type",
+    "propose_graph": "Validate a graph candidate and return Mermaid markup",
+    "mutate_graph": "Apply add/remove/replace/set_params/connect mutations to a graph",
+    "visualize_graph": "Render graph JSON to Mermaid markup",
+    "get_baselines": "List simple sklearn baselines for the task",
+    "train_baseline": "Train and score one baseline model",
+    "tune_graph_hyperparameters": "Tune node hyperparameters without changing graph structure",
+    "train_graph": "Fit and score a graph exactly as proposed",
+    "validate_graph": "Cross-validate a graph",
+    "analyze_errors": "Compare graph score with baseline scores",
+    "get_node_importance": "Estimate node contribution by ablation",
+    "explain_graph": "Explain the last trained graph if model internals expose importances",
+    "generate_report": "Compile iteration results into a final report summary",
 }
 
 
@@ -47,15 +46,28 @@ class OrchestrationRequest(BaseModel):
     csv_path: str
     target_column: str
     task_type: str = "classification"
-    fedot_url: str = "http://fedot-server:8000"
     iterations: int = 3
-    initial_fedot_config: Optional[Dict[str, Any]] = None
+    initial_graph: Optional[Dict[str, Any]] = None
     forecast_length: Optional[int] = None
+
+
+class ArchitectChatRequest(BaseModel):
+    csv_path: str
+    target_column: str
+    task_type: str = "classification"
+    message: str = ""
+    current_graph: Optional[Dict[str, Any]] = None
+    forecast_length: Optional[int] = None
+
+
+class GraphMutationRequest(BaseModel):
+    graph: Dict[str, Any]
+    mutation: Dict[str, Any]
 
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "service": "ml-multi-agent-mcp"}
+    return {"status": "healthy", "service": "graph-automl-mcp"}
 
 
 @app.get("/config")
@@ -63,64 +75,90 @@ async def get_config():
     return {
         "agents": ["Architect", "Engineer", "Critic", "Scribe"],
         "llm_model": LLM_MODEL,
-        "ollama_host": os.getenv("OLLAMA_HOST", "http://localhost:11434"),
-        "fedot_host": os.getenv("FEDOT_HOST", "http://fedot-server:8000"),
         "protocol": "MCP",
         "transport": "stdio",
+        "supported_tasks": SUPPORTED_TASKS,
+        "metrics_by_task": METRICS_BY_TASK,
+        "operations": OPERATIONS,
+        "openrouter_configured": bool(os.getenv("OPENROUTER_API_KEY")),
     }
 
 
 @app.get("/tools")
 async def get_tools():
-    """Return all MCP tools grouped by agent."""
-    result = {}
-    for agent, tool_names in AGENT_TOOLS.items():
-        result[agent] = [
+    return {
+        agent: [
             {"name": name, "description": TOOL_DESCRIPTIONS.get(name, "")}
-            for name in tool_names
+            for name in names
         ]
-    return result
+        for agent, names in AGENT_TOOLS.items()
+    }
+
+
+@app.post("/architect/chat")
+async def architect_chat(request: ArchitectChatRequest):
+    try:
+        result = await propose_architecture(
+            csv_path=request.csv_path,
+            target_column=request.target_column,
+            task_type=request.task_type,
+            message=request.message,
+            current_graph=request.current_graph,
+            forecast_length=request.forecast_length,
+        )
+        if result.get("error"):
+            raise HTTPException(status_code=400, detail=result["error"])
+        return JSONResponse(content=result)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Architect chat failed")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/graph/mutate")
+async def graph_mutate(request: GraphMutationRequest):
+    try:
+        result = mutate_graph_locally(request.graph, request.mutation)
+        return JSONResponse(content=result)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.post("/orchestrate")
 async def orchestrate(request: OrchestrationRequest):
-    """Non-streaming orchestration (returns full result at end)."""
     try:
         result = await run_orchestration(
             csv_path=request.csv_path,
             target_column=request.target_column,
             task_type=request.task_type,
-            fedot_url=request.fedot_url,
             iterations=request.iterations,
-            initial_fedot_config=request.initial_fedot_config,
+            initial_graph=request.initial_graph,
             forecast_length=request.forecast_length,
         )
         return JSONResponse(content=result)
-    except Exception as e:
-        logger.error(f"Orchestration failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as exc:
+        logger.exception("Orchestration failed")
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.post("/orchestrate/stream")
 async def orchestrate_stream(request: OrchestrationRequest):
-    """SSE streaming orchestration — sends progress events in real time."""
-
     async def event_generator():
         try:
             async for evt in run_orchestration_stream(
                 csv_path=request.csv_path,
                 target_column=request.target_column,
                 task_type=request.task_type,
-                fedot_url=request.fedot_url,
                 iterations=request.iterations,
-                initial_fedot_config=request.initial_fedot_config,
+                initial_graph=request.initial_graph,
                 forecast_length=request.forecast_length,
             ):
-                data = json.dumps(evt, default=str, ensure_ascii=False)
-                yield f"data: {data}\n\n"
-        except Exception as e:
-            error_data = json.dumps({"event": "error", "message": str(e)})
-            yield f"data: {error_data}\n\n"
+                yield f"data: {json.dumps(evt, default=str, ensure_ascii=False)}\n\n"
+        except Exception as exc:
+            logger.exception("Streaming orchestration failed")
+            error = {"event": "error", "message": str(exc)}
+            yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
         event_generator(),
@@ -133,33 +171,7 @@ async def orchestrate_stream(request: OrchestrationRequest):
     )
 
 
-@app.post("/orchestrate/file")
-async def orchestrate_file(
-    file: UploadFile = File(...),
-    target_column: str = None,
-    task_type: str = "classification",
-    iterations: int = 3,
-    forecast_length: int = None,
-):
-    if not target_column:
-        raise HTTPException(status_code=400, detail="target_column required")
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
-            tmp.write(await file.read())
-            tmp_path = tmp.name
-        try:
-            result = await run_orchestration(
-                csv_path=tmp_path, target_column=target_column, task_type=task_type,
-                fedot_url=os.getenv("FEDOT_HOST", "http://fedot-server:8000"),
-                iterations=iterations, forecast_length=forecast_length,
-            )
-            return JSONResponse(content=result)
-        finally:
-            os.unlink(tmp_path)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8001)

@@ -26,19 +26,17 @@ class MCPToolClient:
         self._tools_cache: Optional[List[Dict[str, Any]]] = None
         self._connected = False
 
-    async def connect(self, server_script: str = "mcp_server.py", fedot_url: str = "http://fedot-server:8000"):
+    async def connect(self, server_script: str = "mcp_server.py"):
         """Launch MCP server subprocess and establish connection."""
         try:
             # Ensure MCP server subprocess can find backend modules
             server_dir = os.path.dirname(os.path.abspath(server_script))
             python_path = os.environ.get("PYTHONPATH", "")
             if server_dir not in python_path:
-                python_path = f"{server_dir}:{python_path}" if python_path else server_dir
+                python_path = f"{server_dir}{os.pathsep}{python_path}" if python_path else server_dir
 
             env = {
                 **os.environ,
-                "FEDOT_URL": fedot_url,
-                "FEDOT_HOST": fedot_url,
                 "PYTHONPATH": python_path,
             }
 
@@ -135,14 +133,14 @@ class MCPToolClient:
             logger.error(f"Failed to list tools: {e}")
             return []
 
-    def get_tools_for_ollama(self) -> List[Dict[str, Any]]:
-        """Convert MCP tool schemas to Ollama tool calling format."""
+    def get_tools_for_openai(self) -> List[Dict[str, Any]]:
+        """Convert MCP tool schemas to OpenAI-compatible tool calling format."""
         if not self._tools_cache:
             return []
 
-        ollama_tools = []
+        tools = []
         for tool in self._tools_cache:
-            ollama_tools.append({
+            tools.append({
                 "type": "function",
                 "function": {
                     "name": tool["name"],
@@ -150,7 +148,7 @@ class MCPToolClient:
                     "parameters": tool.get("input_schema", {"type": "object", "properties": {}}),
                 },
             })
-        return ollama_tools
+        return tools
 
     @property
     def is_connected(self) -> bool:

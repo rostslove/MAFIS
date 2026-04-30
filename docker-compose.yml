@@ -1,23 +1,4 @@
 services:
-  fedot-server:
-    build:
-      context: .
-      dockerfile: fedot.Dockerfile
-    container_name: fedot-server
-    ports:
-      - "8000:8000"
-    volumes:
-      - ./data:/app/data
-    networks:
-      - ml-network
-    environment:
-      - PYTHONUNBUFFERED=1
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-
   backend:
     build:
       context: .
@@ -30,14 +11,10 @@ services:
       - ml-network
     environment:
       - PYTHONUNBUFFERED=1
-      - FEDOT_HOST=http://fedot-server:8000
-      - FEDOT_URL=http://fedot-server:8000
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       - OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
-      - OPENROUTER_TITLE=Industrial Learning Agent
+      - OPENROUTER_TITLE=GraphAutoML Agent
       - LLM_MODEL=${LLM_MODEL:-meta-llama/llama-3.3-70b-instruct:free}
-    depends_on:
-      - fedot-server
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
       interval: 10s
@@ -63,6 +40,3 @@ services:
 networks:
   ml-network:
     driver: bridge
-
-volumes:
-  data:
