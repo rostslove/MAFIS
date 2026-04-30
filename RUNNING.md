@@ -26,14 +26,38 @@ cd D:\Diploma\Fedot.Industrial
 poetry install
 ```
 
-## 2. Install Backend App Dependencies Into That Poetry Env
+## 2. Restore The Poetry Env If Requirements Were Installed Before
+
+If you previously ran the old backend requirements, restore Fedot.Industrial dependencies first. The old file pinned `pandas` and `scikit-learn` too low for Fedot.Industrial 0.5.0.
+
+```bash
+cd ~/Fedot.Industrial
+poetry install --sync
+```
+
+If your Poetry version says `--sync` is deprecated, use:
+
+```bash
+poetry sync
+```
+
+## 3. Install Backend App Dependencies Into That Poetry Env
 
 ```powershell
 cd D:\Diploma\Fedot.Industrial
 poetry run pip install -r ..\industrial-learning-agent\backend\requirements.txt
 ```
 
-## 3. Run Backend
+On Linux use `/`, not Windows `\`:
+
+```bash
+cd ~/Fedot.Industrial
+poetry run pip install -r ../industrial-learning-agent/backend/requirements.txt
+```
+
+The backend requirements intentionally do not install `fedot-ind`, `pandas`, `scikit-learn`, `xgboost`, or the official `mcp` package; those either come from Fedot.Industrial or are replaced by the local MCP tool adapter. This keeps the Poetry environment on Pydantic v1, as required by Fedot.Industrial's `spacy` dependency.
+
+## 4. Run Backend
 
 ```powershell
 cd D:\Diploma\Fedot.Industrial
@@ -48,7 +72,16 @@ Backend URL:
 http://localhost:8001
 ```
 
-## 4. Run Frontend
+Linux:
+
+```bash
+cd ~/Fedot.Industrial
+export FEDOT_INDUSTRIAL_PATH="$HOME/Fedot.Industrial"
+export OPENROUTER_API_KEY="your_key"
+poetry run python ../industrial-learning-agent/backend/app.py
+```
+
+## 5. Run Frontend
 
 Open a second terminal:
 

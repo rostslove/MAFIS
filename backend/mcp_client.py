@@ -1,164 +1,105 @@
 """
-MCP Client wrapper for the multi-agent system.
+Local MCP-style client for the multi-agent system.
 
-Launches the MCP server as a subprocess and provides a clean interface
-for agents to call tools via MCP protocol.
+The official Python MCP SDK currently depends on Pydantic v2. Fedot.Industrial
+0.5.0 pulls spacy 3.5.x, which requires Pydantic v1. To keep one stable Poetry
+environment, this client calls the local tool registry in-process while exposing
+the same tool-call interface to agents.
 """
 
-import os
+import importlib.util
 import json
 import logging
-from typing import Dict, Any, List, Optional
-from contextlib import AsyncExitStack
-
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+import os
+import sys
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("MCP-Client")
 
 
 class MCPToolClient:
-    """Client that connects to the MCP tool server via stdio."""
+    """Client that exposes MCP-style tool metadata and direct local calls."""
 
     def __init__(self):
-        self.session: Optional[ClientSession] = None
-        self._exit_stack = AsyncExitStack()
+        self._server_module: Optional[Any] = None
         self._tools_cache: Optional[List[Dict[str, Any]]] = None
         self._connected = False
 
     async def connect(self, server_script: str = "mcp_server.py"):
-        """Launch MCP server subprocess and establish connection."""
+        """Load the local MCP tool registry."""
         try:
-            # Ensure MCP server subprocess can find backend modules
-            server_dir = os.path.dirname(os.path.abspath(server_script))
-            python_path = os.environ.get("PYTHONPATH", "")
-            if server_dir not in python_path:
-                python_path = f"{server_dir}{os.pathsep}{python_path}" if python_path else server_dir
+            server_path = os.path.abspath(server_script)
+            server_dir = os.path.dirname(server_path)
+            if server_dir not in sys.path:
+                sys.path.insert(0, server_dir)
 
-            env = {
-                **os.environ,
-                "PYTHONPATH": python_path,
-            }
+            spec = importlib.util.spec_from_file_location("graph_automl_mcp_server", server_path)
+            if spec is None or spec.loader is None:
+                raise RuntimeError(f"Cannot load MCP server module from {server_path}")
 
-            server_params = StdioServerParameters(
-                command="python",
-                args=[server_script],
-                env=env,
-            )
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
 
-            logger.info(f"Launching MCP server: python {server_script}")
-
-            stdio_transport = await self._exit_stack.enter_async_context(
-                stdio_client(server_params)
-            )
-            read_stream, write_stream = stdio_transport
-
-            self.session = await self._exit_stack.enter_async_context(
-                ClientSession(read_stream, write_stream)
-            )
-            await self.session.initialize()
-
-            # Cache tools
-            tools_response = await self.session.list_tools()
-            self._tools_cache = [
-                {
-                    "name": tool.name,
-                    "description": tool.description or "",
-                    "input_schema": tool.inputSchema if hasattr(tool, "inputSchema") else {},
-                }
-                for tool in tools_response.tools
-            ]
-
+            self._server_module = module
+            self._tools_cache = module.mcp.list_tools()
             self._connected = True
-            logger.info(f"MCP connected. Available tools: {[t['name'] for t in self._tools_cache]}")
+            logger.info("MCP tools connected locally: %s", [t["name"] for t in self._tools_cache])
 
-        except Exception as e:
-            logger.error(f"MCP connection failed: {e}")
+        except Exception as exc:
+            logger.error("MCP connection failed: %s", exc)
             self._connected = False
             raise
 
     async def call_tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Call a tool on the MCP server. Returns parsed JSON result."""
-        if not self._connected or not self.session:
+        """Call a local MCP tool. Returns parsed JSON result."""
+        if not self._connected or self._server_module is None:
             return {"error": "MCP client not connected"}
 
         try:
-            logger.info(f"MCP tool call: {name}({arguments})")
+            logger.info("MCP tool call: %s(%s)", name, arguments)
+            result = self._server_module.mcp.call_tool(name, arguments)
 
-            result = await self.session.call_tool(name, arguments)
-
-            # Parse the result content
-            if result.content:
-                text_parts = []
-                for block in result.content:
-                    if hasattr(block, "text"):
-                        text_parts.append(block.text)
-
-                combined = "\n".join(text_parts)
-
-                # Try to parse as JSON
+            if isinstance(result, str):
                 try:
-                    parsed = json.loads(combined)
-                    logger.info(f"MCP tool '{name}' returned successfully")
-                    return parsed
+                    return json.loads(result)
                 except json.JSONDecodeError:
-                    return {"result": combined}
-            else:
-                return {"result": None}
+                    return {"result": result}
+            if isinstance(result, dict):
+                return result
+            return {"result": result}
 
-        except Exception as e:
-            logger.error(f"MCP tool call '{name}' failed: {e}")
-            return {"error": str(e)}
+        except Exception as exc:
+            logger.error("MCP tool call '%s' failed: %s", name, exc)
+            return {"error": str(exc)}
 
     async def list_tools(self) -> List[Dict[str, Any]]:
         """Return cached list of available tools with descriptions."""
-        if self._tools_cache is not None:
-            return self._tools_cache
-
-        if not self._connected or not self.session:
-            return []
-
-        try:
-            tools_response = await self.session.list_tools()
-            self._tools_cache = [
-                {
-                    "name": tool.name,
-                    "description": tool.description or "",
-                    "input_schema": tool.inputSchema if hasattr(tool, "inputSchema") else {},
-                }
-                for tool in tools_response.tools
-            ]
-            return self._tools_cache
-        except Exception as e:
-            logger.error(f"Failed to list tools: {e}")
-            return []
+        return self._tools_cache or []
 
     def get_tools_for_openai(self) -> List[Dict[str, Any]]:
         """Convert MCP tool schemas to OpenAI-compatible tool calling format."""
         if not self._tools_cache:
             return []
 
-        tools = []
-        for tool in self._tools_cache:
-            tools.append({
+        return [
+            {
                 "type": "function",
                 "function": {
                     "name": tool["name"],
                     "description": tool["description"],
                     "parameters": tool.get("input_schema", {"type": "object", "properties": {}}),
                 },
-            })
-        return tools
+            }
+            for tool in self._tools_cache
+        ]
 
     @property
     def is_connected(self) -> bool:
         return self._connected
 
     async def cleanup(self):
-        """Close the MCP connection."""
-        try:
-            await self._exit_stack.aclose()
-            self._connected = False
-            logger.info("MCP client disconnected")
-        except Exception as e:
-            logger.error(f"MCP cleanup error: {e}")
+        """Mark the local tool registry as disconnected."""
+        self._connected = False
+        self._server_module = None
+        logger.info("MCP client disconnected")

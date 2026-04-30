@@ -1,15 +1,17 @@
 """
 MCP server hosting all tools for the GraphAutoML multi-agent system.
 
-Tools call Fedot.Industrial directly (no HTTP proxy). Run with:
-    python mcp_server.py
+Tools call Fedot.Industrial directly (no HTTP proxy). The registry is loaded
+in-process by mcp_client.py to avoid the Pydantic v2 dependency of the
+official MCP SDK.
 """
 
 import json
 import logging
 import os
 import sys
-from typing import Any, Dict, List, Optional
+from inspect import Parameter, signature
+from typing import Any, Dict, List, Optional, Union, get_args, get_origin
 
 # Make backend importable when launched as subprocess
 _backend_dir = os.path.dirname(os.path.abspath(__file__))
@@ -25,8 +27,6 @@ from sklearn.pipeline import Pipeline as SkPipeline
 from sklearn.model_selection import train_test_split
 from xgboost import XGBClassifier, XGBRegressor
 
-from mcp.server.fastmcp import FastMCP
-
 from data_profiler import DataProfiler
 from graph_engine import (
     OPERATIONS, METRICS_BY_TASK, SUPPORTED_TASKS, DEFAULT_GRAPHS,
@@ -37,7 +37,75 @@ from graph_engine import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("MCP")
 
-mcp = FastMCP("GraphAutoMLTools")
+
+def _json_type(annotation: Any) -> str:
+    origin = get_origin(annotation)
+    if origin is Union:
+        non_none = [arg for arg in get_args(annotation) if arg is not type(None)]
+        return _json_type(non_none[0]) if non_none else "string"
+    if origin in (list, List):
+        return "array"
+    if origin in (dict, Dict):
+        return "object"
+    if annotation is bool:
+        return "boolean"
+    if annotation is int:
+        return "integer"
+    if annotation is float:
+        return "number"
+    if annotation in (str, Parameter.empty):
+        return "string"
+    return "object"
+
+
+class LocalMCPRegistry:
+    """Small MCP-like tool registry without the external MCP SDK dependency."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self._tools: Dict[str, Any] = {}
+
+    def tool(self):
+        def decorator(func):
+            self._tools[func.__name__] = func
+            return func
+        return decorator
+
+    def call_tool(self, name: str, arguments: Dict[str, Any]) -> Any:
+        if name not in self._tools:
+            raise ValueError(f"Unknown tool: {name}")
+        return self._tools[name](**arguments)
+
+    def list_tools(self) -> List[Dict[str, Any]]:
+        tools = []
+        for name, func in self._tools.items():
+            sig = signature(func)
+            properties = {}
+            required = []
+            for param_name, param in sig.parameters.items():
+                properties[param_name] = {"type": _json_type(param.annotation)}
+                if param.default is Parameter.empty:
+                    required.append(param_name)
+
+            tools.append({
+                "name": name,
+                "description": (func.__doc__ or "").strip(),
+                "input_schema": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                },
+            })
+        return tools
+
+    def run(self, transport: str = "stdio") -> None:
+        raise RuntimeError(
+            "This project uses the local MCP adapter in-process to avoid the "
+            "Pydantic v2 dependency conflict with Fedot.Industrial 0.5.0."
+        )
+
+
+mcp = LocalMCPRegistry("GraphAutoMLTools")
 
 
 # ============== Trained-model store (single-process) ==============
@@ -486,4 +554,4 @@ def generate_report(iterations_json: str) -> str:
 # ================================================================
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    print(json.dumps({"server": mcp.name, "tools": mcp.list_tools()}, ensure_ascii=False, indent=2))

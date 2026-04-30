@@ -76,7 +76,7 @@ async def get_config():
         "agents": ["Architect", "Engineer", "Critic", "Scribe"],
         "llm_model": LLM_MODEL,
         "protocol": "MCP",
-        "transport": "stdio",
+        "transport": "local-adapter",
         "supported_tasks": SUPPORTED_TASKS,
         "metrics_by_task": METRICS_BY_TASK,
         "operations": OPERATIONS,

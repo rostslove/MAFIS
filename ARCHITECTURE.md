@@ -13,7 +13,7 @@ Streamlit frontend (:8502)
         v
 FastAPI backend (:8001)
         |
-        | MCP stdio subprocess
+        | MCP-style local tool adapter
         v
 MCP graph tools
         |
@@ -158,6 +158,10 @@ poetry install
 ```
 
 For local backend launch, run the backend inside this Poetry environment and install only the application dependencies from `backend/requirements.txt`.
+
+The backend requirements deliberately do not pin `pandas`, `scikit-learn`, or `xgboost`; those versions must remain controlled by `Fedot.Industrial/poetry.lock`.
+
+The official Python MCP SDK is not installed in the Fedot.Industrial Poetry environment because current releases require Pydantic v2, while Fedot.Industrial 0.5.0 depends on `spacy 3.5.x`, which requires Pydantic v1. The project keeps an MCP-style tool registry and OpenAI tool schema adapter locally.
 
 For Docker launch, `docker-compose.yml` passes the sibling checkout as a BuildKit additional context:
 

@@ -1,7 +1,10 @@
-fastapi>=0.115.0
+fastapi>=0.95.0,<0.100.0
 uvicorn>=0.30.0
-pandas>=2.0.0,<2.2.0
-scikit-learn>=1.3.0,<1.4.0
-xgboost>=2.0.0
 openai>=1.40.0
-mcp>=1.0.0
+
+# Fedot.Industrial 0.5.0 is installed from a local Poetry checkout.
+# Do not pin pandas/scikit-learn/xgboost here: they must stay at the
+# versions resolved by Fedot.Industrial's poetry.lock.
+# Do not install the official `mcp` package into this Poetry env: current
+# releases require Pydantic v2, while Fedot.Industrial's spacy dependency
+# requires Pydantic v1. The project uses a lightweight local MCP tool adapter.
