@@ -1,4 +1,35 @@
 services:
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      - ml-network
+    ports:
+      - "127.0.0.1:11434:11434"
+    environment:
+      - OLLAMA_KEEP_ALIVE=30m
+      - OLLAMA_CONTEXT_LENGTH=${OLLAMA_CONTEXT_LENGTH:-8192}
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  ollama-pull:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      - ml-network
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command: "until ollama list >/dev/null 2>&1; do sleep 1; done; ollama pull ${LLM_MODEL:-qwen2.5-coder:7b}"
+    depends_on:
+      ollama:
+        condition: service_started
+
   backend:
     build:
       context: .
@@ -13,11 +44,13 @@ services:
       - ml-network
     environment:
       - PYTHONUNBUFFERED=1
-      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
-      - OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
-      - OPENROUTER_TITLE=GraphAutoML Agent
-      - LLM_MODEL=${LLM_MODEL:-qwen/qwen3-coder:free}
+      - LLM_BASE_URL=http://ollama:11434/v1
+      - LLM_API_KEY=ollama
+      - LLM_MODEL=${LLM_MODEL:-qwen2.5-coder:7b}
       - FEDOT_INDUSTRIAL_PATH=/opt/Fedot.Industrial
+    depends_on:
+      ollama-pull:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
       interval: 10s
@@ -43,3 +76,6 @@ services:
 networks:
   ml-network:
     driver: bridge
+
+volumes:
+  ollama-data:

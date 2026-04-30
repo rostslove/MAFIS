@@ -55,13 +55,39 @@ poetry run pip install -r ../industrial-learning-agent/backend/requirements.txt
 
 The backend requirements intentionally do not install `fedot-ind`, `pandas`, `scikit-learn`, `xgboost`, FastAPI, or the official `mcp` package. Fedot.Industrial owns the scientific stack and Starlette, while the backend uses a local MCP tool adapter. This avoids conflicts with `python-fasthtml -> starlette~=1.0` and `spacy -> pydantic<2`.
 
-## 4. Run Backend
+## 4. Run Local LLM
+
+Recommended default model:
+
+```text
+qwen2.5-coder:7b
+```
+
+It is a practical default for Architect-style JSON/tool reasoning. If the server is CPU-only or low on RAM, use `qwen2.5-coder:3b` instead.
+
+With Docker Compose, Ollama is started automatically and the model is pulled by `ollama-pull`:
+
+```bash
+cd ~/industrial-learning-agent
+docker compose up --build
+```
+
+If the server has NVIDIA GPU runtime configured:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
+```
+
+The Ollama API is bound only to server-local `127.0.0.1:11434`. Backend containers call it through `http://ollama:11434/v1`.
+
+## 5. Run Backend Without Docker
 
 ```powershell
 cd D:\Diploma\Fedot.Industrial
 $env:FEDOT_INDUSTRIAL_PATH="$HOME/Fedot.Industrial"
-$env:OPENROUTER_API_KEY="your_key"
-$env:LLM_MODEL="qwen/qwen3-coder:free"
+$env:LLM_BASE_URL="http://localhost:11434/v1"
+$env:LLM_API_KEY="ollama"
+$env:LLM_MODEL="qwen2.5-coder:7b"
 poetry run python ../industrial-learning-agent/backend/app.py
 ```
 
@@ -71,19 +97,20 @@ Backend URL:
 http://localhost:8001
 ```
 
-You can also put `OPENROUTER_API_KEY` and `LLM_MODEL` into the project `.env`; the backend reads it from the project root even when launched from the Fedot.Industrial directory.
+You can also put `LLM_BASE_URL`, `LLM_API_KEY`, and `LLM_MODEL` into the project `.env`; the backend reads it from the project root even when launched from the Fedot.Industrial directory.
 
 Linux:
 
 ```bash
 cd ~/Fedot.Industrial
 export FEDOT_INDUSTRIAL_PATH="$HOME/Fedot.Industrial"
-export OPENROUTER_API_KEY="your_key"
-export LLM_MODEL="qwen/qwen3-coder:free"
+export LLM_BASE_URL="http://localhost:11434/v1"
+export LLM_API_KEY="ollama"
+export LLM_MODEL="qwen2.5-coder:7b"
 poetry run python ../industrial-learning-agent/backend/app.py
 ```
 
-## 5. Run Frontend
+## 6. Run Frontend
 
 Open a second terminal:
 
@@ -102,7 +129,7 @@ Frontend URL:
 http://localhost:8502
 ```
 
-## Docker Variant
+## Docker Notes
 
 Docker build expects `Fedot.Industrial` next to this project. The compose file uses:
 

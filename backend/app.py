@@ -7,7 +7,7 @@ from starlette.applications import Starlette
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
-from agents.base_agent import LLM_MODEL
+from agents.base_agent import LLM_BASE_URL, LLM_MODEL
 from graph_engine import (
     DEFAULT_GRAPHS,
     FEDOT_IND_VERSION,
@@ -72,9 +72,12 @@ async def health(request):
 
 
 async def get_config(request):
+    llm_provider = "ollama" if "11434" in LLM_BASE_URL or "ollama" in LLM_BASE_URL else "openai-compatible"
     return JSONResponse({
         "agents": ["Architect", "Engineer", "Critic", "Scribe"],
+        "llm_provider": llm_provider,
         "llm_model": LLM_MODEL,
+        "llm_base_url": LLM_BASE_URL,
         "protocol": "MCP",
         "transport": "local-adapter",
         "supported_tasks": SUPPORTED_TASKS,
@@ -83,7 +86,8 @@ async def get_config(request):
         "operation_catalog": {task: get_operation_catalog(task) for task in SUPPORTED_TASKS},
         "operation_descriptions": OPERATION_DESCRIPTIONS,
         "default_graphs": DEFAULT_GRAPHS,
-        "openrouter_configured": bool(os.getenv("OPENROUTER_API_KEY")),
+        "llm_configured": bool(os.getenv("LLM_API_KEY") or os.getenv("OPENROUTER_API_KEY") or LLM_BASE_URL),
+        "openrouter_configured": "openrouter.ai" in LLM_BASE_URL and bool(os.getenv("OPENROUTER_API_KEY")),
         "fedot_ind_version": FEDOT_IND_VERSION,
         "fedot_industrial_source": FEDOT_INDUSTRIAL_SOURCE,
     })

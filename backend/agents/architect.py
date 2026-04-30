@@ -69,8 +69,8 @@ The root is n3."
                         "summary": "Architect LLM call failed; a deterministic fallback graph was used.",
                         "technical_message": response.get("error", ""),
                         "recommendations": [
-                            "Retry when the OpenRouter provider is available.",
-                            "Set LLM_MODEL to another available free model if you need full Architect reasoning.",
+                            "Check that the configured LLM provider is running and the selected model is pulled.",
+                            "Set LLM_MODEL to a smaller local model if the current model is too slow or unavailable.",
                             "You can still edit and approve the fallback graph manually.",
                         ],
                         "recoverable": True,

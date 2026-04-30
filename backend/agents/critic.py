@@ -97,7 +97,7 @@ Return JSON only."""
                 else {}
             )
 
-            # Keep Critic deterministic during evaluation: OpenRouter limits should
+            # Keep Critic deterministic during evaluation: LLM limits should
             # not hide actionable feedback from the user.
             llm_feedback = {}
             feedback.suggested_mutations = (

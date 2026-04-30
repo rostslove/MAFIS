@@ -1,4 +1,4 @@
-"""Base agent: LLM tool calling via OpenRouter (OpenAI-compatible) + MCP."""
+"""Base agent: OpenAI-compatible LLM tool calling + MCP."""
 
 import json
 import logging
@@ -32,10 +32,11 @@ def _load_project_env() -> None:
 
 _load_project_env()
 
-DEFAULT_LLM_MODEL = "qwen/qwen3-coder:free"
+DEFAULT_LLM_MODEL = "qwen2.5-coder:7b"
+DEFAULT_LLM_BASE_URL = "http://localhost:11434/v1"
 LLM_MODEL = os.environ.get("LLM_MODEL", DEFAULT_LLM_MODEL)
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL") or os.environ.get("OPENROUTER_BASE_URL", DEFAULT_LLM_BASE_URL)
+LLM_API_KEY = os.environ.get("LLM_API_KEY") or os.environ.get("OPENROUTER_API_KEY") or "ollama"
 
 _client: Optional[OpenAI] = None
 
@@ -44,8 +45,8 @@ def get_llm_client() -> OpenAI:
     global _client
     if _client is None:
         _client = OpenAI(
-            api_key=OPENROUTER_API_KEY or "missing-key",
-            base_url=OPENROUTER_BASE_URL,
+            api_key=LLM_API_KEY,
+            base_url=LLM_BASE_URL,
             default_headers={
                 "HTTP-Referer": "http://localhost",
                 "X-Title": "GraphAutoML Agent",
