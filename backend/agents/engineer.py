@@ -2,6 +2,7 @@
 
 import json
 import logging
+from typing import Any, Dict, List
 
 from .base_agent import BaseAgent
 from .schemas import ArchitectResult, BaselineResult, DataContext, EngineerResult
@@ -39,6 +40,11 @@ Do not change graph structure; only node parameters may be tuned."""
                 result.graph_score = float(graph_run.get("score") or 0)
                 result.graph_metrics = graph_run.get("metrics", {}) or {}
                 result.tuned_nodes = graph_run.get("tuned_nodes", []) or []
+                result.graph_error = graph_run.get("error", "") or ""
+                result.diagnostics.extend(self._extract_diagnostics(graph_run))
+                result.diagnostics = self._unique_diagnostics(result.diagnostics)
+                if result.graph_error:
+                    result.graph_metrics["error"] = result.graph_error
 
             if result.baseline_results:
                 best = max(result.baseline_results, key=lambda r: r.score)
@@ -57,6 +63,17 @@ Do not change graph structure; only node parameters may be tuned."""
         except Exception as exc:
             logger.exception("[Engineer] failed")
             result.graph_metrics = {"error": str(exc)}
+            result.graph_error = str(exc)
+            result.diagnostics.append(
+                {
+                    "agent": "Engineer",
+                    "kind": "engineer_error",
+                    "summary": "Engineer could not complete training.",
+                    "technical_message": str(exc),
+                    "recommendations": ["Check the graph and dataset format, then run again."],
+                    "recoverable": True,
+                }
+            )
             result.tool_calls = self.get_tool_calls()
             return result
 
@@ -107,4 +124,32 @@ Do not change graph structure; only node parameters may be tuned."""
         if dc.forecast_length:
             fallback_args["forecast_length"] = dc.forecast_length
         trained = await self.call_mcp_tool("train_graph", fallback_args)
-        return trained if isinstance(trained, dict) else {"score": 0, "error": "train_graph returned no data"}
+        if not isinstance(trained, dict):
+            return {"score": 0, "error": "train_graph returned no data"}
+
+        if isinstance(tuned, dict) and tuned.get("error") and trained.get("error"):
+            trained.setdefault("diagnostics", [])
+            trained["diagnostics"].extend(self._extract_diagnostics(tuned))
+            trained["tuning_error"] = tuned.get("error")
+        return trained
+
+    @staticmethod
+    def _extract_diagnostics(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        diagnostics = payload.get("diagnostics", []) if isinstance(payload, dict) else []
+        clean = []
+        for item in diagnostics:
+            if isinstance(item, dict):
+                item = {**item, "agent": item.get("agent") or "Engineer"}
+                clean.append(item)
+        return clean
+
+    @staticmethod
+    def _unique_diagnostics(diagnostics: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        unique: List[Dict[str, Any]] = []
+        seen = set()
+        for item in diagnostics:
+            key = (item.get("kind"), item.get("summary"), item.get("technical_message"))
+            if key not in seen:
+                seen.add(key)
+                unique.append(item)
+        return unique

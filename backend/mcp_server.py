@@ -30,7 +30,7 @@ from xgboost import XGBClassifier, XGBRegressor
 from data_profiler import DataProfiler
 from graph_engine import (
     OPERATIONS, METRICS_BY_TASK, SUPPORTED_TASKS, DEFAULT_GRAPHS,
-    PipelineGraph, compute_metrics, is_ts_task,
+    PipelineGraph, compute_metrics, diagnose_runtime_error, get_operation_catalog, is_ts_task,
     load_input_data, split_input_data,
 )
 
@@ -129,6 +129,26 @@ def _predict_pipeline(pipeline, data, task_type: str) -> np.ndarray:
     return np.asarray(pipeline.predict(data).predict)
 
 
+def _failure_payload(error: Exception, task_type: str = "", graph: Optional[PipelineGraph] = None) -> Dict[str, Any]:
+    diagnostic = diagnose_runtime_error(error, task_type=task_type, graph=graph)
+    return {
+        "score": 0,
+        "error": str(error),
+        "diagnostics": [diagnostic],
+        "recommendations": diagnostic.get("recommendations", []),
+    }
+
+
+def _invalid_graph_payload(message: str, graph: PipelineGraph) -> Dict[str, Any]:
+    diagnostic = diagnose_runtime_error(message, task_type=graph.task_type, graph=graph)
+    return {
+        "score": 0,
+        "error": f"Invalid graph: {message}",
+        "diagnostics": [diagnostic],
+        "recommendations": diagnostic.get("recommendations", []),
+    }
+
+
 # ============== Sklearn baselines ==============
 
 def _baselines(task_type: str) -> Dict[str, SkPipeline]:
@@ -176,6 +196,7 @@ def get_available_operations(task_type: str) -> str:
         "is_time_series": is_ts_task(task_type),
         "preprocessing": ops["preprocessing"],
         "models": ops["models"],
+        "catalog": get_operation_catalog(task_type),
         "metrics": METRICS_BY_TASK.get(task_type, []),
         "default_graph": DEFAULT_GRAPHS.get(task_type, []),
     })
@@ -191,11 +212,13 @@ def propose_graph(graph_json: str) -> str:
     try:
         graph = PipelineGraph.from_dict(json.loads(graph_json))
         ok, msg = graph.validate()
+        diagnostics = [] if ok else [diagnose_runtime_error(msg, task_type=graph.task_type, graph=graph)]
         return json.dumps({
             "valid": ok,
             "message": msg,
             "graph": graph.to_dict(),
             "mermaid": graph.to_mermaid() if ok else "",
+            "diagnostics": diagnostics,
         })
     except Exception as e:
         return json.dumps({"valid": False, "message": str(e), "graph": None})
@@ -209,11 +232,13 @@ def mutate_graph(graph_json: str, mutation_json: str) -> str:
         mutation = json.loads(mutation_json)
         new_graph = graph.apply_mutation(mutation)
         ok, msg = new_graph.validate()
+        diagnostics = [] if ok else [diagnose_runtime_error(msg, task_type=new_graph.task_type, graph=new_graph)]
         return json.dumps({
             "valid": ok,
             "message": msg,
             "graph": new_graph.to_dict(),
             "mermaid": new_graph.to_mermaid() if ok else "",
+            "diagnostics": diagnostics,
         })
     except Exception as e:
         return json.dumps({"valid": False, "message": str(e)})
@@ -281,7 +306,7 @@ def train_graph(graph_json: str, csv_path: str, target_column: str, forecast_len
         graph = PipelineGraph.from_dict(json.loads(graph_json))
         ok, msg = graph.validate()
         if not ok:
-            return json.dumps({"score": 0, "error": f"Invalid graph: {msg}"})
+            return json.dumps(_invalid_graph_payload(msg, graph))
 
         input_data = load_input_data(csv_path, target_column, graph.task_type, forecast_length)
         train, val = split_input_data(input_data)
@@ -302,7 +327,7 @@ def train_graph(graph_json: str, csv_path: str, target_column: str, forecast_len
         })
     except Exception as e:
         logger.exception("train_graph failed")
-        return json.dumps({"score": 0, "error": str(e)})
+        return json.dumps(_failure_payload(e, task_type=getattr(locals().get("graph", None), "task_type", ""), graph=locals().get("graph")))
 
 
 @mcp.tool()
@@ -320,7 +345,7 @@ def tune_graph_hyperparameters(
         graph = PipelineGraph.from_dict(json.loads(graph_json))
         ok, msg = graph.validate()
         if not ok:
-            return json.dumps({"score": 0, "error": f"Invalid graph: {msg}"})
+            return json.dumps(_invalid_graph_payload(msg, graph))
 
         input_data = load_input_data(csv_path, target_column, graph.task_type, forecast_length)
         train, val = split_input_data(input_data)
@@ -354,7 +379,7 @@ def tune_graph_hyperparameters(
         })
     except Exception as e:
         logger.exception("tune_graph_hyperparameters failed")
-        return json.dumps({"score": 0, "error": str(e)})
+        return json.dumps(_failure_payload(e, task_type=getattr(locals().get("graph", None), "task_type", ""), graph=locals().get("graph")))
 
 
 @mcp.tool()
@@ -364,7 +389,8 @@ def validate_graph(graph_json: str, csv_path: str, target_column: str, cv_folds:
         graph = PipelineGraph.from_dict(json.loads(graph_json))
         ok, msg = graph.validate()
         if not ok:
-            return json.dumps({"score": 0, "error": f"Invalid graph: {msg}"})
+            payload = _invalid_graph_payload(msg, graph)
+            return json.dumps({"error": payload["error"], "diagnostics": payload["diagnostics"], "recommendations": payload["recommendations"]})
 
         input_data = load_input_data(csv_path, target_column, graph.task_type, forecast_length)
 
@@ -402,7 +428,8 @@ def validate_graph(graph_json: str, csv_path: str, target_column: str, cv_folds:
         })
     except Exception as e:
         logger.exception("validate_graph failed")
-        return json.dumps({"error": str(e)})
+        payload = _failure_payload(e, task_type=getattr(locals().get("graph", None), "task_type", ""), graph=locals().get("graph"))
+        return json.dumps({"error": payload["error"], "diagnostics": payload["diagnostics"], "recommendations": payload["recommendations"]})
 
 
 # ================================================================
@@ -431,7 +458,8 @@ def analyze_errors(baseline_results_json: str, graph_score: float, task_type: st
         out["failed_baselines"] = [b["name"] for b in baselines if b.get("error")]
         return json.dumps(out)
     except Exception as e:
-        return json.dumps({"error": str(e)})
+        payload = _failure_payload(e, task_type=getattr(locals().get("graph", None), "task_type", ""), graph=locals().get("graph"))
+        return json.dumps({"error": payload["error"], "diagnostics": payload["diagnostics"], "recommendations": payload["recommendations"]})
 
 
 @mcp.tool()

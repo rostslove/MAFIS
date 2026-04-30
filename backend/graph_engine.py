@@ -65,6 +65,7 @@ from fedot.core.repository.tasks import Task, TaskTypesEnum, TsForecastingParams
 
 
 SUPPORTED_TASKS = ["classification", "regression", "ts_classification", "ts_regression", "ts_forecasting"]
+TABULAR_TASKS = ["classification", "regression"]
 TS_TASKS = ["ts_classification", "ts_regression", "ts_forecasting"]
 
 
@@ -75,11 +76,16 @@ def is_ts_task(task_type: str) -> bool:
 # Atomic operations available per task type. Used for validation and proposal.
 OPERATIONS: Dict[str, Dict[str, List[str]]] = {
     "classification": {
-        "preprocessing": ["scaling", "normalization", "simple_imputation", "pca", "kernel_pca"],
+        # Fedot.Industrial 0.5 routes common preprocessing operations through
+        # industrial multidimensional strategies. On ordinary tabular CSV data
+        # they can receive 1D column slices and fail inside sklearn. Keep the
+        # default tabular graph model-only; sklearn baselines still provide a
+        # sanity check with scaling.
+        "preprocessing": [],
         "models": ["rf", "xgboost", "logit", "knn", "lgbm", "mlp", "dt"],
     },
     "regression": {
-        "preprocessing": ["scaling", "normalization", "simple_imputation", "pca", "kernel_pca"],
+        "preprocessing": [],
         "models": ["xgbreg", "treg", "ridge", "lasso", "lgbmreg", "knnreg", "dtreg", "sgdr"],
     },
     "ts_classification": {
@@ -127,12 +133,10 @@ METRICS_BY_TASK: Dict[str, List[str]] = {
 # Sensible default graph per task - used as starter / fallback.
 DEFAULT_GRAPHS: Dict[str, List[Dict[str, Any]]] = {
     "classification": [
-        {"id": "scale", "operation": "scaling", "params": {}, "inputs": []},
-        {"id": "model", "operation": "rf", "params": {}, "inputs": ["scale"]},
+        {"id": "model", "operation": "rf", "params": {}, "inputs": []},
     ],
     "regression": [
-        {"id": "scale", "operation": "scaling", "params": {}, "inputs": []},
-        {"id": "model", "operation": "ridge", "params": {}, "inputs": ["scale"]},
+        {"id": "model", "operation": "ridge", "params": {}, "inputs": []},
     ],
     "ts_classification": [
         {"id": "feat", "operation": "quantile_extractor", "params": {}, "inputs": []},
@@ -147,6 +151,181 @@ DEFAULT_GRAPHS: Dict[str, List[Dict[str, Any]]] = {
         {"id": "model", "operation": "ar", "params": {}, "inputs": ["smooth"]},
     ],
 }
+
+
+OPERATION_DESCRIPTIONS: Dict[str, str] = {
+    "rf": "Random forest classifier; robust baseline for tabular classification.",
+    "xgboost": "Gradient boosting classifier; useful for nonlinear tabular patterns.",
+    "logit": "Linear logistic model; good for small or mostly linear classification tasks.",
+    "knn": "Nearest-neighbor classifier; sensitive to feature scale.",
+    "lgbm": "LightGBM classifier; fast gradient boosting when available.",
+    "mlp": "Neural network classifier; needs enough samples.",
+    "dt": "Decision tree classifier; interpretable but can overfit.",
+    "ridge": "Regularized linear regressor; stable default for tabular regression.",
+    "lasso": "Sparse linear regressor; can suppress weak features.",
+    "xgbreg": "Gradient boosting regressor; strong nonlinear tabular baseline.",
+    "treg": "Tree ensemble regressor; robust nonlinear regression model.",
+    "lgbmreg": "LightGBM regressor; fast gradient boosting when available.",
+    "knnreg": "Nearest-neighbor regressor; sensitive to feature scale.",
+    "dtreg": "Decision tree regressor; interpretable but can overfit.",
+    "sgdr": "Linear stochastic-gradient regressor; useful on larger tables.",
+    "scaling": "Scale time-series channels before feature extraction.",
+    "normalization": "Normalize time-series channels before feature extraction.",
+    "channel_filtration": "Filter noisy or weak time-series channels.",
+    "wavelet_basis": "Wavelet decomposition for localized time-frequency patterns.",
+    "fourier_basis": "Frequency-domain representation for periodic signals.",
+    "eigen_basis": "Basis decomposition for compact signal representation.",
+    "quantile_extractor": "Statistical time-series features based on quantiles.",
+    "topological_extractor": "Topological descriptors of signal shape.",
+    "recurrence_extractor": "Recurrence-plot based time-series features.",
+    "minirocket_extractor": "Fast convolutional time-series feature extractor.",
+    "riemann_extractor": "Riemannian features for multichannel signals.",
+    "industrial_stat_clf": "Classifier over statistical industrial time-series features.",
+    "industrial_freq_clf": "Classifier over frequency-domain industrial features.",
+    "industrial_manifold_clf": "Classifier over manifold/topological signal features.",
+    "industrial_stat_reg": "Regressor over statistical industrial time-series features.",
+    "industrial_freq_reg": "Regressor over frequency-domain industrial features.",
+    "industrial_manifold_reg": "Regressor over manifold/topological signal features.",
+    "inception_model": "Deep time-series model with inception-style blocks.",
+    "resnet_model": "Deep residual model for time-series data.",
+    "smoothing": "Smooth a forecasting series before modeling.",
+    "gaussian_filter": "Gaussian filtering for noisy forecasting series.",
+    "exog_ts": "Use exogenous time-series features.",
+    "ar": "Autoregressive forecasting model.",
+    "stl_arima": "Seasonal-trend decomposition plus ARIMA.",
+    "ets": "Exponential smoothing forecasting model.",
+    "lagged_forecaster": "Forecasting model over lagged features.",
+    "eigen_forecaster": "Forecasting with eigen-basis representation.",
+    "topo_forecaster": "Forecasting using topological signal descriptors.",
+    "glm": "Generalized linear forecasting model.",
+    "tcn_model": "Temporal convolutional neural forecasting/regression model.",
+    "nbeats_model": "Deep neural forecasting/regression model.",
+}
+
+
+def get_operation_catalog(task_type: str) -> Dict[str, List[Dict[str, str]]]:
+    ops = OPERATIONS.get(task_type, {})
+    return {
+        group: [
+            {"operation": name, "description": OPERATION_DESCRIPTIONS.get(name, "")}
+            for name in names
+        ]
+        for group, names in ops.items()
+    }
+
+
+def diagnose_runtime_error(
+    error: Any,
+    task_type: str = "",
+    graph: Optional["PipelineGraph"] = None,
+) -> Dict[str, Any]:
+    """Convert low-level Fedot/sklearn exceptions into user-facing guidance."""
+    message = str(error or "")
+    lower = message.lower()
+    graph_dict = graph.to_dict() if graph else {}
+    nodes = graph_dict.get("nodes", [])
+    known_preprocessing_ops = {
+        op
+        for task_ops in OPERATIONS.values()
+        for op in task_ops.get("preprocessing", [])
+    }
+    known_preprocessing_ops.update({"scaling", "normalization", "simple_imputation", "pca", "kernel_pca"})
+    preprocessing_nodes = [
+        n for n in nodes
+        if n.get("operation") in known_preprocessing_ops
+    ]
+
+    diagnostic: Dict[str, Any] = {
+        "agent": "system",
+        "kind": "runtime_error",
+        "summary": message[:500],
+        "technical_message": message[:2000],
+        "recommendations": [],
+        "recoverable": True,
+    }
+
+    if "expected 2d array" in lower and "got 1d array" in lower:
+        diagnostic.update({
+            "kind": "data_shape_or_preprocessing_error",
+            "summary": (
+                "Fedot received a one-dimensional feature vector where the selected "
+                "operation expected a two-dimensional feature matrix."
+            ),
+            "recommendations": [
+                "For ordinary tabular CSV tasks, remove preprocessing nodes such as scaling/normalization/PCA and train a model node directly.",
+                "If the data is a signal or time series, choose one of the ts_* task types and provide numeric sequence features.",
+                "Check that the CSV has numeric feature columns besides the target column.",
+            ],
+        })
+        if preprocessing_nodes:
+            diagnostic["problem_nodes"] = [
+                {"id": n.get("id"), "operation": n.get("operation")}
+                for n in preprocessing_nodes
+            ]
+            diagnostic["suggested_mutations"] = [
+                {"type": "remove", "node_id": n.get("id")}
+                for n in preprocessing_nodes[:2]
+            ]
+        return diagnostic
+
+    if "operation" in lower and "not allowed" in lower:
+        diagnostic.update({
+            "kind": "invalid_graph_operation",
+            "summary": "The graph contains an operation that is not exposed for the selected task.",
+            "recommendations": [
+                "Remove the unsupported node or replace it with a model listed in the operation catalog.",
+                "For tabular classification/regression, use a direct model-only graph.",
+                "If the operation is a signal transform, switch to the matching ts_* task type.",
+            ],
+        })
+        if preprocessing_nodes:
+            diagnostic["problem_nodes"] = [
+                {"id": n.get("id"), "operation": n.get("operation")}
+                for n in preprocessing_nodes
+            ]
+            diagnostic["suggested_mutations"] = [
+                {"type": "remove", "node_id": n.get("id")}
+                for n in preprocessing_nodes[:2]
+            ]
+        return diagnostic
+
+    if "0 feature" in lower or "at least one array or dtype is required" in lower:
+        diagnostic.update({
+            "kind": "no_numeric_features",
+            "summary": "No numeric feature columns were found after removing the target column.",
+            "recommendations": [
+                "Convert categorical feature columns to numeric values before upload.",
+                "Choose the correct target column; it must not be the only numeric column.",
+            ],
+        })
+        return diagnostic
+
+    if "target column" in lower and "not" in lower:
+        diagnostic.update({
+            "kind": "target_column_error",
+            "summary": "The selected target column was not found in the uploaded CSV.",
+            "recommendations": ["Select an existing target column in the sidebar and run again."],
+            "recoverable": False,
+        })
+        return diagnostic
+
+    if "could not convert" in lower or "invalid literal" in lower:
+        diagnostic.update({
+            "kind": "non_numeric_data",
+            "summary": "A model received non-numeric values that were not encoded.",
+            "recommendations": [
+                "Encode categorical feature columns before upload.",
+                "Remove text/id columns that are not useful model features.",
+            ],
+        })
+        return diagnostic
+
+    diagnostic["recommendations"] = [
+        "Try a simpler graph with only the model node.",
+        "Check the selected task type and target column.",
+        "Review the technical error text if the dataset uses a custom format.",
+    ]
+    return diagnostic
 
 
 @dataclass
@@ -362,7 +541,13 @@ def load_input_data(
         )
 
     y = df[target].values
-    X = df.drop(columns=[target]).select_dtypes(include=[np.number]).values
+    numeric_df = df.drop(columns=[target]).select_dtypes(include=[np.number])
+    if numeric_df.shape[1] == 0:
+        raise ValueError(
+            "No numeric feature columns found after removing the target column. "
+            "Encode categorical features or choose another target."
+        )
+    X = numeric_df.values
 
     if task_type in ("classification", "ts_classification"):
         if y.dtype == object:
@@ -370,6 +555,14 @@ def load_input_data(
             y = LabelEncoder().fit_transform(y)
         task = Task(TaskTypesEnum.classification)
     else:
+        if y.dtype == object:
+            try:
+                y = y.astype(float)
+            except ValueError as exc:
+                raise ValueError(
+                    "Regression target contains non-numeric values. "
+                    "Choose classification or convert the target to numbers."
+                ) from exc
         task = Task(TaskTypesEnum.regression)
 
     return InputData(

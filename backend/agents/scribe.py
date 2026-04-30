@@ -100,6 +100,16 @@ Return the report JSON only."""
         if not iterations:
             return ["Run at least one GraphAutoML iteration"]
         last = iterations[-1].get("critic", {})
+        diagnostics = []
+        diagnostics.extend(iterations[-1].get("engineer", {}).get("diagnostics", []) or [])
+        diagnostics.extend(last.get("diagnostics", []) or [])
+        recommendations = []
+        for diagnostic in diagnostics:
+            for rec in diagnostic.get("recommendations", []) or []:
+                if rec not in recommendations:
+                    recommendations.append(rec)
+        if recommendations:
+            return recommendations[:4]
         suggestions = last.get("suggested_mutations", [])
         if suggestions:
             return ["Review the final Critic mutations before another run", "Increase tuning iterations for the approved graph"]

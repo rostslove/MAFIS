@@ -8,7 +8,16 @@ from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
 from agents.base_agent import LLM_MODEL
-from graph_engine import FEDOT_IND_VERSION, FEDOT_INDUSTRIAL_SOURCE, METRICS_BY_TASK, OPERATIONS, SUPPORTED_TASKS
+from graph_engine import (
+    DEFAULT_GRAPHS,
+    FEDOT_IND_VERSION,
+    FEDOT_INDUSTRIAL_SOURCE,
+    METRICS_BY_TASK,
+    OPERATIONS,
+    OPERATION_DESCRIPTIONS,
+    SUPPORTED_TASKS,
+    get_operation_catalog,
+)
 from orchestrator import mutate_graph_locally, propose_architecture, run_orchestration, run_orchestration_stream
 
 logging.basicConfig(level=logging.INFO)
@@ -65,6 +74,9 @@ async def get_config(request):
         "supported_tasks": SUPPORTED_TASKS,
         "metrics_by_task": METRICS_BY_TASK,
         "operations": OPERATIONS,
+        "operation_catalog": {task: get_operation_catalog(task) for task in SUPPORTED_TASKS},
+        "operation_descriptions": OPERATION_DESCRIPTIONS,
+        "default_graphs": DEFAULT_GRAPHS,
         "openrouter_configured": bool(os.getenv("OPENROUTER_API_KEY")),
         "fedot_ind_version": FEDOT_IND_VERSION,
         "fedot_industrial_source": FEDOT_INDUSTRIAL_SOURCE,

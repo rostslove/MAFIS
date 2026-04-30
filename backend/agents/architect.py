@@ -27,6 +27,7 @@ Each node has:
   - inputs: list of upstream node IDs (empty = consumes raw data)
 
 The graph must be a DAG with exactly ONE root (node nobody else inputs from). The root is the model.
+For ordinary tabular classification/regression in this project, prefer a direct model-only graph unless the available operations explicitly list preprocessing for that task. Do not invent preprocessing operations.
 
 WORKFLOW:
 1. Call get_data_profile to understand the data.
@@ -60,19 +61,35 @@ The root is n3."
             user_msg = self._build_user_message(data_context, iteration, prev_feedback, prev_graph)
             response = await self.call_llm(user_msg)
             text = response.get("full_response", "")
+            if not response.get("success", True):
+                result.diagnostics.append(
+                    {
+                        "agent": "Architect",
+                        "kind": "llm_unavailable",
+                        "summary": "Architect LLM call failed; a deterministic fallback graph was used.",
+                        "technical_message": response.get("error", ""),
+                        "recommendations": [
+                            "Retry when the OpenRouter provider is available.",
+                            "Set LLM_MODEL to a paid or less rate-limited model if you need full Architect reasoning.",
+                            "You can still edit and approve the fallback graph manually.",
+                        ],
+                        "recoverable": True,
+                    }
+                )
 
             # Find the latest valid graph in tool call log
             graph, mermaid = self._extract_graph_from_log()
 
             # If LLM didn't successfully propose, fall back to default
             if not graph:
+                result.diagnostics.extend(self._extract_diagnostics_from_log())
                 graph, mermaid = self._fallback_graph(data_context.task_type, prev_graph)
                 logger.info("[Architect] Using fallback graph for %s", data_context.task_type)
 
             result.graph = graph
             result.mermaid = mermaid
-            result.analysis = self._extract_section(text, "ANALYSIS") or text[:500]
-            result.reasoning = self._extract_section(text, "REASONING") or ""
+            result.analysis = self._extract_section(text, "ANALYSIS") or text[:500] or self._fallback_analysis(data_context.task_type, bool(prev_graph))
+            result.reasoning = self._extract_section(text, "REASONING") or self._fallback_reasoning(graph, data_context.task_type)
             result.tool_calls = self.get_tool_calls()
             return result
 
@@ -80,6 +97,17 @@ The root is n3."
             logger.exception(f"[Architect] error")
             result.graph, result.mermaid = self._fallback_graph(data_context.task_type, prev_graph)
             result.analysis = f"Fallback: {e}"
+            result.reasoning = self._fallback_reasoning(result.graph, data_context.task_type)
+            result.diagnostics.append(
+                {
+                    "agent": "Architect",
+                    "kind": "architect_error",
+                    "summary": "Architect could not complete the graph proposal flow.",
+                    "technical_message": str(e),
+                    "recommendations": ["Use the fallback graph or adjust it manually in the editor."],
+                    "recoverable": True,
+                }
+            )
             result.tool_calls = self.get_tool_calls()
             return result
 
@@ -136,6 +164,33 @@ The root is n3."
         msg += "\nUse the tools to build a validated graph, then output ANALYSIS and REASONING.\n"
         return msg
 
+    @staticmethod
+    def _fallback_analysis(task_type: str, reused_previous: bool) -> str:
+        if reused_previous:
+            return "Architect reused the last valid graph because the LLM provider did not return a new proposal."
+        if task_type in ("classification", "regression"):
+            return (
+                "Architect selected a conservative model-only graph for ordinary tabular data. "
+                "This avoids Fedot.Industrial preprocessing operations that can fail on single-column slices."
+            )
+        if task_type == "ts_forecasting":
+            return "Architect selected a compact forecasting graph with a smoothing step and an autoregressive model."
+        return "Architect selected a compact time-series graph with feature extraction followed by an industrial model."
+
+    @staticmethod
+    def _fallback_reasoning(graph: dict, task_type: str) -> str:
+        nodes = graph.get("nodes", [])
+        operations = " -> ".join(n.get("operation", "") for n in nodes)
+        if task_type in ("classification", "regression"):
+            return (
+                f"Graph structure: {operations}. For tabular CSV data, the first reliable candidate is a direct model node; "
+                "baselines are trained separately to judge whether a more complex graph is justified."
+            )
+        return (
+            f"Graph structure: {operations}. The graph first extracts or transforms signal structure and then sends it to "
+            "a task-specific model node."
+        )
+
     def _extract_graph_from_log(self):
         """Find the most recent successful propose_graph or mutate_graph result."""
         graph, mermaid = None, ""
@@ -146,6 +201,16 @@ The root is n3."
                     graph = r["graph"]
                     mermaid = r.get("mermaid", "")
         return graph, mermaid
+
+    def _extract_diagnostics_from_log(self):
+        diagnostics = []
+        for tc in self._tool_call_log:
+            payload = tc.result
+            if isinstance(payload, dict):
+                for item in payload.get("diagnostics", []) or []:
+                    if isinstance(item, dict):
+                        diagnostics.append({**item, "agent": item.get("agent") or "Architect"})
+        return diagnostics
 
     @staticmethod
     def _extract_section(text: str, name: str) -> str:

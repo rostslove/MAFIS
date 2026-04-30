@@ -87,11 +87,29 @@ def current_payload(extra: Dict[str, Any] | None = None) -> Dict[str, Any]:
     return payload
 
 
-def set_graph(result: Dict[str, Any]) -> None:
+def set_graph(result: Dict[str, Any], approved: bool = False) -> None:
     st.session_state.graph = result.get("graph", {})
     st.session_state.mermaid = result.get("mermaid", "")
-    st.session_state.architect_analysis = result.get("analysis", "")
-    st.session_state.architect_reasoning = result.get("reasoning", "")
+    if "analysis" in result:
+        st.session_state.architect_analysis = result.get("analysis", "")
+    if "reasoning" in result:
+        st.session_state.architect_reasoning = result.get("reasoning", "")
+    if "diagnostics" in result:
+        st.session_state.architect_diagnostics = result.get("diagnostics", [])
+    st.session_state.graph_approved = approved
+
+
+def approve_graph() -> None:
+    if st.session_state.get("graph"):
+        st.session_state.graph_approved = True
+
+
+def root_node_id(graph: Dict[str, Any]) -> str:
+    nodes = graph.get("nodes", [])
+    ids = {node.get("id") for node in nodes}
+    children = {inp for node in nodes for inp in node.get("inputs", [])}
+    roots = [node_id for node_id in ids - children if node_id]
+    return roots[0] if roots else ""
 
 
 def require_dataset() -> bool:
@@ -129,6 +147,61 @@ def render_tool_calls(tool_calls: List[Dict[str, Any]], title: str) -> None:
         st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
 
+def render_diagnostics(diagnostics: List[Dict[str, Any]], title: str = "Diagnostics") -> None:
+    if not diagnostics:
+        return
+    with st.expander(title, expanded=True):
+        for item in diagnostics:
+            st.warning(item.get("summary", "Runtime diagnostic"))
+            recommendations = item.get("recommendations", []) or []
+            if recommendations:
+                for rec in recommendations:
+                    st.write(f"- {rec}")
+            if item.get("problem_nodes"):
+                st.write("Problem nodes")
+                st.dataframe(pd.DataFrame(item["problem_nodes"]), use_container_width=True, hide_index=True)
+            if item.get("technical_message"):
+                with st.expander("Technical message"):
+                    st.code(str(item["technical_message"])[:4000])
+
+
+def operation_rows(config: Dict[str, Any], task_type: str) -> List[Dict[str, str]]:
+    catalog = config.get("operation_catalog", {}).get(task_type, {})
+    if catalog:
+        rows = []
+        for group, items in catalog.items():
+            for item in items:
+                rows.append({
+                    "group": group,
+                    "operation": item.get("operation", ""),
+                    "description": item.get("description", ""),
+                })
+        return rows
+
+    operations = config.get("operations", {}).get(task_type, {})
+    descriptions = config.get("operation_descriptions", {})
+    return [
+        {"group": group, "operation": name, "description": descriptions.get(name, "")}
+        for group, names in operations.items()
+        for name in names
+    ]
+
+
+def graph_rows(graph: Dict[str, Any]) -> List[Dict[str, str]]:
+    root_id = root_node_id(graph)
+    rows = []
+    for node in graph.get("nodes", []):
+        role = "model" if node.get("id") == root_id else "preprocessing"
+        rows.append({
+            "id": node.get("id", ""),
+            "role": role,
+            "operation": node.get("operation", ""),
+            "inputs": ", ".join(node.get("inputs", [])) or "raw data",
+            "params": json.dumps(node.get("params", {}), ensure_ascii=False),
+        })
+    return rows
+
+
 def mutate_graph(mutation: Dict[str, Any]) -> None:
     graph = st.session_state.get("graph")
     if not graph:
@@ -141,6 +214,7 @@ def mutate_graph(mutation: Dict[str, Any]) -> None:
             st.success("Graph updated.")
         else:
             st.error(result.get("message", "Invalid graph mutation"))
+            render_diagnostics(result.get("diagnostics", []), "Mutation diagnostics")
     except Exception as exc:
         st.error(f"Mutation failed: {exc}")
 
@@ -169,8 +243,14 @@ def stream_run(payload: Dict[str, Any]) -> None:
                 lines.append(f"Iteration {event.get('iteration')}: {event.get('agent')} started")
             elif event_type == "agent_done":
                 lines.append(f"{event.get('agent')}: {event.get('summary', '')}")
+                if event.get("diagnostics"):
+                    for diagnostic in event["diagnostics"]:
+                        lines.append(f"{event.get('agent')} diagnostic: {diagnostic.get('summary', '')}")
                 done_steps += 1
                 progress.progress(min(done_steps / total_steps, 1.0))
+            elif event_type == "diagnostics":
+                for diagnostic in event.get("diagnostics", []):
+                    lines.append(f"{event.get('agent')} diagnostic: {diagnostic.get('summary', '')}")
             elif event_type == "iteration_done":
                 lines.append(
                     f"Iteration {event.get('iteration')} done: graph={event.get('graph_score', 0):.4f}, "
@@ -237,23 +317,20 @@ def architect_tab(config: Dict[str, Any]) -> None:
         return
 
     task_type = st.session_state.get("task_type", "classification")
-    operations = config.get("operations", {}).get(task_type, {})
     col_left, col_right = st.columns([1, 1])
 
     with col_left:
         st.write("Available atomic operations")
-        ops_table = []
-        for kind, names in operations.items():
-            for name in names:
-                ops_table.append({"type": kind, "operation": name})
-        st.dataframe(pd.DataFrame(ops_table), use_container_width=True, hide_index=True)
+        rows = operation_rows(config, task_type)
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
         message = st.text_area(
-            "Message to Architect",
-            placeholder="Example: add frequency features before the model, or replace the classifier with a simpler tree model.",
+            "Request to Architect",
+            placeholder="Example: prefer a simpler linear model, use frequency features for a signal task, or keep the graph conservative.",
             height=110,
         )
-        if st.button("Ask Architect", use_container_width=True):
+        ask_col, default_col = st.columns(2)
+        if ask_col.button("Ask Architect", type="primary", use_container_width=True):
             try:
                 payload = current_payload(
                     {
@@ -268,19 +345,37 @@ def architect_tab(config: Dict[str, Any]) -> None:
             except Exception as exc:
                 st.error(f"Architect failed: {exc}")
 
-        if st.button("Use Default Graph", use_container_width=True):
-            try:
-                result = post_json("/architect/chat", current_payload({"message": "Use a conservative default graph."}), timeout=180)
-                set_graph(result)
-                st.success("Default-style graph proposed.")
-            except Exception as exc:
-                st.error(f"Cannot create graph: {exc}")
+        if default_col.button("Use Reliable Default", use_container_width=True):
+            graph = {
+                "task_type": task_type,
+                "nodes": config.get("default_graphs", {}).get(task_type, []),
+            }
+            set_graph(
+                {
+                    "graph": graph,
+                    "analysis": "Reliable default graph selected without an LLM call.",
+                    "reasoning": "This graph is intentionally small so Engineer can first verify that the data format and target are trainable.",
+                    "diagnostics": [],
+                }
+            )
+            st.session_state.architect_tool_calls = []
+            st.success("Default graph selected.")
 
     with col_right:
+        status = "approved" if st.session_state.get("graph_approved") else "draft"
+        st.caption(f"Graph status: {status}")
         render_graph(st.session_state.get("graph", {}))
         if st.session_state.get("architect_analysis"):
             st.write("Analysis")
             st.write(st.session_state.architect_analysis)
+        if st.session_state.get("architect_reasoning"):
+            st.write("Reasoning")
+            st.write(st.session_state.architect_reasoning)
+        render_diagnostics(st.session_state.get("architect_diagnostics", []), "Architect diagnostics")
+        if st.session_state.get("graph"):
+            if st.button("Approve Draft", use_container_width=True):
+                approve_graph()
+                st.success("Graph approved.")
         render_tool_calls(st.session_state.get("architect_tool_calls", []), "Architect tool calls")
 
 
@@ -293,48 +388,79 @@ def graph_editor_tab(config: Dict[str, Any]) -> None:
 
     task_type = graph.get("task_type", st.session_state.get("task_type", "classification"))
     operations = config.get("operations", {}).get(task_type, {})
-    all_ops = operations.get("preprocessing", []) + operations.get("models", [])
+    preprocessing_ops = operations.get("preprocessing", [])
+    model_ops = operations.get("models", [])
     node_ids = [node.get("id") for node in graph.get("nodes", [])]
+    root_id = root_node_id(graph)
 
-    st.dataframe(pd.DataFrame(graph.get("nodes", [])), use_container_width=True, hide_index=True)
+    status_col, approve_col = st.columns([2, 1])
+    status_col.caption("Approved" if st.session_state.get("graph_approved") else "Draft")
+    if approve_col.button("Approve Edited Graph", use_container_width=True):
+        approve_graph()
+        st.success("Graph approved.")
+
+    st.dataframe(pd.DataFrame(graph_rows(graph)), use_container_width=True, hide_index=True)
     render_graph(graph)
 
-    col_add, col_replace, col_params = st.columns(3)
+    catalog_rows = operation_rows(config, task_type)
+    if catalog_rows:
+        with st.expander("Operation catalog"):
+            st.dataframe(pd.DataFrame(catalog_rows), use_container_width=True, hide_index=True)
 
-    with col_add:
-        st.write("Add Node")
-        with st.form("add_node"):
-            new_id = st.text_input("New node id", value="new_node")
-            new_op = st.selectbox("Operation", all_ops, key="add_op")
-            input_ids = st.multiselect("Inputs", node_ids)
-            rewire = st.selectbox("Rewire consumer", [""] + node_ids)
-            submitted = st.form_submit_button("Add")
-            if submitted:
-                mutation = {
-                    "type": "add",
-                    "node": {"id": new_id, "operation": new_op, "params": {}, "inputs": input_ids},
-                }
-                if rewire:
-                    mutation["rewire_input_of"] = rewire
-                mutate_graph(mutation)
+    col_insert, col_model, col_params = st.columns(3)
 
-    with col_replace:
-        st.write("Replace or Remove")
-        with st.form("replace_node"):
-            node_id = st.selectbox("Node", node_ids, key="replace_node_id")
-            new_op = st.selectbox("New operation", all_ops, key="replace_op")
-            replace = st.form_submit_button("Replace")
-            remove = st.form_submit_button("Remove")
-            if replace:
-                mutate_graph({"type": "replace", "node_id": node_id, "new_operation": new_op})
-            if remove:
-                mutate_graph({"type": "remove", "node_id": node_id})
+    with col_insert:
+        st.write("Insert Before Model")
+        if preprocessing_ops:
+            root_node = next((node for node in graph.get("nodes", []) if node.get("id") == root_id), {})
+            old_inputs = root_node.get("inputs", [])
+            with st.form("insert_preprocessing"):
+                new_id = st.text_input("Node id", value=f"prep_{len(node_ids) + 1}")
+                new_op = st.selectbox("Preprocessing operation", preprocessing_ops, key="insert_op")
+                submitted = st.form_submit_button("Insert")
+                if submitted:
+                    mutate_graph(
+                        {
+                            "type": "add",
+                            "node": {"id": new_id, "operation": new_op, "params": {}, "inputs": old_inputs},
+                            "rewire_input_of": root_id,
+                        }
+                    )
+        else:
+            st.caption("No safe preprocessing operations are exposed for this task.")
+
+    with col_model:
+        st.write("Model")
+        if model_ops:
+            with st.form("replace_model"):
+                current_model = next((node for node in graph.get("nodes", []) if node.get("id") == root_id), {})
+                st.text_input("Model node", value=root_id, disabled=True)
+                default_index = model_ops.index(current_model.get("operation")) if current_model.get("operation") in model_ops else 0
+                new_op = st.selectbox("Model operation", model_ops, index=default_index, key="model_op")
+                replace = st.form_submit_button("Replace Model")
+                if replace:
+                    mutate_graph({"type": "replace", "node_id": root_id, "new_operation": new_op})
+        else:
+            st.caption("No model operations returned by backend config.")
+
+        removable = [node_id for node_id in node_ids if node_id != root_id]
+        if removable:
+            with st.form("remove_node"):
+                node_id = st.selectbox("Preprocessing node", removable, key="remove_node_id")
+                remove = st.form_submit_button("Remove Node")
+                if remove:
+                    mutate_graph({"type": "remove", "node_id": node_id})
 
     with col_params:
         st.write("Set Parameters")
         with st.form("params_node"):
             node_id = st.selectbox("Node", node_ids, key="params_node_id")
-            params_text = st.text_area("Params JSON", value="{}", height=100)
+            current = next((node for node in graph.get("nodes", []) if node.get("id") == node_id), {})
+            params_text = st.text_area(
+                "Params JSON",
+                value=json.dumps(current.get("params", {}) or {}, ensure_ascii=False, indent=2),
+                height=130,
+            )
             submitted = st.form_submit_button("Apply params")
             if submitted:
                 try:
@@ -353,8 +479,11 @@ def run_tab() -> None:
         st.info("Approve a graph first in the Architect tab.")
         return
 
+    if not st.session_state.get("graph_approved"):
+        st.warning("Graph is still a draft. Running will approve this exact version.")
     render_graph(graph)
     if st.button("Approve Graph and Run", type="primary", use_container_width=True):
+        approve_graph()
         payload = current_payload(
             {
                 "iterations": int(st.session_state.get("iterations", 2)),
@@ -410,6 +539,7 @@ def results_tab() -> None:
             render_graph(item.get("architect", {}).get("graph", {}))
             st.write("Engineer metrics")
             st.json(item.get("engineer", {}).get("graph_metrics", {}))
+            render_diagnostics(item.get("engineer", {}).get("diagnostics", []), "Engineer diagnostics")
             st.write("Critic")
             critic = item.get("critic", {})
             st.write(critic.get("assessment", ""))
@@ -422,6 +552,7 @@ def results_tab() -> None:
             if critic.get("suggested_mutations"):
                 st.write("Suggested mutations")
                 st.json(critic["suggested_mutations"])
+            render_diagnostics(critic.get("diagnostics", []), "Critic diagnostics")
 
 
 def report_tab() -> None:

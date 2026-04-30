@@ -19,6 +19,7 @@ class ToolCall:
             "args": self.arguments,
             "result": str(self.result)[:500],
             "success": self.success,
+            "error": self.error,
         }
 
 
@@ -54,6 +55,7 @@ class ArchitectResult:
     mermaid: str = ""
     analysis: str = ""
     reasoning: str = ""
+    diagnostics: List[Dict[str, Any]] = field(default_factory=list)
     tool_calls: List[ToolCall] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -62,6 +64,7 @@ class ArchitectResult:
             "mermaid": self.mermaid,
             "analysis": self.analysis,
             "reasoning": self.reasoning,
+            "diagnostics": self.diagnostics,
             "tool_calls": [tc.to_dict() for tc in self.tool_calls],
         }
 
@@ -82,6 +85,8 @@ class EngineerResult:
     tuned_nodes: List[Dict[str, Any]] = field(default_factory=list)
     best_baseline_score: float = 0.0
     best_baseline_name: str = ""
+    graph_error: str = ""
+    diagnostics: List[Dict[str, Any]] = field(default_factory=list)
     tool_calls: List[ToolCall] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -95,6 +100,8 @@ class EngineerResult:
             "tuned_nodes": self.tuned_nodes,
             "best_baseline_score": self.best_baseline_score,
             "best_baseline_name": self.best_baseline_name,
+            "graph_error": self.graph_error,
+            "diagnostics": self.diagnostics,
             "tool_calls": [tc.to_dict() for tc in self.tool_calls],
         }
 
@@ -109,6 +116,7 @@ class CriticFeedback:
     should_stop: bool = False
     node_importance: Dict[str, float] = field(default_factory=dict)
     explanation: Dict[str, Any] = field(default_factory=dict)
+    diagnostics: List[Dict[str, Any]] = field(default_factory=list)
     full_response: str = ""
     tool_calls: List[ToolCall] = field(default_factory=list)
 
@@ -122,6 +130,7 @@ class CriticFeedback:
             "should_stop": self.should_stop,
             "node_importance": self.node_importance,
             "explanation": self.explanation,
+            "diagnostics": self.diagnostics,
             "full_response": self.full_response,
             "tool_calls": [tc.to_dict() for tc in self.tool_calls],
         }

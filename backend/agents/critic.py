@@ -60,7 +60,13 @@ Return JSON only."""
                 ensure_ascii=False,
             )
 
-            validation = await self._validate_graph(graph_json, data_context)
+            if engineer_result.graph_error:
+                validation = {
+                    "skipped": "Graph training failed; cross-validation would repeat the same failure.",
+                    "diagnostics": engineer_result.diagnostics,
+                }
+            else:
+                validation = await self._validate_graph(graph_json, data_context)
             error_analysis = await self.call_mcp_tool(
                 "analyze_errors",
                 {
@@ -69,13 +75,21 @@ Return JSON only."""
                     "task_type": data_context.task_type,
                 },
             )
-            explanation = await self.call_mcp_tool("explain_graph", {"top_k": 10})
-            node_importance = await self._maybe_get_node_importance(graph, graph_json, data_context)
+            if engineer_result.graph_error or engineer_result.graph_score <= 0:
+                explanation = {
+                    "skipped": "Graph was not trained successfully; explanation is unavailable.",
+                    "error": engineer_result.graph_error,
+                }
+                node_importance = {"skipped": "Graph was not trained successfully; node ablation is unavailable."}
+            else:
+                explanation = await self.call_mcp_tool("explain_graph", {"top_k": 10})
+                node_importance = await self._maybe_get_node_importance(graph, graph_json, data_context)
 
             feedback.winner = "graph" if engineer_result.graph_score >= engineer_result.best_baseline_score else "baseline"
             feedback.assessment = self._build_assessment(engineer_result, validation, error_analysis)
             feedback.strengths = self._strengths(engineer_result, validation, error_analysis)
             feedback.weaknesses = self._weaknesses(engineer_result, validation, error_analysis)
+            feedback.diagnostics = self._collect_diagnostics(engineer_result, validation, node_importance)
             feedback.explanation = explanation if isinstance(explanation, dict) else {}
             feedback.node_importance = (
                 node_importance.get("node_importance", {})
@@ -83,14 +97,17 @@ Return JSON only."""
                 else {}
             )
 
-            llm_feedback = await self._ask_llm_for_mutations(
-                graph,
-                data_context,
-                engineer_result,
-                validation if isinstance(validation, dict) else {},
-                error_analysis if isinstance(error_analysis, dict) else {},
-                feedback,
-            )
+            if engineer_result.graph_error:
+                llm_feedback = {}
+            else:
+                llm_feedback = await self._ask_llm_for_mutations(
+                    graph,
+                    data_context,
+                    engineer_result,
+                    validation if isinstance(validation, dict) else {},
+                    error_analysis if isinstance(error_analysis, dict) else {},
+                    feedback,
+                )
             feedback.suggested_mutations = (
                 llm_feedback.get("suggested_mutations")
                 or self._fallback_mutations(graph, data_context, engineer_result)
@@ -110,6 +127,7 @@ Return JSON only."""
             feedback.winner = "graph" if engineer_result.graph_score >= engineer_result.best_baseline_score else "baseline"
             feedback.assessment = f"Critic fallback after error: {exc}"
             feedback.weaknesses = ["Critic LLM/tool analysis failed"]
+            feedback.diagnostics = list(engineer_result.diagnostics)
             feedback.suggested_mutations = self._fallback_mutations(graph, data_context, engineer_result)
             feedback.should_stop = False
             feedback.tool_calls = self.get_tool_calls()
@@ -168,6 +186,12 @@ Return JSON only."""
 
     @staticmethod
     def _build_assessment(engineer: EngineerResult, validation: Dict[str, Any], error_analysis: Dict[str, Any]) -> str:
+        if engineer.graph_error:
+            return (
+                f"Graph failed during training: {engineer.graph_error[:220]}. "
+                f"Best baseline is {engineer.best_baseline_name or 'none'} "
+                f"{engineer.best_baseline_score:.4f}."
+            )
         cv = ""
         if isinstance(validation, dict) and "score_mean" in validation:
             cv = f", CV mean {validation.get('score_mean', 0):.4f} +/- {validation.get('score_std', 0):.4f}"
@@ -182,6 +206,10 @@ Return JSON only."""
     @staticmethod
     def _strengths(engineer: EngineerResult, validation: Dict[str, Any], error_analysis: Dict[str, Any]) -> List[str]:
         strengths = []
+        if engineer.graph_error:
+            if engineer.best_baseline_score > 0:
+                return ["Baselines trained successfully, so the dataset itself is readable"]
+            return ["The failure was captured and converted into diagnostics"]
         if engineer.graph_score > 0:
             strengths.append("The proposed graph trained successfully")
         if engineer.graph_score >= engineer.best_baseline_score:
@@ -195,6 +223,10 @@ Return JSON only."""
     @staticmethod
     def _weaknesses(engineer: EngineerResult, validation: Dict[str, Any], error_analysis: Dict[str, Any]) -> List[str]:
         weaknesses = []
+        if engineer.graph_error:
+            weaknesses.append("The graph could not be trained")
+            weaknesses.extend(Critic._diagnostic_recommendations(engineer.diagnostics))
+            return weaknesses
         if engineer.graph_score <= 0:
             weaknesses.append("The graph score is zero or unavailable")
         if engineer.best_baseline_score > engineer.graph_score:
@@ -212,23 +244,20 @@ Return JSON only."""
             return []
 
         mutations: List[Dict[str, Any]] = []
+        for diagnostic in engineer.diagnostics:
+            for mutation in diagnostic.get("suggested_mutations", []) or []:
+                if isinstance(mutation, dict):
+                    mutations.append(mutation)
+        if mutations:
+            return mutations[:2]
+
         baseline_op = self._baseline_to_operation(dc.task_type, engineer.best_baseline_name)
         current_root = next((n for n in nodes if n.get("id") == root_id), {})
 
         if engineer.best_baseline_score > engineer.graph_score and baseline_op and current_root.get("operation") != baseline_op:
             mutations.append({"type": "replace", "node_id": root_id, "new_operation": baseline_op})
 
-        if dc.task_type in ("classification", "regression"):
-            has_scaling = any(n.get("operation") in ("scaling", "normalization") for n in nodes)
-            if not has_scaling:
-                mutations.append(
-                    {
-                        "type": "add",
-                        "node": {"id": "scale_auto", "operation": "scaling", "params": {}, "inputs": []},
-                        "rewire_input_of": root_id,
-                    }
-                )
-        elif dc.task_type.startswith("ts_") and not any("fourier" in n.get("operation", "") for n in nodes):
+        if dc.task_type.startswith("ts_") and not any("fourier" in n.get("operation", "") for n in nodes):
             mutations.append(
                 {
                     "type": "add",
@@ -238,6 +267,36 @@ Return JSON only."""
             )
 
         return mutations[:2]
+
+    @staticmethod
+    def _collect_diagnostics(
+        engineer: EngineerResult,
+        validation: Dict[str, Any],
+        node_importance: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        diagnostics = list(engineer.diagnostics)
+        for payload in (validation, node_importance):
+            if isinstance(payload, dict):
+                for item in payload.get("diagnostics", []) or []:
+                    if isinstance(item, dict):
+                        diagnostics.append({**item, "agent": item.get("agent") or "Critic"})
+        unique: List[Dict[str, Any]] = []
+        seen = set()
+        for item in diagnostics:
+            key = (item.get("kind"), item.get("summary"), item.get("technical_message"))
+            if key not in seen:
+                seen.add(key)
+                unique.append(item)
+        return unique
+
+    @staticmethod
+    def _diagnostic_recommendations(diagnostics: List[Dict[str, Any]]) -> List[str]:
+        recs: List[str] = []
+        for diagnostic in diagnostics:
+            for rec in diagnostic.get("recommendations", []) or []:
+                if rec not in recs:
+                    recs.append(rec)
+        return recs[:4]
 
     @staticmethod
     def _root_id(nodes: List[Dict[str, Any]]) -> str:

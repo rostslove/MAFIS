@@ -6,7 +6,7 @@ import pandas as pd
 
 from agents import Architect, ArchitectResult, Critic, CriticFeedback, DataContext, Engineer, IterationRecord, Scribe
 from data_profiler import DataProfiler
-from graph_engine import SUPPORTED_TASKS, PipelineGraph, is_ts_task
+from graph_engine import SUPPORTED_TASKS, PipelineGraph, diagnose_runtime_error, is_ts_task
 from mcp_client import MCPToolClient
 
 logger = logging.getLogger("Orchestrator")
@@ -125,6 +125,7 @@ async def run_orchestration_stream(
                     summary=f"Graph nodes: {len(architect_result.graph.get('nodes', []))}",
                     graph=architect_result.graph,
                     mermaid=architect_result.mermaid,
+                    diagnostics=architect_result.diagnostics,
                     tool_calls_count=len(architect_result.tool_calls),
                 )
 
@@ -139,8 +140,17 @@ async def run_orchestration_stream(
                         f"best baseline: {engineer_result.best_baseline_name or 'none'} "
                         f"{engineer_result.best_baseline_score:.4f}"
                     ),
+                    diagnostics=engineer_result.diagnostics,
+                    graph_error=engineer_result.graph_error,
                     tool_calls_count=len(engineer_result.tool_calls),
                 )
+                if engineer_result.diagnostics:
+                    yield _event(
+                        "diagnostics",
+                        agent="Engineer",
+                        iteration=iteration,
+                        diagnostics=engineer_result.diagnostics,
+                    )
 
                 yield _event("agent_start", agent="Critic", iteration=iteration, step="3/3")
                 critic_result = await critic.execute(architect_result, engineer_result, data_context, iteration)
@@ -152,6 +162,7 @@ async def run_orchestration_stream(
                         f"Winner: {critic_result.winner}; stop={critic_result.should_stop}; "
                         f"mutations={len(critic_result.suggested_mutations)}"
                     ),
+                    diagnostics=critic_result.diagnostics,
                     tool_calls_count=len(critic_result.tool_calls),
                 )
 
@@ -181,6 +192,7 @@ async def run_orchestration_stream(
                     winner=critic_result.winner,
                     graph=architect_result.graph,
                     mermaid=architect_result.mermaid,
+                    diagnostics=engineer_result.diagnostics + critic_result.diagnostics,
                 )
 
                 prev_feedback = critic_result
@@ -314,11 +326,13 @@ def mutate_graph_locally(graph: Dict[str, Any], mutation: Dict[str, Any]) -> Dic
     pipeline_graph = PipelineGraph.from_dict(graph)
     mutated = pipeline_graph.apply_mutation(mutation)
     ok, message = mutated.validate()
+    diagnostics = [] if ok else [diagnose_runtime_error(message, task_type=mutated.task_type, graph=mutated)]
     return {
         "valid": ok,
         "message": message,
         "graph": mutated.to_dict(),
         "mermaid": mutated.to_mermaid() if ok else "",
+        "diagnostics": diagnostics,
     }
 
 
