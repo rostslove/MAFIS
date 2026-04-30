@@ -1,11 +1,11 @@
 import json
 import logging
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse, StreamingResponse
+from starlette.routing import Route
 
 from agents.base_agent import LLM_MODEL
 from graph_engine import FEDOT_IND_VERSION, FEDOT_INDUSTRIAL_SOURCE, METRICS_BY_TASK, OPERATIONS, SUPPORTED_TASKS
@@ -13,8 +13,6 @@ from orchestrator import mutate_graph_locally, propose_architecture, run_orchest
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-app = FastAPI(title="GraphAutoML MCP System", version="4.0.0")
 
 
 AGENT_TOOLS = {
@@ -42,37 +40,24 @@ TOOL_DESCRIPTIONS = {
 }
 
 
-class OrchestrationRequest(BaseModel):
-    csv_path: str
-    target_column: str
-    task_type: str = "classification"
-    iterations: int = 3
-    initial_graph: Optional[Dict[str, Any]] = None
-    forecast_length: Optional[int] = None
+async def _json_body(request) -> Dict[str, Any]:
+    try:
+        data = await request.json()
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
-class ArchitectChatRequest(BaseModel):
-    csv_path: str
-    target_column: str
-    task_type: str = "classification"
-    message: str = ""
-    current_graph: Optional[Dict[str, Any]] = None
-    forecast_length: Optional[int] = None
+def _error(message: str, status_code: int = 400) -> JSONResponse:
+    return JSONResponse({"detail": message}, status_code=status_code)
 
 
-class GraphMutationRequest(BaseModel):
-    graph: Dict[str, Any]
-    mutation: Dict[str, Any]
+async def health(request):
+    return JSONResponse({"status": "healthy", "service": "graph-automl-mcp"})
 
 
-@app.get("/health")
-async def health():
-    return {"status": "healthy", "service": "graph-automl-mcp"}
-
-
-@app.get("/config")
-async def get_config():
-    return {
+async def get_config(request):
+    return JSONResponse({
         "agents": ["Architect", "Engineer", "Critic", "Scribe"],
         "llm_model": LLM_MODEL,
         "protocol": "MCP",
@@ -83,78 +68,76 @@ async def get_config():
         "openrouter_configured": bool(os.getenv("OPENROUTER_API_KEY")),
         "fedot_ind_version": FEDOT_IND_VERSION,
         "fedot_industrial_source": FEDOT_INDUSTRIAL_SOURCE,
-    }
+    })
 
 
-@app.get("/tools")
-async def get_tools():
-    return {
+async def get_tools(request):
+    return JSONResponse({
         agent: [
             {"name": name, "description": TOOL_DESCRIPTIONS.get(name, "")}
             for name in names
         ]
         for agent, names in AGENT_TOOLS.items()
-    }
+    })
 
 
-@app.post("/architect/chat")
-async def architect_chat(request: ArchitectChatRequest):
+async def architect_chat(request):
+    payload = await _json_body(request)
     try:
         result = await propose_architecture(
-            csv_path=request.csv_path,
-            target_column=request.target_column,
-            task_type=request.task_type,
-            message=request.message,
-            current_graph=request.current_graph,
-            forecast_length=request.forecast_length,
+            csv_path=payload.get("csv_path", ""),
+            target_column=payload.get("target_column", ""),
+            task_type=payload.get("task_type", "classification"),
+            message=payload.get("message", ""),
+            current_graph=payload.get("current_graph"),
+            forecast_length=payload.get("forecast_length"),
         )
         if result.get("error"):
-            raise HTTPException(status_code=400, detail=result["error"])
-        return JSONResponse(content=result)
-    except HTTPException:
-        raise
+            return _error(result["error"], 400)
+        return JSONResponse(result)
     except Exception as exc:
         logger.exception("Architect chat failed")
-        raise HTTPException(status_code=500, detail=str(exc))
+        return _error(str(exc), 500)
 
 
-@app.post("/graph/mutate")
-async def graph_mutate(request: GraphMutationRequest):
+async def graph_mutate(request):
+    payload = await _json_body(request)
     try:
-        result = mutate_graph_locally(request.graph, request.mutation)
-        return JSONResponse(content=result)
+        result = mutate_graph_locally(payload.get("graph", {}), payload.get("mutation", {}))
+        return JSONResponse(result)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        return _error(str(exc), 400)
 
 
-@app.post("/orchestrate")
-async def orchestrate(request: OrchestrationRequest):
+async def orchestrate(request):
+    payload = await _json_body(request)
     try:
         result = await run_orchestration(
-            csv_path=request.csv_path,
-            target_column=request.target_column,
-            task_type=request.task_type,
-            iterations=request.iterations,
-            initial_graph=request.initial_graph,
-            forecast_length=request.forecast_length,
+            csv_path=payload.get("csv_path", ""),
+            target_column=payload.get("target_column", ""),
+            task_type=payload.get("task_type", "classification"),
+            iterations=int(payload.get("iterations", 3) or 3),
+            initial_graph=payload.get("initial_graph"),
+            forecast_length=payload.get("forecast_length"),
         )
-        return JSONResponse(content=result)
+        return JSONResponse(result)
     except Exception as exc:
         logger.exception("Orchestration failed")
-        raise HTTPException(status_code=500, detail=str(exc))
+        return _error(str(exc), 500)
 
 
-@app.post("/orchestrate/stream")
-async def orchestrate_stream(request: OrchestrationRequest):
+async def orchestrate_stream(request):
+    payload = await _json_body(request)
+
     async def event_generator():
         try:
             async for evt in run_orchestration_stream(
-                csv_path=request.csv_path,
-                target_column=request.target_column,
-                task_type=request.task_type,
-                iterations=request.iterations,
-                initial_graph=request.initial_graph,
-                forecast_length=request.forecast_length,
+                csv_path=payload.get("csv_path", ""),
+                target_column=payload.get("target_column", ""),
+                task_type=payload.get("task_type", "classification"),
+                iterations=int(payload.get("iterations", 3) or 3),
+                initial_graph=payload.get("initial_graph"),
+                forecast_length=payload.get("forecast_length"),
             ):
                 yield f"data: {json.dumps(evt, default=str, ensure_ascii=False)}\n\n"
         except Exception as exc:
@@ -171,6 +154,19 @@ async def orchestrate_stream(request: OrchestrationRequest):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+routes = [
+    Route("/health", health, methods=["GET"]),
+    Route("/config", get_config, methods=["GET"]),
+    Route("/tools", get_tools, methods=["GET"]),
+    Route("/architect/chat", architect_chat, methods=["POST"]),
+    Route("/graph/mutate", graph_mutate, methods=["POST"]),
+    Route("/orchestrate", orchestrate, methods=["POST"]),
+    Route("/orchestrate/stream", orchestrate_stream, methods=["POST"]),
+]
+
+app = Starlette(debug=False, routes=routes)
 
 
 if __name__ == "__main__":

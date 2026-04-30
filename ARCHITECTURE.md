@@ -11,7 +11,7 @@ Streamlit frontend (:8502)
         |
         | HTTP / SSE
         v
-FastAPI backend (:8001)
+Starlette backend (:8001)
         |
         | MCP-style local tool adapter
         v
@@ -144,7 +144,7 @@ The Streamlit app is organized around graph approval:
 - `backend/mcp_server.py` - MCP tools for profiling, graph validation, training, validation, reporting.
 - `backend/orchestrator.py` - agent loop and Architect chat helper.
 - `backend/agents/` - agent implementations and shared dataclasses.
-- `backend/app.py` - FastAPI endpoints.
+- `backend/app.py` - Starlette HTTP and SSE endpoints.
 - `frontend/streamlit_app.py` - interactive graph-first UI.
 
 ## Fedot.Industrial 0.5.0 Setup
@@ -161,7 +161,7 @@ For local backend launch, run the backend inside this Poetry environment and ins
 
 The backend requirements deliberately do not pin `pandas`, `scikit-learn`, or `xgboost`; those versions must remain controlled by `Fedot.Industrial/poetry.lock`.
 
-The official Python MCP SDK is not installed in the Fedot.Industrial Poetry environment because current releases require Pydantic v2, while Fedot.Industrial 0.5.0 depends on `spacy 3.5.x`, which requires Pydantic v1. The project keeps an MCP-style tool registry and OpenAI tool schema adapter locally.
+FastAPI and the official Python MCP SDK are not installed in the Fedot.Industrial Poetry environment because their dependency trees conflict with Fedot.Industrial 0.5.0 (`python-fasthtml -> starlette~=1.0`, `spacy -> pydantic<2`). The project uses Starlette directly and keeps an MCP-style tool registry plus OpenAI tool schema adapter locally.
 
 For Docker launch, `docker-compose.yml` passes the sibling checkout as a BuildKit additional context:
 

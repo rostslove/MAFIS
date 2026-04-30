@@ -55,7 +55,7 @@ cd ~/Fedot.Industrial
 poetry run pip install -r ../industrial-learning-agent/backend/requirements.txt
 ```
 
-The backend requirements intentionally do not install `fedot-ind`, `pandas`, `scikit-learn`, `xgboost`, or the official `mcp` package; those either come from Fedot.Industrial or are replaced by the local MCP tool adapter. This keeps the Poetry environment on Pydantic v1, as required by Fedot.Industrial's `spacy` dependency.
+The backend requirements intentionally do not install `fedot-ind`, `pandas`, `scikit-learn`, `xgboost`, FastAPI, or the official `mcp` package. Fedot.Industrial owns the scientific stack and Starlette, while the backend uses a local MCP tool adapter. This avoids conflicts with `python-fasthtml -> starlette~=1.0` and `spacy -> pydantic<2`.
 
 ## 4. Run Backend
 
