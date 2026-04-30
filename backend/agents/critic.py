@@ -97,20 +97,20 @@ Return JSON only."""
                 else {}
             )
 
-            if engineer_result.graph_error:
-                llm_feedback = {}
-            else:
-                llm_feedback = await self._ask_llm_for_mutations(
-                    graph,
-                    data_context,
-                    engineer_result,
-                    validation if isinstance(validation, dict) else {},
-                    error_analysis if isinstance(error_analysis, dict) else {},
-                    feedback,
-                )
+            # Keep Critic deterministic during evaluation: OpenRouter limits should
+            # not hide actionable feedback from the user.
+            llm_feedback = {}
             feedback.suggested_mutations = (
                 llm_feedback.get("suggested_mutations")
                 or self._fallback_mutations(graph, data_context, engineer_result)
+            )
+            feedback.improvement_plan = self._build_improvement_plan(
+                graph,
+                data_context,
+                engineer_result,
+                validation if isinstance(validation, dict) else {},
+                error_analysis if isinstance(error_analysis, dict) else {},
+                feedback.suggested_mutations,
             )
             feedback.should_stop = bool(
                 llm_feedback.get("should_stop")
@@ -129,6 +129,7 @@ Return JSON only."""
             feedback.weaknesses = ["Critic LLM/tool analysis failed"]
             feedback.diagnostics = list(engineer_result.diagnostics)
             feedback.suggested_mutations = self._fallback_mutations(graph, data_context, engineer_result)
+            feedback.improvement_plan = self._build_improvement_plan(graph, data_context, engineer_result, {}, {}, feedback.suggested_mutations)
             feedback.should_stop = False
             feedback.tool_calls = self.get_tool_calls()
             return feedback
@@ -268,6 +269,53 @@ Return JSON only."""
 
         return mutations[:2]
 
+    def _build_improvement_plan(
+        self,
+        graph: Dict[str, Any],
+        dc: DataContext,
+        engineer: EngineerResult,
+        validation: Dict[str, Any],
+        error_analysis: Dict[str, Any],
+        mutations: List[Dict[str, Any]],
+    ) -> List[str]:
+        plan: List[str] = []
+        if engineer.graph_error:
+            plan.append("First fix the graph/runtime error before comparing model quality.")
+            plan.extend(self._diagnostic_recommendations(engineer.diagnostics))
+            return self._unique_strings(plan)
+
+        delta = error_analysis.get("delta") if isinstance(error_analysis, dict) else None
+        if engineer.best_baseline_score > engineer.graph_score:
+            plan.append(
+                f"The graph is behind the best baseline ({engineer.best_baseline_name}) "
+                f"by about {abs(float(delta or engineer.best_baseline_score - engineer.graph_score)):.4f}."
+            )
+            mapped = self._baseline_to_operation(dc.task_type, engineer.best_baseline_name)
+            if mapped:
+                plan.append(f"Replace the current model node with '{mapped}' because that family performed best as a baseline.")
+        else:
+            plan.append("The graph is competitive with baselines; keep the structure and validate it on more data.")
+
+        if validation.get("score_std", 0) > 0.05:
+            plan.append("Cross-validation variance is noticeable; prefer simpler models or stronger regularization.")
+
+        if dc.profile.get("is_imbalanced"):
+            plan.append("Target classes look imbalanced; prefer metrics such as F1/precision and consider class weighting.")
+
+        for mutation in mutations:
+            if mutation.get("type") == "replace":
+                plan.append(
+                    f"Architect can draft a new graph by replacing node '{mutation.get('node_id')}' "
+                    f"with '{mutation.get('new_operation')}'."
+                )
+            elif mutation.get("type") == "add":
+                node = mutation.get("node", {})
+                plan.append(f"Architect can draft a new graph by adding '{node.get('operation')}' before the model.")
+            elif mutation.get("type") == "set_params":
+                plan.append(f"Architect can draft a new graph by updating parameters of node '{mutation.get('node_id')}'.")
+
+        return self._unique_strings(plan)[:6]
+
     @staticmethod
     def _collect_diagnostics(
         engineer: EngineerResult,
@@ -297,6 +345,14 @@ Return JSON only."""
                 if rec not in recs:
                     recs.append(rec)
         return recs[:4]
+
+    @staticmethod
+    def _unique_strings(items: List[str]) -> List[str]:
+        out: List[str] = []
+        for item in items:
+            if item and item not in out:
+                out.append(item)
+        return out
 
     @staticmethod
     def _root_id(nodes: List[Dict[str, Any]]) -> str:

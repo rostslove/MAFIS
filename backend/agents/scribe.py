@@ -1,10 +1,11 @@
 """Scribe: turns GraphAutoML iterations into a compact final report."""
 
-import json
 import logging
 from typing import Any, Dict, List
 
-from .base_agent import BaseAgent, extract_json_block
+import json
+
+from .base_agent import BaseAgent
 from .schemas import DataContext, ScribeReport
 
 logger = logging.getLogger("Scribe")
@@ -41,7 +42,7 @@ Return JSON only:
             if not isinstance(tool_report, dict):
                 tool_report = {}
 
-            llm_report = await self._ask_llm(all_iterations, data_context, tool_report)
+            llm_report: Dict[str, Any] = {}
             best_score = tool_report.get("best_score", 0)
             n_iterations = tool_report.get("n_iterations", len(all_iterations))
 
@@ -68,20 +69,6 @@ Return JSON only:
             report.recommendations = ["Review backend logs and rerun the orchestration"]
             report.tool_calls = self.get_tool_calls()
             return report
-
-    async def _ask_llm(
-        self,
-        iterations: List[Dict[str, Any]],
-        dc: DataContext,
-        tool_report: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        context = f"""Task: {dc.task_type}
-Data profile: {json.dumps(dc.profile, ensure_ascii=False)}
-Tool summary: {json.dumps(tool_report, ensure_ascii=False)}
-Iterations: {json.dumps(iterations, ensure_ascii=False)[:8000]}
-Return the report JSON only."""
-        response = await self.call_llm(context, max_rounds=1, use_tools=False)
-        return extract_json_block(response.get("full_response", "")) or {}
 
     @staticmethod
     def _default_results(tool_report: Dict[str, Any]) -> str:

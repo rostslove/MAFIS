@@ -550,9 +550,6 @@ def load_input_data(
     X = numeric_df.values
 
     if task_type in ("classification", "ts_classification"):
-        if y.dtype == object:
-            from sklearn.preprocessing import LabelEncoder
-            y = LabelEncoder().fit_transform(y)
         task = Task(TaskTypesEnum.classification)
     else:
         if y.dtype == object:

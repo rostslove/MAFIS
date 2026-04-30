@@ -18,7 +18,13 @@ from graph_engine import (
     SUPPORTED_TASKS,
     get_operation_catalog,
 )
-from orchestrator import mutate_graph_locally, propose_architecture, run_orchestration, run_orchestration_stream
+from orchestrator import (
+    mutate_graph_locally,
+    propose_architecture,
+    propose_revision_from_critic,
+    run_orchestration,
+    run_orchestration_stream,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -112,6 +118,26 @@ async def architect_chat(request):
         return _error(str(exc), 500)
 
 
+async def architect_revise(request):
+    payload = await _json_body(request)
+    try:
+        result = await propose_revision_from_critic(
+            csv_path=payload.get("csv_path", ""),
+            target_column=payload.get("target_column", ""),
+            task_type=payload.get("task_type", "classification"),
+            current_graph=payload.get("current_graph") or {},
+            critic_feedback=payload.get("critic_feedback") or {},
+            message=payload.get("message", ""),
+            forecast_length=payload.get("forecast_length"),
+        )
+        if result.get("error"):
+            return _error(result["error"], 400)
+        return JSONResponse(result)
+    except Exception as exc:
+        logger.exception("Architect revision failed")
+        return _error(str(exc), 500)
+
+
 async def graph_mutate(request):
     payload = await _json_body(request)
     try:
@@ -128,7 +154,7 @@ async def orchestrate(request):
             csv_path=payload.get("csv_path", ""),
             target_column=payload.get("target_column", ""),
             task_type=payload.get("task_type", "classification"),
-            iterations=int(payload.get("iterations", 3) or 3),
+            iterations=int(payload.get("iterations", 1) or 1),
             initial_graph=payload.get("initial_graph"),
             forecast_length=payload.get("forecast_length"),
         )
@@ -147,7 +173,7 @@ async def orchestrate_stream(request):
                 csv_path=payload.get("csv_path", ""),
                 target_column=payload.get("target_column", ""),
                 task_type=payload.get("task_type", "classification"),
-                iterations=int(payload.get("iterations", 3) or 3),
+                iterations=int(payload.get("iterations", 1) or 1),
                 initial_graph=payload.get("initial_graph"),
                 forecast_length=payload.get("forecast_length"),
             ):
@@ -173,6 +199,7 @@ routes = [
     Route("/config", get_config, methods=["GET"]),
     Route("/tools", get_tools, methods=["GET"]),
     Route("/architect/chat", architect_chat, methods=["POST"]),
+    Route("/architect/revise", architect_revise, methods=["POST"]),
     Route("/graph/mutate", graph_mutate, methods=["POST"]),
     Route("/orchestrate", orchestrate, methods=["POST"]),
     Route("/orchestrate/stream", orchestrate_stream, methods=["POST"]),

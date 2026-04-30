@@ -75,6 +75,7 @@ class BaselineResult:
     score: float = 0.0
     metrics: Dict[str, float] = field(default_factory=dict)
     error: Optional[str] = None
+    target_info: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -86,13 +87,15 @@ class EngineerResult:
     best_baseline_score: float = 0.0
     best_baseline_name: str = ""
     graph_error: str = ""
+    target_info: Dict[str, Any] = field(default_factory=dict)
+    training_notes: List[str] = field(default_factory=list)
     diagnostics: List[Dict[str, Any]] = field(default_factory=list)
     tool_calls: List[ToolCall] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "baseline_results": [
-                {"name": r.name, "score": r.score, "metrics": r.metrics, "error": r.error}
+                {"name": r.name, "score": r.score, "metrics": r.metrics, "error": r.error, "target_info": r.target_info}
                 for r in self.baseline_results
             ],
             "graph_score": self.graph_score,
@@ -101,6 +104,8 @@ class EngineerResult:
             "best_baseline_score": self.best_baseline_score,
             "best_baseline_name": self.best_baseline_name,
             "graph_error": self.graph_error,
+            "target_info": self.target_info,
+            "training_notes": self.training_notes,
             "diagnostics": self.diagnostics,
             "tool_calls": [tc.to_dict() for tc in self.tool_calls],
         }
@@ -113,6 +118,7 @@ class CriticFeedback:
     strengths: List[str] = field(default_factory=list)
     weaknesses: List[str] = field(default_factory=list)
     suggested_mutations: List[Dict[str, Any]] = field(default_factory=list)
+    improvement_plan: List[str] = field(default_factory=list)
     should_stop: bool = False
     node_importance: Dict[str, float] = field(default_factory=dict)
     explanation: Dict[str, Any] = field(default_factory=dict)
@@ -127,6 +133,7 @@ class CriticFeedback:
             "strengths": self.strengths,
             "weaknesses": self.weaknesses,
             "suggested_mutations": self.suggested_mutations,
+            "improvement_plan": self.improvement_plan,
             "should_stop": self.should_stop,
             "node_importance": self.node_importance,
             "explanation": self.explanation,

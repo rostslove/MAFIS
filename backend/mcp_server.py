@@ -129,6 +129,26 @@ def _predict_pipeline(pipeline, data, task_type: str) -> np.ndarray:
     return np.asarray(pipeline.predict(data).predict)
 
 
+def _target_info(csv_path: str, target_column: str, task_type: str) -> Dict[str, Any]:
+    df = pd.read_csv(csv_path, usecols=[target_column])
+    y = df[target_column]
+    values = y.dropna()
+    info: Dict[str, Any] = {
+        "column": target_column,
+        "raw_dtype": str(y.dtype),
+        "unique_values": int(values.nunique()),
+        "sample_values": [str(v) for v in values.head(10).tolist()],
+        "fedot_receives_raw_target": task_type in ("classification", "ts_classification"),
+        "baseline_encoded": False,
+    }
+    if task_type in ("classification", "ts_classification") and not np.issubdtype(y.dtype, np.number):
+        encoder = LabelEncoder()
+        encoder.fit(values.astype(str).values)
+        info["baseline_encoded"] = True
+        info["baseline_encoding"] = {str(label): int(code) for code, label in enumerate(encoder.classes_)}
+    return info
+
+
 def _failure_payload(error: Exception, task_type: str = "", graph: Optional[PipelineGraph] = None) -> Dict[str, Any]:
     diagnostic = diagnose_runtime_error(error, task_type=task_type, graph=graph)
     return {
@@ -280,8 +300,10 @@ def train_baseline(csv_path: str, target_column: str, baseline_name: str, task_t
         df = pd.read_csv(csv_path)
         y = df[target_column].values
         X = df.drop(columns=[target_column]).select_dtypes(include=[np.number]).values
+        baseline_encoded = False
         if task_type in ("classification", "ts_classification") and not np.issubdtype(np.asarray(y).dtype, np.number):
-            y = LabelEncoder().fit_transform(y)
+            y = LabelEncoder().fit_transform(pd.Series(y).astype(str).values)
+            baseline_encoded = True
 
         stratify = y if task_type in ("classification", "ts_classification") else None
         X_tr, X_va, y_tr, y_va = train_test_split(X, y, test_size=0.2, random_state=42, stratify=stratify)
@@ -290,7 +312,13 @@ def train_baseline(csv_path: str, target_column: str, baseline_name: str, task_t
         pipe.fit(X_tr, y_tr)
         preds = pipe.predict(X_va)
         metrics = compute_metrics(task_type, y_va, preds)
-        return json.dumps({"name": baseline_name, "score": metrics["primary_score"], "metrics": metrics})
+        return json.dumps({
+            "name": baseline_name,
+            "score": metrics["primary_score"],
+            "metrics": metrics,
+            "target_info": _target_info(csv_path, target_column, task_type),
+            "baseline_encoded_target": baseline_encoded,
+        })
     except Exception as e:
         return json.dumps({"name": baseline_name, "score": 0, "error": str(e)})
 
@@ -318,12 +346,21 @@ def train_graph(graph_json: str, csv_path: str, target_column: str, forecast_len
         metrics = compute_metrics(graph.task_type, val.target, preds)
         _store_run(pipeline, graph, input_data, preds)
 
+        target_info = _target_info(csv_path, target_column, graph.task_type)
+        training_notes = []
+        if target_info.get("fedot_receives_raw_target") and target_info.get("baseline_encoded"):
+            training_notes.append(
+                "Fedot graph received the raw string classification target; sklearn baselines encoded it only for baseline fitting."
+            )
+
         return json.dumps({
             "score": metrics["primary_score"],
             "metrics": metrics,
             "graph": graph.to_dict(),
             "n_train": len(train.features),
             "n_val": len(val.features),
+            "target_info": target_info,
+            "training_notes": training_notes,
         })
     except Exception as e:
         logger.exception("train_graph failed")
@@ -346,6 +383,29 @@ def tune_graph_hyperparameters(
         ok, msg = graph.validate()
         if not ok:
             return json.dumps(_invalid_graph_payload(msg, graph))
+
+        if graph.task_type in ("classification", "ts_classification"):
+            diagnostic = {
+                "agent": "Engineer",
+                "kind": "tuning_skipped",
+                "summary": "Classification tuning skipped to avoid Fedot ROC-AUC metric tracebacks.",
+                "technical_message": (
+                    "Fedot.Industrial 0.5 tuner may evaluate binary ROC-AUC on a two-column probability matrix "
+                    "and print repeated internal ValueError tracebacks. Training the graph as-is is cleaner."
+                ),
+                "recommendations": [
+                    "Use train_graph for classification graphs.",
+                    "Let Critic compare the trained graph with baselines and suggest a model replacement.",
+                ],
+                "recoverable": True,
+            }
+            return json.dumps({
+                "score": 0,
+                "error": "tuning skipped for classification",
+                "diagnostics": [diagnostic],
+                "recommendations": diagnostic["recommendations"],
+                "target_info": _target_info(csv_path, target_column, graph.task_type),
+            })
 
         input_data = load_input_data(csv_path, target_column, graph.task_type, forecast_length)
         train, val = split_input_data(input_data)
@@ -371,11 +431,20 @@ def tune_graph_hyperparameters(
         except Exception:
             pass
 
+        target_info = _target_info(csv_path, target_column, graph.task_type)
+        training_notes = []
+        if target_info.get("fedot_receives_raw_target") and target_info.get("baseline_encoded"):
+            training_notes.append(
+                "Fedot graph received the raw string classification target; sklearn baselines encoded it only for baseline fitting."
+            )
+
         return json.dumps({
             "score": metrics["primary_score"],
             "metrics": metrics,
             "graph": graph.to_dict(),
             "tuned_nodes": tuned_nodes,
+            "target_info": target_info,
+            "training_notes": training_notes,
         })
     except Exception as e:
         logger.exception("tune_graph_hyperparameters failed")

@@ -47,8 +47,9 @@ async def run_orchestration_stream(
     initial_fedot_config: Optional[Dict[str, Any]] = None,
     forecast_length: Optional[int] = None,
 ) -> AsyncGenerator[Dict[str, Any], None]:
-    """Run Architect -> Engineer -> Critic iterations and yield SSE-friendly events."""
+    """Evaluate one user-approved graph and yield SSE-friendly events."""
     del fedot_url, initial_fedot_config
+    iterations = 1
 
     if task_type not in SUPPORTED_TASKS:
         yield _event("error", message=f"Unknown task type: {task_type}. Available: {SUPPORTED_TASKS}")
@@ -316,10 +317,85 @@ async def propose_architecture(
             "mermaid": result.mermaid,
             "analysis": result.analysis,
             "reasoning": result.reasoning,
+            "diagnostics": result.diagnostics,
             "tool_calls": [tc.to_dict() for tc in result.tool_calls],
         }
     finally:
         await mcp_client.cleanup()
+
+
+async def propose_revision_from_critic(
+    csv_path: str,
+    target_column: str,
+    task_type: str,
+    current_graph: Dict[str, Any],
+    critic_feedback: Dict[str, Any],
+    message: str = "",
+    forecast_length: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Create a new draft graph from explicit Critic feedback; user must approve it."""
+    if task_type not in SUPPORTED_TASKS:
+        return {"error": f"Unknown task type: {task_type}"}
+
+    graph = PipelineGraph.from_dict(current_graph)
+    ok, validation_message = graph.validate()
+    if not ok:
+        return {"error": f"Current graph is invalid: {validation_message}"}
+
+    mutations = critic_feedback.get("suggested_mutations", []) or []
+    diagnostics = []
+    draft = graph
+    applied = []
+    for mutation in mutations:
+        try:
+            candidate = draft.apply_mutation(mutation)
+            ok, validation_message = candidate.validate()
+            if ok:
+                draft = candidate
+                applied.append(mutation)
+            else:
+                diagnostics.append(diagnose_runtime_error(validation_message, task_type=task_type, graph=candidate))
+        except Exception as exc:
+            diagnostics.append(diagnose_runtime_error(exc, task_type=task_type, graph=draft))
+
+    if applied:
+        return {
+            "profile": _profile_data(csv_path, target_column, task_type, forecast_length),
+            "graph": draft.to_dict(),
+            "mermaid": draft.to_mermaid(),
+            "analysis": "Architect drafted a new graph by applying Critic feedback. It is not approved yet.",
+            "reasoning": _revision_reasoning(critic_feedback, applied, message),
+            "diagnostics": diagnostics,
+            "applied_mutations": applied,
+            "requires_approval": True,
+            "tool_calls": [],
+        }
+
+    return {
+        "profile": _profile_data(csv_path, target_column, task_type, forecast_length),
+        "graph": graph.to_dict(),
+        "mermaid": graph.to_mermaid(),
+        "analysis": "Critic did not provide a valid structural mutation, so Architect kept the current graph as the draft.",
+        "reasoning": _revision_reasoning(critic_feedback, [], message),
+        "diagnostics": diagnostics,
+        "applied_mutations": [],
+        "requires_approval": True,
+        "tool_calls": [],
+    }
+
+
+def _revision_reasoning(critic_feedback: Dict[str, Any], applied: list, message: str = "") -> str:
+    parts = []
+    assessment = critic_feedback.get("assessment")
+    if assessment:
+        parts.append(f"Critic assessment: {assessment}")
+    plan = critic_feedback.get("improvement_plan", []) or []
+    if plan:
+        parts.append("Improvement plan: " + " ".join(str(item) for item in plan[:4]))
+    parts.append(f"Applied mutations: {applied}")
+    if message:
+        parts.append(f"User note: {message}")
+    return "\n".join(parts)
 
 
 def mutate_graph_locally(graph: Dict[str, Any], mutation: Dict[str, Any]) -> Dict[str, Any]:

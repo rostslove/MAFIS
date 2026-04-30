@@ -41,10 +41,18 @@ Do not change graph structure; only node parameters may be tuned."""
                 result.graph_metrics = graph_run.get("metrics", {}) or {}
                 result.tuned_nodes = graph_run.get("tuned_nodes", []) or []
                 result.graph_error = graph_run.get("error", "") or ""
+                result.target_info = graph_run.get("target_info", {}) or result.target_info
+                result.training_notes.extend(graph_run.get("training_notes", []) or [])
                 result.diagnostics.extend(self._extract_diagnostics(graph_run))
                 result.diagnostics = self._unique_diagnostics(result.diagnostics)
                 if result.graph_error:
                     result.graph_metrics["error"] = result.graph_error
+
+            if result.target_info.get("baseline_encoded"):
+                result.training_notes.append(
+                    "Fedot graph used the raw target values; sklearn baselines used this label mapping: "
+                    f"{result.target_info.get('baseline_encoding', {})}"
+                )
 
             if result.baseline_results:
                 best = max(result.baseline_results, key=lambda r: r.score)
@@ -98,10 +106,38 @@ Do not change graph structure; only node parameters may be tuned."""
                         score=float(baseline.get("score") or 0),
                         metrics=baseline.get("metrics", {}) or {},
                         error=baseline.get("error"),
+                        target_info=baseline.get("target_info", {}) or {},
                     )
                 )
+                if not result.target_info and baseline.get("target_info"):
+                    result.target_info = baseline["target_info"]
 
     async def _train_graph(self, graph_json: str, dc: DataContext) -> dict:
+        if dc.task_type in ("classification", "ts_classification"):
+            trained = await self._train_without_tuning(graph_json, dc)
+            trained.setdefault("training_notes", []).append(
+                "Fedot hyperparameter tuning was skipped for classification because Fedot.Industrial 0.5 "
+                "prints internal ROC-AUC shape tracebacks for binary probability matrices during tuning. "
+                "The graph was trained as-is and scored with external sklearn metrics."
+            )
+            trained.setdefault("diagnostics", []).append(
+                {
+                    "agent": "Engineer",
+                    "kind": "tuning_skipped",
+                    "summary": "Classification tuning skipped to avoid noisy Fedot ROC-AUC metric tracebacks.",
+                    "technical_message": (
+                        "Fedot tuner can call roc_auc_score with y_score shaped (n_samples, 2). "
+                        "The exception is internal to tuner metric evaluation and does not mean the final graph cannot train."
+                    ),
+                    "recommendations": [
+                        "Compare the graph against baselines first.",
+                        "Use manual model replacement from Critic feedback instead of automatic tuner for classification.",
+                    ],
+                    "recoverable": True,
+                }
+            )
+            return trained
+
         args = {
             "graph_json": graph_json,
             "csv_path": dc.csv_path,
@@ -116,21 +152,24 @@ Do not change graph structure; only node parameters may be tuned."""
             return tuned
 
         logger.warning("[Engineer] tuning failed or returned zero score, training graph without tuning")
-        fallback_args = {
+        trained = await self._train_without_tuning(graph_json, dc)
+        if isinstance(tuned, dict) and tuned.get("error") and trained.get("error"):
+            trained.setdefault("diagnostics", [])
+            trained["diagnostics"].extend(self._extract_diagnostics(tuned))
+            trained["tuning_error"] = tuned.get("error")
+        return trained
+
+    async def _train_without_tuning(self, graph_json: str, dc: DataContext) -> dict:
+        args = {
             "graph_json": graph_json,
             "csv_path": dc.csv_path,
             "target_column": dc.target_column,
         }
         if dc.forecast_length:
-            fallback_args["forecast_length"] = dc.forecast_length
-        trained = await self.call_mcp_tool("train_graph", fallback_args)
+            args["forecast_length"] = dc.forecast_length
+        trained = await self.call_mcp_tool("train_graph", args)
         if not isinstance(trained, dict):
             return {"score": 0, "error": "train_graph returned no data"}
-
-        if isinstance(tuned, dict) and tuned.get("error") and trained.get("error"):
-            trained.setdefault("diagnostics", [])
-            trained["diagnostics"].extend(self._extract_diagnostics(tuned))
-            trained["tuning_error"] = tuned.get("error")
         return trained
 
     @staticmethod

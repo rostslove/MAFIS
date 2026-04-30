@@ -97,10 +97,23 @@ def set_graph(result: Dict[str, Any], approved: bool = False) -> None:
     if "diagnostics" in result:
         st.session_state.architect_diagnostics = result.get("diagnostics", [])
     st.session_state.graph_approved = approved
+    if approved:
+        st.session_state.approved_graph = st.session_state.graph
+        st.session_state.approved_mermaid = st.session_state.mermaid
 
 
 def approve_graph() -> None:
     if st.session_state.get("graph"):
+        st.session_state.approved_graph = st.session_state.graph
+        st.session_state.approved_mermaid = st.session_state.get("mermaid", "")
+        st.session_state.graph_approved = True
+
+
+def discard_draft() -> None:
+    approved = st.session_state.get("approved_graph")
+    if approved:
+        st.session_state.graph = approved
+        st.session_state.mermaid = st.session_state.get("approved_mermaid", "")
         st.session_state.graph_approved = True
 
 
@@ -119,16 +132,17 @@ def require_dataset() -> bool:
     return True
 
 
-def render_graph(graph: Dict[str, Any]) -> None:
+def render_graph(graph: Dict[str, Any], show_details: bool = True) -> None:
     if not graph:
         st.info("No graph proposed yet.")
         return
     st.graphviz_chart(graph_to_dot(graph), use_container_width=True)
-    with st.expander("Graph JSON"):
-        st.json(graph)
-    if st.session_state.get("mermaid"):
-        with st.expander("Mermaid"):
-            st.code(st.session_state.mermaid, language="mermaid")
+    if show_details:
+        with st.expander("Graph JSON"):
+            st.json(graph)
+        if st.session_state.get("mermaid"):
+            with st.expander("Mermaid"):
+                st.code(st.session_state.mermaid, language="mermaid")
 
 
 def render_tool_calls(tool_calls: List[Dict[str, Any]], title: str) -> None:
@@ -147,10 +161,11 @@ def render_tool_calls(tool_calls: List[Dict[str, Any]], title: str) -> None:
         st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
 
-def render_diagnostics(diagnostics: List[Dict[str, Any]], title: str = "Diagnostics") -> None:
+def render_diagnostics(diagnostics: List[Dict[str, Any]], title: str = "Diagnostics", use_expander: bool = True) -> None:
     if not diagnostics:
         return
-    with st.expander(title, expanded=True):
+    container = st.expander(title, expanded=True) if use_expander else st.container()
+    with container:
         for item in diagnostics:
             st.warning(item.get("summary", "Runtime diagnostic"))
             recommendations = item.get("recommendations", []) or []
@@ -161,8 +176,8 @@ def render_diagnostics(diagnostics: List[Dict[str, Any]], title: str = "Diagnost
                 st.write("Problem nodes")
                 st.dataframe(pd.DataFrame(item["problem_nodes"]), use_container_width=True, hide_index=True)
             if item.get("technical_message"):
-                with st.expander("Technical message"):
-                    st.code(str(item["technical_message"])[:4000])
+                st.caption("Technical message")
+                st.code(str(item["technical_message"])[:4000])
 
 
 def operation_rows(config: Dict[str, Any], task_type: str) -> List[Dict[str, str]]:
@@ -258,7 +273,10 @@ def stream_run(payload: Dict[str, Any]) -> None:
                 )
                 if event.get("graph"):
                     st.session_state.graph = event["graph"]
+                    st.session_state.approved_graph = event["graph"]
                     st.session_state.mermaid = event.get("mermaid", "")
+                    st.session_state.approved_mermaid = event.get("mermaid", "")
+                    st.session_state.graph_approved = True
             elif event_type == "error":
                 lines.append(f"ERROR: {event.get('message')}")
             elif event_type == "complete":
@@ -289,7 +307,6 @@ def sidebar() -> None:
                 st.session_state.forecast_length = st.number_input("Forecast length", min_value=1, value=14)
             else:
                 st.session_state.forecast_length = None
-            st.session_state.iterations = st.slider("Iterations", min_value=1, max_value=5, value=2)
 
         st.divider()
         st.caption(f"Backend: {BACKEND_URL}")
@@ -373,9 +390,13 @@ def architect_tab(config: Dict[str, Any]) -> None:
             st.write(st.session_state.architect_reasoning)
         render_diagnostics(st.session_state.get("architect_diagnostics", []), "Architect diagnostics")
         if st.session_state.get("graph"):
-            if st.button("Approve Draft", use_container_width=True):
+            action_cols = st.columns(2)
+            if action_cols[0].button("Approve Draft", use_container_width=True):
                 approve_graph()
                 st.success("Graph approved.")
+            if action_cols[1].button("Discard Draft", use_container_width=True, disabled=not st.session_state.get("approved_graph")):
+                discard_draft()
+                st.info("Draft discarded; approved graph restored.")
         render_tool_calls(st.session_state.get("architect_tool_calls", []), "Architect tool calls")
 
 
@@ -393,11 +414,14 @@ def graph_editor_tab(config: Dict[str, Any]) -> None:
     node_ids = [node.get("id") for node in graph.get("nodes", [])]
     root_id = root_node_id(graph)
 
-    status_col, approve_col = st.columns([2, 1])
+    status_col, approve_col, discard_col = st.columns([2, 1, 1])
     status_col.caption("Approved" if st.session_state.get("graph_approved") else "Draft")
     if approve_col.button("Approve Edited Graph", use_container_width=True):
         approve_graph()
         st.success("Graph approved.")
+    if discard_col.button("Discard Draft", use_container_width=True, disabled=not st.session_state.get("approved_graph")):
+        discard_draft()
+        st.info("Draft discarded; approved graph restored.")
 
     st.dataframe(pd.DataFrame(graph_rows(graph)), use_container_width=True, hide_index=True)
     render_graph(graph)
@@ -471,23 +495,28 @@ def graph_editor_tab(config: Dict[str, Any]) -> None:
 
 
 def run_tab() -> None:
-    st.subheader("Run Approved Graph")
+    st.subheader("Evaluate Approved Graph")
     if not require_dataset():
         return
-    graph = st.session_state.get("graph")
-    if not graph:
-        st.info("Approve a graph first in the Architect tab.")
+    approved_graph = st.session_state.get("approved_graph")
+    draft_graph = st.session_state.get("graph")
+    if not approved_graph:
+        st.info("Approve a graph first. Draft graphs are never evaluated automatically.")
         return
 
     if not st.session_state.get("graph_approved"):
-        st.warning("Graph is still a draft. Running will approve this exact version.")
-    render_graph(graph)
-    if st.button("Approve Graph and Run", type="primary", use_container_width=True):
-        approve_graph()
+        st.warning("There is an unapproved draft. Evaluation will use the last approved graph.")
+        if draft_graph:
+            st.write("Draft waiting for approval")
+            render_graph(draft_graph, show_details=False)
+
+    st.write("Approved graph for evaluation")
+    render_graph(approved_graph, show_details=True)
+    if st.button("Evaluate Approved Graph", type="primary", use_container_width=True):
         payload = current_payload(
             {
-                "iterations": int(st.session_state.get("iterations", 2)),
-                "initial_graph": graph,
+                "iterations": 1,
+                "initial_graph": approved_graph,
             }
         )
         try:
@@ -498,61 +527,149 @@ def run_tab() -> None:
             st.error(f"Run failed: {exc}")
 
 
+def latest_iteration(result: Dict[str, Any]) -> Dict[str, Any]:
+    for item in reversed(result.get("iterations", [])):
+        if "error" not in item:
+            return item
+    return {}
+
+
+def render_engineer_report(engineer: Dict[str, Any]) -> None:
+    st.markdown("#### Engineer Report")
+    target_info = engineer.get("target_info", {}) or {}
+    if target_info:
+        cols = st.columns(4)
+        cols[0].metric("Target", target_info.get("column", ""))
+        cols[1].metric("Raw dtype", target_info.get("raw_dtype", ""))
+        cols[2].metric("Unique", target_info.get("unique_values", 0))
+        cols[3].metric("Baseline encoded", "yes" if target_info.get("baseline_encoded") else "no")
+        st.caption(
+            "Fedot graph receives raw target values. Encoding shown here is used only for sklearn baselines when needed."
+        )
+        if target_info.get("baseline_encoding"):
+            st.write("Sklearn baseline label mapping")
+            st.json(target_info["baseline_encoding"])
+        if target_info.get("sample_values"):
+            st.caption("Target sample: " + ", ".join(target_info["sample_values"][:8]))
+
+    notes = engineer.get("training_notes", []) or []
+    if notes:
+        st.write("Training notes")
+        for note in notes:
+            st.write(f"- {note}")
+
+    if engineer.get("graph_error"):
+        st.error(engineer["graph_error"])
+
+    metrics = engineer.get("graph_metrics", {}) or {}
+    if metrics:
+        metric_rows = [{"metric": k, "value": v} for k, v in metrics.items() if k != "error"]
+        st.write("Graph metrics")
+        st.dataframe(pd.DataFrame(metric_rows), use_container_width=True, hide_index=True)
+
+    baselines = engineer.get("baseline_results", []) or []
+    if baselines:
+        rows = []
+        for item in baselines:
+            metrics = item.get("metrics", {}) or {}
+            rows.append({
+                "baseline": item.get("name"),
+                "score": item.get("score", 0),
+                "accuracy": metrics.get("accuracy"),
+                "f1": metrics.get("f1"),
+                "roc_auc": metrics.get("roc_auc"),
+                "r2": metrics.get("r2"),
+                "rmse": metrics.get("rmse"),
+                "error": item.get("error"),
+            })
+        st.write("Baselines")
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    render_diagnostics(engineer.get("diagnostics", []), "Engineer diagnostics", use_expander=False)
+
+
+def render_critic_feedback(critic: Dict[str, Any]) -> None:
+    st.markdown("#### Critic Feedback")
+    st.write(critic.get("assessment", "No critic assessment."))
+
+    cols = st.columns(2)
+    cols[0].metric("Winner", critic.get("winner", ""))
+    cols[1].metric("Suggested changes", len(critic.get("suggested_mutations", []) or []))
+
+    if critic.get("strengths"):
+        st.write("What works")
+        for item in critic["strengths"]:
+            st.write(f"- {item}")
+    if critic.get("weaknesses"):
+        st.write("What should improve")
+        for item in critic["weaknesses"]:
+            st.write(f"- {item}")
+    if critic.get("improvement_plan"):
+        st.write("Improvement plan")
+        for item in critic["improvement_plan"]:
+            st.write(f"- {item}")
+    if critic.get("suggested_mutations"):
+        st.write("Concrete mutations for Architect")
+        st.json(critic["suggested_mutations"])
+
+    render_diagnostics(critic.get("diagnostics", []), "Critic diagnostics", use_expander=False)
+
+
+def request_architect_revision(iteration: Dict[str, Any], message: str = "") -> None:
+    current_graph = st.session_state.get("approved_graph") or iteration.get("architect", {}).get("graph", {})
+    critic = iteration.get("critic", {})
+    payload = current_payload({
+        "current_graph": current_graph,
+        "critic_feedback": critic,
+        "message": message,
+    })
+    result = post_json("/architect/revise", payload, timeout=180)
+    set_graph(result, approved=False)
+    st.session_state.architect_tool_calls = result.get("tool_calls", [])
+    st.success("Architect prepared a new draft. Approve it to make it the active pipeline.")
+
+
 def results_tab() -> None:
-    st.subheader("Results")
+    st.subheader("Evaluation Result")
     result = st.session_state.get("result")
     if not result:
-        st.info("Run an approved graph to see results.")
+        st.info("Evaluate an approved graph to see Engineer and Critic feedback.")
         return
 
-    summary = result.get("summary", {})
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Iterations", summary.get("successful_iterations", 0))
-    col2.metric("Max graph", f"{summary.get('max_graph_score', 0):.4f}")
-    col3.metric("Max baseline", f"{summary.get('max_baseline_score', 0):.4f}")
-    col4.metric("Graph wins", summary.get("graph_wins_count", 0))
+    item = latest_iteration(result)
+    if not item:
+        st.error("No successful evaluation found.")
+        return
 
-    rows = []
-    for item in result.get("iterations", []):
-        if "error" in item:
-            rows.append({"iteration": item.get("iteration"), "status": "failed", "error": item.get("error")})
-            continue
-        engineer = item.get("engineer", {})
-        critic = item.get("critic", {})
-        rows.append(
-            {
-                "iteration": item.get("iteration"),
-                "graph_score": engineer.get("graph_score", 0),
-                "best_baseline": engineer.get("best_baseline_score", 0),
-                "baseline_name": engineer.get("best_baseline_name", ""),
-                "winner": critic.get("winner", ""),
-                "stop": critic.get("should_stop", False),
-            }
-        )
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    engineer = item.get("engineer", {})
+    critic = item.get("critic", {})
 
-    for item in result.get("iterations", []):
-        if "error" in item:
-            continue
-        with st.expander(f"Iteration {item.get('iteration')} details"):
-            st.write("Graph")
-            render_graph(item.get("architect", {}).get("graph", {}))
-            st.write("Engineer metrics")
-            st.json(item.get("engineer", {}).get("graph_metrics", {}))
-            render_diagnostics(item.get("engineer", {}).get("diagnostics", []), "Engineer diagnostics")
-            st.write("Critic")
-            critic = item.get("critic", {})
-            st.write(critic.get("assessment", ""))
-            if critic.get("strengths"):
-                st.write("Strengths")
-                st.write(critic["strengths"])
-            if critic.get("weaknesses"):
-                st.write("Weaknesses")
-                st.write(critic["weaknesses"])
-            if critic.get("suggested_mutations"):
-                st.write("Suggested mutations")
-                st.json(critic["suggested_mutations"])
-            render_diagnostics(critic.get("diagnostics", []), "Critic diagnostics")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Graph score", f"{engineer.get('graph_score', 0):.4f}")
+    col2.metric("Best baseline", f"{engineer.get('best_baseline_score', 0):.4f}")
+    col3.metric("Baseline model", engineer.get("best_baseline_name", ""))
+
+    st.markdown("#### Evaluated Graph")
+    render_graph(item.get("architect", {}).get("graph", {}), show_details=False)
+
+    render_engineer_report(engineer)
+    render_critic_feedback(critic)
+
+    st.markdown("#### Next Pipeline Decision")
+    msg = st.text_area(
+        "Optional note for Architect",
+        placeholder="Example: prefer a simpler model, avoid heavy operations, or apply only the model replacement.",
+        height=90,
+    )
+    col_apply, col_keep = st.columns(2)
+    if col_apply.button("Ask Architect To Draft Critic Changes", type="primary", use_container_width=True):
+        try:
+            request_architect_revision(item, msg)
+        except Exception as exc:
+            st.error(f"Architect revision failed: {exc}")
+    if col_keep.button("Keep Current Approved Pipeline", use_container_width=True):
+        discard_draft()
+        st.info("Current approved pipeline kept. No new draft accepted.")
 
 
 def report_tab() -> None:
@@ -597,7 +714,7 @@ def main() -> None:
     config = load_config()
     tools = load_tools()
 
-    tabs = st.tabs(["Data", "Architect", "Graph Editor", "Run", "Results", "Report", "MCP Tools"])
+    tabs = st.tabs(["Data", "Architect", "Graph Editor", "Evaluate", "Feedback", "Report", "MCP Tools"])
     with tabs[0]:
         data_tab()
     with tabs[1]:
