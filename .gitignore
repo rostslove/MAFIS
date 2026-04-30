@@ -1,0 +1,26 @@
+# Environment files
+.env
+.env.local
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+
+# Data directory
+data/*.csv
+data/*.parquet
+
+# Docker
+.docker/
+
+# IDE
+.vscode/
+.idea/
+*.swp

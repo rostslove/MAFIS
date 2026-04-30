@@ -3,6 +3,8 @@ services:
     build:
       context: .
       dockerfile: backend.Dockerfile
+      additional_contexts:
+        fedot_industrial: ${FEDOT_INDUSTRIAL_CONTEXT:-../Fedot.Industrial}
     ports:
       - "8001:8001"
     volumes:
@@ -15,6 +17,7 @@ services:
       - OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
       - OPENROUTER_TITLE=GraphAutoML Agent
       - LLM_MODEL=${LLM_MODEL:-meta-llama/llama-3.3-70b-instruct:free}
+      - FEDOT_INDUSTRIAL_PATH=/opt/Fedot.Industrial
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
       interval: 10s

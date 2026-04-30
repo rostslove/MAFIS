@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from agents.base_agent import LLM_MODEL
-from graph_engine import METRICS_BY_TASK, OPERATIONS, SUPPORTED_TASKS
+from graph_engine import FEDOT_IND_VERSION, FEDOT_INDUSTRIAL_SOURCE, METRICS_BY_TASK, OPERATIONS, SUPPORTED_TASKS
 from orchestrator import mutate_graph_locally, propose_architecture, run_orchestration, run_orchestration_stream
 
 logging.basicConfig(level=logging.INFO)
@@ -81,6 +81,8 @@ async def get_config():
         "metrics_by_task": METRICS_BY_TASK,
         "operations": OPERATIONS,
         "openrouter_configured": bool(os.getenv("OPENROUTER_API_KEY")),
+        "fedot_ind_version": FEDOT_IND_VERSION,
+        "fedot_industrial_source": FEDOT_INDUSTRIAL_SOURCE,
     }
 
 

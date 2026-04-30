@@ -24,6 +24,8 @@ Fedot.Industrial + sklearn
 
 There is no separate `fedot_server` service anymore. The old double serialization path (`MCP -> HTTP -> Fedot server`) was removed; MCP tools now call graph and training code directly in the backend container.
 
+Fedot.Industrial 0.5.0 is expected to come from a local source checkout, not from PyPI. The backend supports a sibling checkout at `../Fedot.Industrial` or an explicit `FEDOT_INDUSTRIAL_PATH`.
+
 ## Agents
 
 ### Architect
@@ -144,6 +146,27 @@ The Streamlit app is organized around graph approval:
 - `backend/agents/` - agent implementations and shared dataclasses.
 - `backend/app.py` - FastAPI endpoints.
 - `frontend/streamlit_app.py` - interactive graph-first UI.
+
+## Fedot.Industrial 0.5.0 Setup
+
+`fedot-ind==0.5.0` is installed from the repository checkout:
+
+```bash
+git clone https://github.com/aimclub/Fedot.Industrial.git
+cd Fedot.Industrial
+poetry install
+```
+
+For local backend launch, run the backend inside this Poetry environment and install only the application dependencies from `backend/requirements.txt`.
+
+For Docker launch, `docker-compose.yml` passes the sibling checkout as a BuildKit additional context:
+
+```yaml
+additional_contexts:
+  fedot_industrial: ${FEDOT_INDUSTRIAL_CONTEXT:-../Fedot.Industrial}
+```
+
+If your checkout has another path or name, set `FEDOT_INDUSTRIAL_CONTEXT` for Docker and `FEDOT_INDUSTRIAL_PATH` for local Python runs.
 
 ## API Endpoints
 

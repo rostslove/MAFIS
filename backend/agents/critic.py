@@ -250,7 +250,7 @@ Return JSON only."""
     def _baseline_to_operation(task_type: str, baseline_name: str) -> str:
         mapping = {
             "classification": {"logreg": "logit", "rf": "rf", "xgb": "xgboost"},
-            "regression": {"ridge": "ridge", "rf": "rfr", "xgb": "lgbmreg"},
+            "regression": {"ridge": "ridge", "rf": "treg", "xgb": "xgbreg"},
             "ts_classification": {
                 "logreg": "industrial_stat_clf",
                 "rf": "industrial_stat_clf",

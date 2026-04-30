@@ -3,14 +3,60 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
+import sys
 from dataclasses import dataclass, field, asdict
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
-# Import fedot_ind early so its operations register with Fedot's repository
-import fedot_ind  # noqa: F401
+logger = logging.getLogger("GraphEngine")
+
+
+def _add_local_fedot_industrial_to_path() -> str:
+    """Prefer a sibling Fedot.Industrial source checkout when it exists."""
+    candidates = []
+    env_path = os.environ.get("FEDOT_INDUSTRIAL_PATH")
+    if env_path:
+        candidates.append(Path(env_path))
+
+    project_root = Path(__file__).resolve().parents[1]
+    candidates.extend([
+        project_root.parent / "Fedot.Industrial",
+        project_root.parent / "FEDOT.Industrial",
+        Path("/opt/Fedot.Industrial"),
+    ])
+
+    for candidate in candidates:
+        if (candidate / "fedot_ind").is_dir():
+            source_path = str(candidate.resolve())
+            if source_path not in sys.path:
+                sys.path.insert(0, source_path)
+            return source_path
+    return ""
+
+
+FEDOT_INDUSTRIAL_SOURCE = _add_local_fedot_industrial_to_path()
+
+try:
+    import fedot_ind  # noqa: F401
+    from fedot_ind.core.repository.initializer_industrial_models import IndustrialModels
+
+    FEDOT_IND_VERSION = getattr(fedot_ind, "__version__", "unknown")
+    IndustrialModels().setup_repository()
+except ImportError as exc:
+    raise ImportError(
+        "Fedot.Industrial 0.5.0 is required. Install it from a local clone with "
+        "`git clone https://github.com/aimclub/Fedot.Industrial.git`, "
+        "`cd Fedot.Industrial`, `poetry install`, then run this backend inside "
+        "that Poetry environment. You can also set FEDOT_INDUSTRIAL_PATH to the clone path."
+    ) from exc
+except Exception as exc:
+    logger.warning("Fedot.Industrial repository setup failed: %s", exc)
+
 from fedot.core.data.data import InputData
 from fedot.core.pipelines.pipeline import Pipeline
 from fedot.core.pipelines.node import PipelineNode
@@ -29,12 +75,12 @@ def is_ts_task(task_type: str) -> bool:
 # Atomic operations available per task type. Used for validation and proposal.
 OPERATIONS: Dict[str, Dict[str, List[str]]] = {
     "classification": {
-        "preprocessing": ["scaling", "normalization", "pca", "kernel_pca", "fast_ica"],
+        "preprocessing": ["scaling", "normalization", "simple_imputation", "pca", "kernel_pca"],
         "models": ["rf", "xgboost", "logit", "knn", "lgbm", "mlp", "dt"],
     },
     "regression": {
-        "preprocessing": ["scaling", "normalization", "pca", "kernel_pca", "fast_ica"],
-        "models": ["rfr", "ridge", "lasso", "lgbmreg", "knnreg", "dtreg", "sgdr"],
+        "preprocessing": ["scaling", "normalization", "simple_imputation", "pca", "kernel_pca"],
+        "models": ["xgbreg", "treg", "ridge", "lasso", "lgbmreg", "knnreg", "dtreg", "sgdr"],
     },
     "ts_classification": {
         "preprocessing": [
@@ -61,8 +107,11 @@ OPERATIONS: Dict[str, Dict[str, List[str]]] = {
         ],
     },
     "ts_forecasting": {
-        "preprocessing": ["smoothing", "gaussian_filter", "wavelet_basis", "fourier_basis", "eigen_basis"],
-        "models": ["ar", "stl_arima", "ets", "lagged_forecaster", "glm", "tcn_model", "nbeats_model"],
+        "preprocessing": ["smoothing", "gaussian_filter", "exog_ts", "eigen_basis"],
+        "models": [
+            "ar", "stl_arima", "ets", "lagged_forecaster", "eigen_forecaster",
+            "topo_forecaster", "glm", "tcn_model", "nbeats_model",
+        ],
     },
 }
 
@@ -83,7 +132,7 @@ DEFAULT_GRAPHS: Dict[str, List[Dict[str, Any]]] = {
     ],
     "regression": [
         {"id": "scale", "operation": "scaling", "params": {}, "inputs": []},
-        {"id": "model", "operation": "rfr", "params": {}, "inputs": ["scale"]},
+        {"id": "model", "operation": "ridge", "params": {}, "inputs": ["scale"]},
     ],
     "ts_classification": [
         {"id": "feat", "operation": "quantile_extractor", "params": {}, "inputs": []},
