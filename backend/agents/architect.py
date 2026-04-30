@@ -70,7 +70,7 @@ The root is n3."
                         "technical_message": response.get("error", ""),
                         "recommendations": [
                             "Retry when the OpenRouter provider is available.",
-                            "Set LLM_MODEL to a paid or less rate-limited model if you need full Architect reasoning.",
+                            "Set LLM_MODEL to another available free model if you need full Architect reasoning.",
                             "You can still edit and approve the fallback graph manually.",
                         ],
                         "recoverable": True,

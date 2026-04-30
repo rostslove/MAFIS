@@ -5,7 +5,7 @@
 Expected folder layout:
 
 ```text
-Diploma/
+
   Fedot.Industrial/
   industrial-learning-agent/
 ```
@@ -13,7 +13,6 @@ Diploma/
 ## 1. Prepare Fedot.Industrial
 
 ```powershell
-cd D:\Diploma
 git clone https://github.com/aimclub/Fedot.Industrial.git
 cd Fedot.Industrial
 poetry install
@@ -22,13 +21,12 @@ poetry install
 If the repository is already cloned, just run:
 
 ```powershell
-cd D:\Diploma\Fedot.Industrial
+cd ~/Fedot.Industrial
 poetry install
 ```
 
 ## 2. Restore The Poetry Env If Requirements Were Installed Before
 
-If you previously ran the old backend requirements, restore Fedot.Industrial dependencies first. The old file pinned `pandas` and `scikit-learn` too low for Fedot.Industrial 0.5.0.
 
 ```bash
 cd ~/Fedot.Industrial
@@ -45,7 +43,7 @@ poetry sync
 
 ```powershell
 cd D:\Diploma\Fedot.Industrial
-poetry run pip install -r ..\industrial-learning-agent\backend\requirements.txt
+poetry run pip install -r ../industrial-learning-agent/backend/requirements.txt
 ```
 
 On Linux use `/`, not Windows `\`:
@@ -61,9 +59,10 @@ The backend requirements intentionally do not install `fedot-ind`, `pandas`, `sc
 
 ```powershell
 cd D:\Diploma\Fedot.Industrial
-$env:FEDOT_INDUSTRIAL_PATH="D:\Diploma\Fedot.Industrial"
+$env:FEDOT_INDUSTRIAL_PATH="$HOME/Fedot.Industrial"
 $env:OPENROUTER_API_KEY="your_key"
-poetry run python ..\industrial-learning-agent\backend\app.py
+$env:LLM_MODEL="qwen/qwen3-coder:free"
+poetry run python ../industrial-learning-agent/backend/app.py
 ```
 
 Backend URL:
@@ -72,12 +71,15 @@ Backend URL:
 http://localhost:8001
 ```
 
+You can also put `OPENROUTER_API_KEY` and `LLM_MODEL` into the project `.env`; the backend reads it from the project root even when launched from the Fedot.Industrial directory.
+
 Linux:
 
 ```bash
 cd ~/Fedot.Industrial
 export FEDOT_INDUSTRIAL_PATH="$HOME/Fedot.Industrial"
 export OPENROUTER_API_KEY="your_key"
+export LLM_MODEL="qwen/qwen3-coder:free"
 poetry run python ../industrial-learning-agent/backend/app.py
 ```
 
@@ -86,9 +88,9 @@ poetry run python ../industrial-learning-agent/backend/app.py
 Open a second terminal:
 
 ```powershell
-cd D:\Diploma\industrial-learning-agent\frontend
+cd ~/industrial-learning-agent/frontend
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+./.venv/Scripts/bin/activate
 pip install -r requirements.txt
 $env:BACKEND_URL="http://localhost:8001"
 streamlit run streamlit_app.py --server.port 8502
@@ -112,7 +114,7 @@ additional_contexts:
 If the checkout is elsewhere:
 
 ```powershell
-$env:FEDOT_INDUSTRIAL_CONTEXT="D:\path\to\Fedot.Industrial"
+$env:FEDOT_INDUSTRIAL_CONTEXT="$HOME/Fedot.Industrial"
 docker compose up --build
 ```
 

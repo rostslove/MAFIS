@@ -5,6 +5,7 @@ import logging
 import os
 import re
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from openai import OpenAI
@@ -13,7 +14,26 @@ from .schemas import ToolCall
 
 logger = logging.getLogger("BaseAgent")
 
-LLM_MODEL = os.environ.get("LLM_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+
+def _load_project_env() -> None:
+    env_path = Path(__file__).resolve().parents[2] / ".env"
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key:
+            os.environ.setdefault(key, value)
+
+
+_load_project_env()
+
+DEFAULT_LLM_MODEL = "qwen/qwen3-coder:free"
+LLM_MODEL = os.environ.get("LLM_MODEL", DEFAULT_LLM_MODEL)
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 
