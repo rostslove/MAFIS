@@ -494,8 +494,13 @@ def sidebar(config: Dict[str, Any]) -> None:
         if "df" in st.session_state:
             df = st.session_state.df
             st.caption(f"{df.shape[0]} rows, {df.shape[1]} columns")
-            st.session_state.target_column = st.selectbox("Target column", df.columns)
-            st.session_state.task_type = st.selectbox("Task type", TASK_TYPES)
+            columns = list(df.columns)
+            current_target = st.session_state.get("target_column")
+            target_index = columns.index(current_target) if current_target in columns else 0
+            st.session_state.target_column = st.selectbox("Target column", columns, index=target_index)
+            current_task = st.session_state.get("task_type", "classification")
+            task_index = TASK_TYPES.index(current_task) if current_task in TASK_TYPES else 0
+            st.session_state.task_type = st.selectbox("Task type", TASK_TYPES, index=task_index)
             metric_options = (
                 config.get("metrics_by_task", {}).get(st.session_state.task_type)
                 or DEFAULT_METRICS_BY_TASK.get(st.session_state.task_type, [])
@@ -1149,12 +1154,19 @@ def benchmarks_tab(config: Dict[str, Any]) -> None:
             with st.spinner("Downloading/loading M4 and saving CSV..."):
                 result = post_json("/benchmarks/m4/load", payload, timeout=900)
             adopt_m4_dataset(result)
-            st.success(
+            st.session_state.m4_load_success = (
                 f"M4 dataset loaded: {result.get('n_samples', 0)} samples written to "
-                f"`{result.get('csv_filename', '')}`. Switch to Architect or Graph Editor to continue."
+                f"`{result.get('csv_filename', '')}`. Task type set to "
+                f"`{result.get('task_type', 'ts_classification')}`. "
+                "Switch to Architect or Graph Editor to continue."
             )
+            st.rerun()
         except Exception as exc:
             st.error(f"M4 loading failed: {exc}")
+
+    success_message = st.session_state.pop("m4_load_success", "")
+    if success_message:
+        st.success(success_message)
 
     render_m4_dataset_info(st.session_state.get("m4_dataset_info") or {})
 
