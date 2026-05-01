@@ -70,7 +70,7 @@ def save_uploaded_csv(uploaded_file) -> str:
     filename = f"uploaded_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv"
     path = data_dir / filename
     df.to_csv(path, index=False)
-    st.session_state.csv_path = str(path)
+    st.session_state.csv_path = f"/app/data/{filename}" if Path("/app/data").exists() else str(path)
     return str(path)
 
 

@@ -33,6 +33,7 @@ from graph_engine import (
     PipelineGraph, compute_metrics, diagnose_runtime_error, get_operation_catalog, is_ts_task,
     load_input_data, split_input_data,
 )
+from path_utils import normalize_csv_path
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("MCP")
@@ -130,6 +131,7 @@ def _predict_pipeline(pipeline, data, task_type: str) -> np.ndarray:
 
 
 def _target_info(csv_path: str, target_column: str, task_type: str) -> Dict[str, Any]:
+    csv_path = normalize_csv_path(csv_path)
     df = pd.read_csv(csv_path, usecols=[target_column])
     y = df[target_column]
     values = y.dropna()
@@ -195,6 +197,7 @@ def _baselines(task_type: str) -> Dict[str, SkPipeline]:
 def get_data_profile(csv_path: str, target_column: str, task_type: str = "classification") -> str:
     """Profile a CSV: returns JSON with n_samples, n_features, issues, recommendations."""
     try:
+        csv_path = normalize_csv_path(csv_path)
         df = pd.read_csv(csv_path)
         y = df[target_column] if target_column in df.columns else None
         X = df.drop(columns=[target_column]) if target_column in df.columns else df
@@ -290,6 +293,7 @@ def get_baselines(task_type: str) -> str:
 def train_baseline(csv_path: str, target_column: str, baseline_name: str, task_type: str = "classification") -> str:
     """Train an sklearn baseline. Returns score and metrics."""
     try:
+        csv_path = normalize_csv_path(csv_path)
         if task_type == "ts_forecasting":
             return json.dumps({"name": baseline_name, "score": 0, "error": "Baselines unavailable for ts_forecasting"})
 
@@ -331,6 +335,7 @@ def train_baseline(csv_path: str, target_column: str, baseline_name: str, task_t
 def train_graph(graph_json: str, csv_path: str, target_column: str, forecast_length: Optional[int] = None) -> str:
     """Train a pipeline graph as-is on the data. Returns score and per-task metrics."""
     try:
+        csv_path = normalize_csv_path(csv_path)
         graph = PipelineGraph.from_dict(json.loads(graph_json))
         ok, msg = graph.validate()
         if not ok:
@@ -379,6 +384,7 @@ def tune_graph_hyperparameters(
     try:
         from fedot.core.pipelines.tuning.tuner_builder import TunerBuilder
 
+        csv_path = normalize_csv_path(csv_path)
         graph = PipelineGraph.from_dict(json.loads(graph_json))
         ok, msg = graph.validate()
         if not ok:
@@ -455,6 +461,7 @@ def tune_graph_hyperparameters(
 def validate_graph(graph_json: str, csv_path: str, target_column: str, cv_folds: int = 3, forecast_length: Optional[int] = None) -> str:
     """Cross-validate the graph. Returns mean & std of the primary metric across folds."""
     try:
+        csv_path = normalize_csv_path(csv_path)
         graph = PipelineGraph.from_dict(json.loads(graph_json))
         ok, msg = graph.validate()
         if not ok:
@@ -535,6 +542,7 @@ def analyze_errors(baseline_results_json: str, graph_score: float, task_type: st
 def get_node_importance(graph_json: str, csv_path: str, target_column: str, forecast_length: Optional[int] = None) -> str:
     """Estimate per-node importance via leave-one-out ablation (training-only, can be slow)."""
     try:
+        csv_path = normalize_csv_path(csv_path)
         graph = PipelineGraph.from_dict(json.loads(graph_json))
         input_data = load_input_data(csv_path, target_column, graph.task_type, forecast_length)
         train, val = split_input_data(input_data)

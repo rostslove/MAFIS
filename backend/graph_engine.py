@@ -13,6 +13,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from path_utils import normalize_csv_path
+
 logger = logging.getLogger("GraphEngine")
 
 
@@ -525,6 +527,7 @@ def load_input_data(
     forecast_length: Optional[int] = None,
 ) -> InputData:
     """Load CSV into a Fedot InputData object."""
+    csv_path = normalize_csv_path(csv_path)
     df = pd.read_csv(csv_path)
     if target not in df.columns:
         raise ValueError(f"Target column '{target}' not in CSV")

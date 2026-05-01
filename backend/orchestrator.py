@@ -8,6 +8,7 @@ from agents import Architect, ArchitectResult, Critic, CriticFeedback, DataConte
 from data_profiler import DataProfiler
 from graph_engine import SUPPORTED_TASKS, PipelineGraph, diagnose_runtime_error, is_ts_task
 from mcp_client import MCPToolClient
+from path_utils import describe_missing_csv, normalize_csv_path
 
 logger = logging.getLogger("Orchestrator")
 
@@ -17,6 +18,9 @@ def _event(event_type: str, **data) -> Dict[str, Any]:
 
 
 def _profile_data(csv_path: str, target_column: str, task_type: str, forecast_length: Optional[int]) -> Dict[str, Any]:
+    csv_path = normalize_csv_path(csv_path)
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(describe_missing_csv(csv_path))
     df = pd.read_csv(csv_path)
     if target_column not in df.columns:
         raise ValueError(f"Target '{target_column}' not found")
@@ -57,6 +61,7 @@ async def run_orchestration_stream(
     if task_type == "ts_forecasting" and not forecast_length:
         yield _event("error", message="ts_forecasting requires forecast_length")
         return
+    csv_path = normalize_csv_path(csv_path)
 
     try:
         yield _event("status", message="Loading and profiling data...")
@@ -283,6 +288,7 @@ async def propose_architecture(
     forecast_length: Optional[int] = None,
 ) -> Dict[str, Any]:
     """One-shot Architect interaction for the frontend graph approval flow."""
+    csv_path = normalize_csv_path(csv_path)
     if task_type not in SUPPORTED_TASKS:
         return {"error": f"Unknown task type: {task_type}"}
 
@@ -334,6 +340,7 @@ async def propose_revision_from_critic(
     forecast_length: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Create a new draft graph from explicit Critic feedback; user must approve it."""
+    csv_path = normalize_csv_path(csv_path)
     if task_type not in SUPPORTED_TASKS:
         return {"error": f"Unknown task type: {task_type}"}
 

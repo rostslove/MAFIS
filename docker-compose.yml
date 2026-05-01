@@ -24,11 +24,11 @@ services:
       - ml-network
     environment:
       - OLLAMA_HOST=http://ollama:11434
-    entrypoint: ["/bin/sh", "-c"]
-    command: "until ollama list >/dev/null 2>&1; do sleep 1; done; ollama pull ${LLM_MODEL:-qwen2.5-coder:7b}"
+    entrypoint: ["ollama"]
+    command: ["pull", "${LLM_MODEL:-qwen2.5-coder:7b}"]
     depends_on:
       ollama:
-        condition: service_started
+        condition: service_healthy
 
   backend:
     build:
