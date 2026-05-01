@@ -6,6 +6,7 @@ from typing import Optional
 
 from .base_agent import BaseAgent, extract_json_block
 from .schemas import ArchitectResult, CriticFeedback, DataContext
+from .structured import parse_graph_proposal_object
 
 logger = logging.getLogger("Architect")
 
@@ -44,6 +45,25 @@ fourier_basis, quantile_extractor, industrial_freq_clf, fft_features, and statis
 unless the selected task is a time-series task and the operation is in the returned catalog.
 """
 
+    STRUCTURED_PROMPT = """You are an ML Architect. Return JSON only, no markdown and no prose.
+The response must match this schema:
+{
+  "graph": {
+    "task_type": "classification",
+    "nodes": [
+      {"id": "model", "operation": "rf", "params": {}, "inputs": []}
+    ]
+  },
+  "analysis": "Short explanation of why this graph fits the data and task.",
+  "reasoning": "Short explanation of operation choices using only the available operation catalog."
+}
+Rules:
+- Use only operations listed in AVAILABLE_OPERATIONS.
+- If AVAILABLE_OPERATIONS.preprocessing is empty, do not add preprocessing nodes.
+- The graph must have exactly one root model node.
+- For ordinary tabular classification/regression, prefer one direct model node unless feedback explicitly asks for another valid model.
+"""
+
     def __init__(self, name: str = "Architect", mcp_client=None):
         super().__init__(name=name, mcp_client=mcp_client)
 
@@ -58,57 +78,36 @@ unless the selected task is a time-series task and the operation is in the retur
         result = ArchitectResult()
 
         try:
-            user_msg = self._build_user_message(data_context, iteration, prev_feedback, prev_graph)
-            response = await self.call_llm(user_msg)
-            text = response.get("full_response", "")
-            used_fallback = False
-            if not response.get("success", True):
-                result.diagnostics.append(
-                    {
-                        "agent": "Architect",
-                        "kind": "llm_unavailable",
-                        "summary": "Architect LLM call failed; a deterministic fallback graph was used.",
-                        "technical_message": response.get("error", ""),
-                        "recommendations": [
-                            "Check that the configured LLM provider is running and the selected model is pulled.",
-                            "Set LLM_MODEL to a smaller local model if the current model is too slow or unavailable.",
-                            "You can still edit and approve the fallback graph manually.",
-                        ],
-                        "recoverable": True,
-                    }
-                )
+            graph, mermaid, analysis, reasoning, diagnostics = await self._structured_graph_proposal(
+                data_context,
+                prev_feedback,
+                prev_graph,
+            )
 
-            # Find the latest valid graph in tool call log
-            graph, mermaid = self._extract_graph_from_log()
-
-            # If LLM didn't successfully propose, fall back to default
             if not graph:
-                result.diagnostics.extend(self._extract_diagnostics_from_log())
+                result.diagnostics.extend(diagnostics)
+                graph, mermaid = await self._fallback_graph_with_tools(data_context, prev_graph)
+                analysis = self._fallback_analysis(data_context.task_type, bool(prev_graph))
+                reasoning = self._fallback_reasoning(graph, data_context.task_type)
                 result.diagnostics.append(
                     {
                         "agent": "Architect",
-                        "kind": "llm_tool_call_not_emitted",
-                        "summary": "The local LLM did not emit a structured MCP tool call, so Architect used a deterministic MCP-backed proposal.",
-                        "technical_message": text[:1000],
+                        "kind": "structured_proposal_invalid",
+                        "summary": "Architect could not produce a valid structured graph proposal, so a deterministic MCP-backed proposal was used.",
+                        "technical_message": json.dumps(diagnostics, ensure_ascii=False)[:1200],
                         "recommendations": [
-                            "This is recoverable: the fallback still calls MCP tools and produces a valid draft graph.",
-                            "Approve the graph if it is suitable, or edit it manually before evaluation.",
+                            "Approve the deterministic graph if it is suitable, or edit it manually before evaluation.",
+                            "For local 7B models, keep graph requests short and operation names exact.",
                         ],
                         "recoverable": True,
                     }
                 )
-                graph, mermaid = await self._fallback_graph_with_tools(data_context, prev_graph)
-                used_fallback = True
                 logger.info("[Architect] Using fallback graph for %s", data_context.task_type)
 
             result.graph = graph
             result.mermaid = mermaid
-            if used_fallback:
-                result.analysis = self._fallback_analysis(data_context.task_type, bool(prev_graph))
-                result.reasoning = self._fallback_reasoning(graph, data_context.task_type)
-            else:
-                result.analysis = self._extract_section(text, "ANALYSIS") or text[:500] or self._fallback_analysis(data_context.task_type, bool(prev_graph))
-                result.reasoning = self._extract_section(text, "REASONING") or self._fallback_reasoning(graph, data_context.task_type)
+            result.analysis = analysis or self._fallback_analysis(data_context.task_type, bool(prev_graph))
+            result.reasoning = reasoning or self._fallback_reasoning(graph, data_context.task_type)
             result.tool_calls = self.get_tool_calls()
             return result
 
@@ -129,6 +128,63 @@ unless the selected task is a time-series task and the operation is in the retur
             )
             result.tool_calls = self.get_tool_calls()
             return result
+
+    async def _structured_graph_proposal(self, data_context: DataContext, prev_feedback, prev_graph):
+        diagnostics = []
+        profile = await self.call_mcp_tool(
+            "get_data_profile",
+            {
+                "csv_path": data_context.csv_path,
+                "target_column": data_context.target_column,
+                "task_type": data_context.task_type,
+            },
+        )
+        operations = await self.call_mcp_tool("get_available_operations", {"task_type": data_context.task_type})
+
+        prompt = self._build_structured_prompt(data_context, profile, operations, prev_feedback, prev_graph)
+        response = await self.call_llm(
+            prompt,
+            system_prompt=self.STRUCTURED_PROMPT,
+            max_rounds=1,
+            use_tools=False,
+        )
+        raw_text = response.get("full_response", "")
+        parsed = extract_json_block(raw_text)
+        proposal = parse_graph_proposal_object(parsed) if parsed else None
+        if not proposal:
+            diagnostics.append(
+                {
+                    "agent": "Architect",
+                    "kind": "invalid_structured_llm_output",
+                    "summary": "Architect LLM response was not a valid GraphProposal JSON object.",
+                    "technical_message": raw_text[:1200] or response.get("error", ""),
+                    "recommendations": ["The backend will use a deterministic graph proposal instead."],
+                    "recoverable": True,
+                }
+            )
+            return None, "", "", "", diagnostics
+
+        proposed = await self.call_mcp_tool("propose_graph", {"graph_json": proposal.graph.as_graph_json()})
+        if isinstance(proposed, dict) and proposed.get("valid") and proposed.get("graph"):
+            return (
+                proposed["graph"],
+                proposed.get("mermaid", ""),
+                proposal.analysis,
+                proposal.reasoning,
+                diagnostics,
+            )
+
+        diagnostics.append(
+            {
+                "agent": "Architect",
+                "kind": "invalid_structured_graph",
+                "summary": "Architect proposed a structured graph, but graph validation rejected it.",
+                "technical_message": json.dumps(proposed, ensure_ascii=False)[:1200],
+                "recommendations": ["Use operations exactly as returned by the operation catalog."],
+                "recoverable": True,
+            }
+        )
+        return None, "", proposal.analysis, proposal.reasoning, diagnostics
 
     @staticmethod
     def _fallback_graph(task_type: str, prev_graph: Optional[dict] = None):
@@ -202,6 +258,30 @@ unless the selected task is a time-series task and the operation is in the retur
 
         msg += "\nUse the tools to build a validated graph, then output ANALYSIS and REASONING.\n"
         return msg
+
+    def _build_structured_prompt(self, dc: DataContext, profile, operations, prev_fb, prev_graph) -> str:
+        payload = {
+            "task": dc.task_type,
+            "is_time_series": dc.is_time_series,
+            "csv_path": dc.csv_path,
+            "target_column": dc.target_column,
+            "data_profile": profile,
+            "available_operations": operations,
+            "previous_graph": prev_graph,
+            "feedback": None,
+        }
+        if prev_fb:
+            payload["feedback"] = {
+                "decision": prev_fb.winner,
+                "assessment": prev_fb.assessment,
+                "weaknesses": prev_fb.weaknesses,
+                "suggested_mutations": prev_fb.suggested_mutations,
+            }
+        return (
+            "Create one valid graph proposal for this payload.\n"
+            "Return only the GraphProposal JSON object.\n"
+            f"{json.dumps(payload, ensure_ascii=False)}"
+        )
 
     @staticmethod
     def _fallback_analysis(task_type: str, reused_previous: bool) -> str:

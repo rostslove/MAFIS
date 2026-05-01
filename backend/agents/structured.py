@@ -46,6 +46,16 @@ class GraphObject(BaseModel):
         return self.json()
 
 
+class GraphProposalObject(BaseModel):
+    graph: GraphObject
+    analysis: str = ""
+    reasoning: str = ""
+
+    @validator("analysis", "reasoning", pre=True, always=True)
+    def stringify_text(cls, value: Any) -> str:
+        return "" if value is None else str(value).strip()
+
+
 class ToolCallObject(BaseModel):
     name: str
     arguments: Dict[str, Any] = Field(default_factory=dict)
@@ -118,5 +128,12 @@ def normalize_mutate_graph_arguments(args: Dict[str, Any]) -> Dict[str, Any]:
 def parse_tool_call_object(payload: Any) -> ToolCallObject | None:
     try:
         return ToolCallObject.parse_obj(payload)
+    except ValidationError:
+        return None
+
+
+def parse_graph_proposal_object(payload: Any) -> GraphProposalObject | None:
+    try:
+        return GraphProposalObject.parse_obj(payload)
     except ValidationError:
         return None
