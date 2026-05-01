@@ -20,7 +20,7 @@ from fedot.core.data.data import InputData
 from fedot.core.repository.dataset_types import DataTypesEnum
 from fedot.core.repository.tasks import Task, TaskTypesEnum
 
-from graph_engine import DEFAULT_GRAPHS, PipelineGraph, compute_metrics
+from graph_engine import PipelineGraph, compute_metrics
 from path_utils import data_dir
 
 
@@ -32,6 +32,40 @@ def _group_list(groups: Optional[Sequence[str]]) -> Tuple[str, ...]:
         return M4_GROUPS
     selected = tuple(group for group in groups if group in M4_GROUPS)
     return selected or M4_GROUPS
+
+
+def m4_classification_profile(
+    n_per_group: int = 100,
+    window_length: int = 50,
+    test_size: float = 0.3,
+    groups: Optional[Sequence[str]] = None,
+    standardize: bool = True,
+) -> Dict[str, Any]:
+    selected_groups = _group_list(groups)
+    n_rows = max(1, int(n_per_group))
+    length = max(8, int(window_length))
+    n_samples = n_rows * len(selected_groups)
+    return {
+        "benchmark": "M4",
+        "benchmark_mode": "frequency-group ts_classification",
+        "requires_architect_graph": True,
+        "n_samples": n_samples,
+        "n_features": length,
+        "feature_shape": [n_samples, length],
+        "target": "frequency_group",
+        "target_type": "multiclass",
+        "classes": list(selected_groups),
+        "class_balance": {group: n_rows for group in selected_groups},
+        "test_size": min(max(float(test_size), 0.05), 0.5),
+        "standardize_each_series": bool(standardize),
+        "is_time_series": True,
+        "issues": [],
+        "recommendations": [
+            "Use ts_classification operations only.",
+            "Prefer a feature extraction node followed by an industrial classifier.",
+            "The graph should classify M4 frequency groups from fixed-length series windows.",
+        ],
+    }
 
 
 def _m4_cache_root() -> Path:
@@ -186,13 +220,12 @@ def _group_counts(y_train: np.ndarray, y_test: np.ndarray, groups: Sequence[str]
     return rows
 
 
-def _default_graph() -> Dict[str, Any]:
-    return {"task_type": "ts_classification", "nodes": DEFAULT_GRAPHS["ts_classification"]}
-
-
 def _validate_graph(graph: Optional[Dict[str, Any]]) -> PipelineGraph:
-    candidate = graph if graph and graph.get("task_type") == "ts_classification" else _default_graph()
-    pipeline_graph = PipelineGraph.from_dict(candidate)
+    if not graph:
+        raise ValueError("M4 benchmark requires an Architect-approved ts_classification graph.")
+    if graph.get("task_type") != "ts_classification":
+        raise ValueError("M4 benchmark graph must use task_type='ts_classification'.")
+    pipeline_graph = PipelineGraph.from_dict(graph)
     ok, message = pipeline_graph.validate()
     if not ok:
         raise ValueError(f"Invalid M4 benchmark graph: {message}")

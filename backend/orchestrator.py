@@ -8,6 +8,7 @@ import pandas as pd
 from agents import Architect, ArchitectResult, Critic, CriticFeedback, DataContext, Engineer, EngineerResult, IterationRecord, Scribe
 from data_profiler import DataProfiler
 from graph_engine import SUPPORTED_TASKS, PipelineGraph, diagnose_runtime_error, is_ts_task
+from m4_benchmark import m4_classification_profile
 from mcp_client import MCPToolClient
 from path_utils import describe_missing_csv, normalize_csv_path
 
@@ -324,6 +325,72 @@ async def propose_architecture(
             "analysis": result.analysis,
             "reasoning": result.reasoning,
             "diagnostics": result.diagnostics,
+            "tool_calls": [tc.to_dict() for tc in result.tool_calls],
+        }
+    finally:
+        await mcp_client.cleanup()
+
+
+async def propose_m4_benchmark_architecture(
+    message: str = "",
+    current_graph: Optional[Dict[str, Any]] = None,
+    n_per_group: int = 100,
+    window_length: int = 50,
+    test_size: float = 0.3,
+    primary_metric: Optional[str] = "f1",
+    groups: Optional[list] = None,
+    standardize: bool = True,
+) -> Dict[str, Any]:
+    """One-shot Architect interaction for M4 benchmark graph approval."""
+    profile = m4_classification_profile(
+        n_per_group=n_per_group,
+        window_length=window_length,
+        test_size=test_size,
+        groups=groups,
+        standardize=standardize,
+    )
+    data_context = DataContext(
+        csv_path="",
+        target_column="frequency_group",
+        task_type="ts_classification",
+        profile=profile,
+        primary_metric=primary_metric,
+        test_size=test_size,
+    )
+
+    mcp_client = await _connect_mcp()
+    try:
+        architect = Architect(mcp_client=mcp_client)
+        feedback = None
+        if message:
+            feedback = CriticFeedback(
+                winner="user",
+                weaknesses=[message],
+                suggested_mutations=[],
+            )
+        result = await architect.execute(
+            data_context=data_context,
+            iteration=1,
+            prev_feedback=feedback,
+            prev_graph=current_graph,
+        )
+        if not result.graph:
+            return {
+                "error": "Architect did not produce a valid M4 benchmark graph.",
+                "profile": profile,
+                "diagnostics": result.diagnostics,
+                "tool_calls": [tc.to_dict() for tc in result.tool_calls],
+            }
+        return {
+            "profile": profile,
+            "benchmark": "M4",
+            "task_type": "ts_classification",
+            "graph": result.graph,
+            "mermaid": result.mermaid,
+            "analysis": result.analysis,
+            "reasoning": result.reasoning,
+            "diagnostics": result.diagnostics,
+            "requires_approval": True,
             "tool_calls": [tc.to_dict() for tc in result.tool_calls],
         }
     finally:

@@ -65,7 +65,13 @@ def post_json(path: str, payload: Dict[str, Any], timeout: int = 120) -> Dict[st
         response.raise_for_status()
     except requests.HTTPError as exc:
         try:
-            detail = response.json().get("detail", response.text)
+            body = response.json()
+            detail = body.get("detail") or body.get("error") or response.text
+            diagnostics = body.get("diagnostics") or []
+            if diagnostics:
+                summaries = "; ".join(item.get("summary", "") for item in diagnostics[:3] if item.get("summary"))
+                if summaries:
+                    detail = f"{detail} Diagnostics: {summaries}"
         except Exception:
             detail = response.text
         raise RuntimeError(f"{response.status_code}: {detail}") from exc
@@ -1031,24 +1037,21 @@ def render_evaluation_history(current_result: Dict[str, Any]) -> None:
             )
 
 
-def m4_default_graph(config: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "task_type": "ts_classification",
-        "nodes": config.get("default_graphs", {}).get(
-            "ts_classification",
-            [
-                {"id": "feat", "operation": "quantile_extractor", "params": {}, "inputs": []},
-                {"id": "model", "operation": "industrial_stat_clf", "params": {}, "inputs": ["feat"]},
-            ],
-        ),
-    }
+def set_m4_graph(result: Dict[str, Any]) -> None:
+    st.session_state.m4_graph = result.get("graph", {}) or {}
+    st.session_state.m4_profile = result.get("profile", {}) or {}
+    st.session_state.m4_architect_analysis = result.get("analysis", "")
+    st.session_state.m4_architect_reasoning = result.get("reasoning", "")
+    st.session_state.m4_architect_diagnostics = result.get("diagnostics", []) or []
+    st.session_state.m4_architect_tool_calls = result.get("tool_calls", []) or []
+    st.session_state.m4_graph_approved = False
 
 
-def m4_graph_for_run(config: Dict[str, Any], source: str) -> Dict[str, Any]:
-    approved = st.session_state.get("approved_graph") or {}
-    if source == "Approved ts_classification graph" and approved.get("task_type") == "ts_classification":
-        return approved
-    return m4_default_graph(config)
+def approve_m4_graph() -> None:
+    graph = st.session_state.get("m4_graph") or {}
+    if graph:
+        st.session_state.m4_approved_graph = graph
+        st.session_state.m4_graph_approved = True
 
 
 def render_m4_benchmark_result(result: Dict[str, Any]) -> None:
@@ -1109,11 +1112,6 @@ def benchmarks_tab(config: Dict[str, Any]) -> None:
         "Each time series is one sample; the target class is its frequency group."
     )
 
-    current_approved = st.session_state.get("approved_graph") or {}
-    graph_sources = ["Default ts_classification graph"]
-    if current_approved.get("task_type") == "ts_classification":
-        graph_sources.append("Approved ts_classification graph")
-
     settings_col, graph_col = st.columns([1, 1])
     with settings_col:
         selected_groups = st.multiselect(
@@ -1150,26 +1148,73 @@ def benchmarks_tab(config: Dict[str, Any]) -> None:
             index=metric_options.index("f1") if "f1" in metric_options else 0,
         )
         standardize = st.checkbox("Standardize each series", value=True)
-        graph_source = st.selectbox("Benchmark graph", graph_sources)
+        message = st.text_area(
+            "Request to Architect",
+            placeholder="Example: prefer fast feature extraction, avoid deep neural models, or try frequency-domain features.",
+            height=90,
+            key="m4_architect_message",
+        )
+        if st.button("Ask Architect For M4 Graph", type="primary", use_container_width=True, key="m4_ask_architect"):
+            payload = {
+                "message": message,
+                "current_graph": st.session_state.get("m4_graph"),
+                "groups": selected_groups or groups,
+                "n_per_group": int(n_per_group),
+                "window_length": int(window_length),
+                "test_size": float(test_size),
+                "primary_metric": metric,
+                "standardize": bool(standardize),
+            }
+            try:
+                with st.spinner("Architect is drafting an M4 benchmark graph..."):
+                    result = post_json("/benchmarks/m4/architect", payload, timeout=240)
+                set_m4_graph(result)
+                st.success("Architect proposed an M4 benchmark graph. Approve it before running the benchmark.")
+            except Exception as exc:
+                st.error(f"M4 Architect failed: {exc}")
 
-    graph = m4_graph_for_run(config, graph_source)
+    graph = st.session_state.get("m4_graph", {}) or {}
     with graph_col:
-        st.write("Graph used for M4")
-        render_graph(graph, show_details=False)
-        st.dataframe(pd.DataFrame(graph_rows(graph)), use_container_width=True, hide_index=True)
+        status = "approved" if st.session_state.get("m4_graph_approved") else "draft"
+        st.write(f"M4 Architect graph ({status})")
+        if graph:
+            render_graph(graph, show_details=False)
+            st.dataframe(pd.DataFrame(graph_rows(graph)), use_container_width=True, hide_index=True)
+            action_cols = st.columns(2)
+            if action_cols[0].button("Approve M4 Graph", use_container_width=True, key="m4_approve_graph"):
+                approve_m4_graph()
+                st.success("M4 graph approved for benchmark.")
+            if action_cols[1].button("Discard M4 Draft", use_container_width=True, key="m4_discard_graph"):
+                st.session_state.m4_graph = st.session_state.get("m4_approved_graph", {}) or {}
+                st.session_state.m4_graph_approved = bool(st.session_state.get("m4_graph"))
+                st.info("M4 draft discarded.")
+            if st.session_state.get("m4_architect_analysis"):
+                st.write("Analysis")
+                st.write(st.session_state.m4_architect_analysis)
+            if st.session_state.get("m4_architect_reasoning"):
+                st.write("Reasoning")
+                st.write(st.session_state.m4_architect_reasoning)
+            render_diagnostics(st.session_state.get("m4_architect_diagnostics", []), "M4 Architect diagnostics")
+            render_tool_calls(st.session_state.get("m4_architect_tool_calls", []), "M4 Architect tool calls")
+        else:
+            st.info("Ask Architect to draft an M4 graph first.")
+            st.write("Available ts_classification operations")
+            render_operation_catalog(config, "ts_classification", "m4_benchmark")
 
     if len(selected_groups or []) < 2:
         st.warning("Select at least two M4 groups for a classification benchmark.")
 
+    approved_graph = st.session_state.get("m4_approved_graph") or {}
+    can_run = bool(approved_graph) and st.session_state.get("m4_graph_approved") and len(selected_groups or []) >= 2
     if st.button(
         "Run M4 Benchmark",
         type="primary",
         use_container_width=True,
         key="run_m4_benchmark",
-        disabled=len(selected_groups or []) < 2,
+        disabled=not can_run,
     ):
         payload = {
-            "graph": graph,
+            "graph": approved_graph,
             "groups": selected_groups or groups,
             "n_per_group": int(n_per_group),
             "window_length": int(window_length),
@@ -1183,6 +1228,9 @@ def benchmarks_tab(config: Dict[str, Any]) -> None:
             st.success("M4 benchmark completed.")
         except Exception as exc:
             st.error(f"M4 benchmark failed: {exc}")
+
+    if not approved_graph:
+        st.caption("Benchmark run is disabled until an Architect graph is approved.")
 
     render_m4_benchmark_result(st.session_state.get("m4_benchmark_result", {}) or {})
 

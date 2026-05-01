@@ -23,6 +23,7 @@ from graph_engine import (
 from orchestrator import (
     mutate_graph_locally,
     propose_architecture,
+    propose_m4_benchmark_architecture,
     propose_revision_from_critic,
     run_orchestration,
     run_orchestration_stream,
@@ -96,6 +97,7 @@ async def get_config(request):
             "m4_classification": {
                 "name": "M4 frequency-group classification",
                 "task_type": "ts_classification",
+                "requires_architect_graph": True,
                 "groups": list(M4_GROUPS),
                 "default_primary_metric": "f1",
                 "default_window_length": 50,
@@ -128,7 +130,7 @@ async def architect_chat(request):
             primary_metric=payload.get("primary_metric"),
         )
         if result.get("error"):
-            return _error(result["error"], 400)
+            return JSONResponse(result, status_code=400)
         return JSONResponse(result)
     except Exception as exc:
         logger.exception("Architect chat failed")
@@ -150,7 +152,7 @@ async def architect_revise(request):
             selected_mutations=payload.get("selected_mutations"),
         )
         if result.get("error"):
-            return _error(result["error"], 400)
+            return JSONResponse(result, status_code=400)
         return JSONResponse(result)
     except Exception as exc:
         logger.exception("Architect revision failed")
@@ -233,6 +235,27 @@ async def benchmark_m4(request):
         return _error(str(exc), 500)
 
 
+async def benchmark_m4_architect(request):
+    payload = await _json_body(request)
+    try:
+        result = await propose_m4_benchmark_architecture(
+            message=payload.get("message", ""),
+            current_graph=payload.get("current_graph"),
+            n_per_group=int(payload.get("n_per_group", 100) or 100),
+            window_length=int(payload.get("window_length", 50) or 50),
+            test_size=_payload_test_size(payload),
+            primary_metric=payload.get("primary_metric") or "f1",
+            groups=payload.get("groups") or None,
+            standardize=bool(payload.get("standardize", True)),
+        )
+        if result.get("error"):
+            return JSONResponse(result, status_code=400)
+        return JSONResponse(result)
+    except Exception as exc:
+        logger.exception("M4 benchmark architect failed")
+        return _error(str(exc), 500)
+
+
 async def orchestrate_stream(request):
     payload = await _json_body(request)
 
@@ -275,6 +298,7 @@ routes = [
     Route("/orchestrate", orchestrate, methods=["POST"]),
     Route("/orchestrate/stream", orchestrate_stream, methods=["POST"]),
     Route("/engineer/tune", engineer_tune, methods=["POST"]),
+    Route("/benchmarks/m4/architect", benchmark_m4_architect, methods=["POST"]),
     Route("/benchmarks/m4", benchmark_m4, methods=["POST"]),
 ]
 
