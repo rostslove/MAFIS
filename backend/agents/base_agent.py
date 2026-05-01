@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from openai import OpenAI
 
 from .schemas import ToolCall
+from .structured import parse_tool_call_object
 
 logger = logging.getLogger("BaseAgent")
 
@@ -96,6 +97,64 @@ def extract_json_value(text: str) -> Optional[Any]:
             pass
     parsed = extract_json_block(text)
     return parsed
+
+
+def extract_json_values(text: str) -> List[Any]:
+    """Extract all top-level JSON objects/arrays from free-form model text."""
+    values: List[Any] = []
+    if not text:
+        return values
+
+    fenced_blocks = re.findall(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+    candidates = fenced_blocks or [text]
+    for candidate in candidates:
+        stripped = candidate.strip()
+        try:
+            parsed = json.loads(stripped)
+            return parsed if isinstance(parsed, list) else [parsed]
+        except json.JSONDecodeError:
+            pass
+
+        starts = [idx for idx, char in enumerate(candidate) if char in "[{"]
+        consumed_until = -1
+        for start in starts:
+            if start < consumed_until:
+                continue
+            stack: List[str] = []
+            in_string = False
+            escaped = False
+            for idx in range(start, len(candidate)):
+                char = candidate[idx]
+                if escaped:
+                    escaped = False
+                    continue
+                if char == "\\":
+                    escaped = in_string
+                    continue
+                if char == '"':
+                    in_string = not in_string
+                    continue
+                if in_string:
+                    continue
+                if char in "{[":
+                    stack.append("}" if char == "{" else "]")
+                elif char in "}]":
+                    if not stack or stack[-1] != char:
+                        break
+                    stack.pop()
+                    if not stack:
+                        snippet = candidate[start:idx + 1]
+                        try:
+                            parsed = json.loads(snippet)
+                            if isinstance(parsed, list):
+                                values.extend(parsed)
+                            else:
+                                values.append(parsed)
+                            consumed_until = idx + 1
+                        except json.JSONDecodeError:
+                            pass
+                        break
+    return values
 
 
 class BaseAgent(ABC):
@@ -222,23 +281,14 @@ class BaseAgent(ABC):
         if not text or not tools:
             return []
         allowed = {tool["function"]["name"] for tool in tools if "function" in tool and "name" in tool["function"]}
-        parsed = extract_json_value(text)
-        if parsed is None:
+        parsed_values = extract_json_values(text)
+        if not parsed_values:
             return []
-        items = parsed if isinstance(parsed, list) else [parsed]
         calls: List[Tuple[str, Dict[str, Any]]] = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            name = item.get("name") or item.get("tool") or item.get("tool_name")
-            args = item.get("arguments") or item.get("args") or {}
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except json.JSONDecodeError:
-                    args = {}
-            if name in allowed and isinstance(args, dict):
-                calls.append((name, args))
+        for item in parsed_values:
+            parsed_call = parse_tool_call_object(item)
+            if parsed_call and parsed_call.name in allowed:
+                calls.append((parsed_call.name, parsed_call.arguments))
         return calls
 
     @abstractmethod
