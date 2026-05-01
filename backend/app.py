@@ -23,13 +23,12 @@ from graph_engine import (
 from orchestrator import (
     mutate_graph_locally,
     propose_architecture,
-    propose_m4_benchmark_architecture,
     propose_revision_from_critic,
     run_orchestration,
     run_orchestration_stream,
     tune_approved_graph,
 )
-from m4_benchmark import M4_GROUPS, run_m4_classification_benchmark
+from m4_benchmark import M4_GROUPS, M4_TARGET_COLUMN, M4_TASK_TYPE, prepare_m4_dataset_csv
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -69,13 +68,6 @@ def _error(message: str, status_code: int = 400) -> JSONResponse:
     return JSONResponse({"detail": message}, status_code=status_code)
 
 
-def _compact_error(exc: Exception, limit: int = 1200) -> str:
-    message = str(exc)
-    if len(message) <= limit:
-        return message
-    return message[:limit].rstrip() + "... [truncated]"
-
-
 async def health(request):
     return JSONResponse({"status": "healthy", "service": "graph-automl-mcp"})
 
@@ -103,8 +95,8 @@ async def get_config(request):
         "benchmarks": {
             "m4_classification": {
                 "name": "M4 frequency-group classification",
-                "task_type": "ts_classification",
-                "requires_architect_graph": True,
+                "task_type": M4_TASK_TYPE,
+                "target_column": M4_TARGET_COLUMN,
                 "groups": list(M4_GROUPS),
                 "default_primary_metric": "f1",
                 "default_window_length": 50,
@@ -221,45 +213,20 @@ async def engineer_tune(request):
         return _error(str(exc), 500)
 
 
-async def benchmark_m4(request):
+async def benchmark_m4_load(request):
     payload = await _json_body(request)
     try:
         result = await anyio.to_thread.run_sync(
-            lambda: run_m4_classification_benchmark(
-                graph=payload.get("graph"),
+            lambda: prepare_m4_dataset_csv(
                 n_per_group=int(payload.get("n_per_group", 100) or 100),
                 window_length=int(payload.get("window_length", 50) or 50),
-                test_size=_payload_test_size(payload),
-                primary_metric=payload.get("primary_metric") or "f1",
-                random_state=int(payload.get("random_state", 42) or 42),
                 standardize=bool(payload.get("standardize", True)),
                 groups=payload.get("groups") or None,
             )
         )
         return JSONResponse(result)
     except Exception as exc:
-        logger.exception("M4 benchmark failed")
-        return _error(_compact_error(exc), 500)
-
-
-async def benchmark_m4_architect(request):
-    payload = await _json_body(request)
-    try:
-        result = await propose_m4_benchmark_architecture(
-            message=payload.get("message", ""),
-            current_graph=payload.get("current_graph"),
-            n_per_group=int(payload.get("n_per_group", 100) or 100),
-            window_length=int(payload.get("window_length", 50) or 50),
-            test_size=_payload_test_size(payload),
-            primary_metric=payload.get("primary_metric") or "f1",
-            groups=payload.get("groups") or None,
-            standardize=bool(payload.get("standardize", True)),
-        )
-        if result.get("error"):
-            return JSONResponse(result, status_code=400)
-        return JSONResponse(result)
-    except Exception as exc:
-        logger.exception("M4 benchmark architect failed")
+        logger.exception("M4 dataset preparation failed")
         return _error(str(exc), 500)
 
 
@@ -305,8 +272,7 @@ routes = [
     Route("/orchestrate", orchestrate, methods=["POST"]),
     Route("/orchestrate/stream", orchestrate_stream, methods=["POST"]),
     Route("/engineer/tune", engineer_tune, methods=["POST"]),
-    Route("/benchmarks/m4/architect", benchmark_m4_architect, methods=["POST"]),
-    Route("/benchmarks/m4", benchmark_m4, methods=["POST"]),
+    Route("/benchmarks/m4/load", benchmark_m4_load, methods=["POST"]),
 ]
 
 app = Starlette(debug=False, routes=routes)

@@ -1,30 +1,27 @@
-"""M4 benchmark helpers for the local GraphAutoML backend.
+"""M4 benchmark data loader.
 
-The benchmark follows the M4 classification utility used in the Fedot.Industrial
-examples: each time series becomes one sample, and the target is the M4 frequency
-group. Data is downloaded through ``datasetsforecast.m4.M4.download`` and then
-read from the wide CSV files without melting them into a huge long dataframe.
+This module only loads M4 series, reshapes them into a fixed-window
+classification problem (label = frequency group), and saves the result as a
+CSV under the shared data dir. The rest of the pipeline (Architect, Engineer,
+Critic, Evaluate) reuses the standard CSV flow exactly as it does for any
+user-uploaded dataset.
 """
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
-from sklearn import metrics as skm
-from sklearn.model_selection import train_test_split
 
-from fedot.core.data.data import InputData
-from fedot.core.repository.dataset_types import DataTypesEnum
-from fedot.core.repository.tasks import Task, TaskTypesEnum
-
-from graph_engine import PipelineGraph, compute_metrics
 from path_utils import data_dir
 
 
 M4_GROUPS: Tuple[str, ...] = ("Daily", "Weekly", "Monthly", "Quarterly", "Yearly")
+M4_TARGET_COLUMN = "frequency_group"
+M4_TASK_TYPE = "ts_classification"
 
 
 def _group_list(groups: Optional[Sequence[str]]) -> Tuple[str, ...]:
@@ -32,42 +29,6 @@ def _group_list(groups: Optional[Sequence[str]]) -> Tuple[str, ...]:
         return M4_GROUPS
     selected = tuple(group for group in groups if group in M4_GROUPS)
     return selected or M4_GROUPS
-
-
-def m4_classification_profile(
-    n_per_group: int = 100,
-    window_length: int = 50,
-    test_size: float = 0.3,
-    groups: Optional[Sequence[str]] = None,
-    standardize: bool = True,
-) -> Dict[str, Any]:
-    selected_groups = _group_list(groups)
-    n_rows = max(1, int(n_per_group))
-    length = max(8, int(window_length))
-    n_samples = n_rows * len(selected_groups)
-    return {
-        "benchmark": "M4",
-        "benchmark_mode": "frequency-group ts_classification",
-        "requires_architect_graph": True,
-        "n_samples": n_samples,
-        "n_features": length,
-        "feature_shape": [n_samples, length],
-        "fedot_feature_shape": [1, n_samples, length],
-        "n_channels": 1,
-        "target": "frequency_group",
-        "target_type": "multiclass",
-        "classes": list(selected_groups),
-        "class_balance": {group: n_rows for group in selected_groups},
-        "test_size": min(max(float(test_size), 0.05), 0.5),
-        "standardize_each_series": bool(standardize),
-        "is_time_series": True,
-        "issues": [],
-        "recommendations": [
-            "Use ts_classification operations only.",
-            "Prefer a feature extraction node followed by an industrial classifier.",
-            "The graph should classify M4 frequency groups from fixed-length series windows.",
-        ],
-    }
 
 
 def _m4_cache_root() -> Path:
@@ -114,26 +75,20 @@ def _prepare_series(row: np.ndarray, window_length: int, standardize: bool) -> n
     return series[-window_length:]
 
 
-def load_m4_classification(
-    n_per_group: int = 100,
-    window_length: int = 50,
-    test_size: float = 0.3,
-    random_state: int = 42,
-    standardize: bool = True,
-    groups: Optional[Sequence[str]] = None,
-) -> Tuple[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray], Dict[str, Any]]:
-    selected_groups = _group_list(groups)
-    n_rows = max(1, int(n_per_group))
-    length = max(8, int(window_length))
-
+def _load_m4_matrix(
+    n_per_group: int,
+    window_length: int,
+    standardize: bool,
+    groups: Sequence[str],
+) -> Tuple[np.ndarray, np.ndarray, List[Dict[str, Any]]]:
     x_all: List[np.ndarray] = []
     y_all: List[int] = []
     source_files: List[Dict[str, Any]] = []
 
-    for label, group in enumerate(selected_groups):
-        values = _read_wide_group_csv(group, max_rows=n_rows)
+    for label, group in enumerate(groups):
+        values = _read_wide_group_csv(group, max_rows=n_per_group)
         for row in values:
-            x_all.append(_prepare_series(row, length, standardize))
+            x_all.append(_prepare_series(row, window_length, standardize))
             y_all.append(label)
 
         csv_path = _m4_csv_path(group)
@@ -150,144 +105,56 @@ def load_m4_classification(
 
     x = np.stack(x_all).astype(np.float32)
     y = np.asarray(y_all, dtype=np.int64)
+    return x, y, source_files
 
-    stratify = y if len(np.unique(y)) > 1 and min(np.bincount(y)) > 1 else None
-    x_train, x_test, y_train, y_test = train_test_split(
-        x,
-        y,
-        test_size=min(max(float(test_size), 0.05), 0.5),
-        random_state=int(random_state),
-        stratify=stratify,
-    )
 
-    meta = {
+def prepare_m4_dataset_csv(
+    n_per_group: int = 100,
+    window_length: int = 50,
+    standardize: bool = True,
+    groups: Optional[Sequence[str]] = None,
+    filename: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Download M4 if needed, build a classification CSV, return its descriptor.
+
+    The CSV has ``window_length`` numeric feature columns named ``f_0 .. f_{N-1}``
+    and a string ``frequency_group`` target column. Each row is one M4 series
+    truncated/zero-padded to the window. Standard CSV flow takes over from here.
+    """
+    selected_groups = _group_list(groups)
+    n_rows = max(1, int(n_per_group))
+    length = max(8, int(window_length))
+
+    x, y, source_files = _load_m4_matrix(n_rows, length, bool(standardize), selected_groups)
+
+    feature_cols = [f"f_{i}" for i in range(length)]
+    df = pd.DataFrame(x, columns=feature_cols)
+    df[M4_TARGET_COLUMN] = [selected_groups[label] for label in y]
+
+    cache = _m4_cache_root()
+    cache.mkdir(parents=True, exist_ok=True)
+    if not filename:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        groups_tag = "-".join(selected_groups)
+        filename = f"m4_{groups_tag}_n{n_rows}_w{length}_{timestamp}.csv"
+    csv_path = cache / filename
+    df.to_csv(csv_path, index=False)
+
+    class_balance = {group: int(np.sum(y == idx)) for idx, group in enumerate(selected_groups)}
+
+    return {
+        "csv_path": str(csv_path),
+        "csv_filename": csv_path.name,
+        "target_column": M4_TARGET_COLUMN,
+        "task_type": M4_TASK_TYPE,
+        "n_samples": int(x.shape[0]),
+        "n_features": int(x.shape[1]),
+        "feature_columns": feature_cols,
         "groups": list(selected_groups),
         "group_labels": {str(idx): group for idx, group in enumerate(selected_groups)},
         "window_length": length,
         "n_per_group": n_rows,
         "standardize": bool(standardize),
+        "class_balance": class_balance,
         "source_files": source_files,
-    }
-    return (x_train, y_train), (x_test, y_test), meta
-
-
-def _to_input_data(features: np.ndarray, target: np.ndarray) -> InputData:
-    matrix = np.asarray(features, dtype=float)
-    if matrix.ndim != 2:
-        raise ValueError(f"M4 benchmark features must be a 2D matrix, got shape {matrix.shape}.")
-
-    # Fedot.Industrial's channel-independent converter expects channels first.
-    # One univariate M4 channel becomes a single 2D sample matrix downstream.
-    ts_features = matrix[np.newaxis, :, :]
-    return InputData(
-        idx=np.arange(matrix.shape[0]),
-        features=ts_features,
-        target=target,
-        task=Task(TaskTypesEnum.classification),
-        data_type=DataTypesEnum.ts,
-    )
-
-
-def _predict_labels(pipeline, data: InputData) -> np.ndarray:
-    try:
-        return np.asarray(pipeline.predict(data, output_mode="labels").predict)
-    except Exception:
-        return np.asarray(pipeline.predict(data).predict)
-
-
-def _class_report(y_true: np.ndarray, y_pred: np.ndarray, groups: Sequence[str]) -> List[Dict[str, Any]]:
-    labels = list(range(len(groups)))
-    report = skm.classification_report(
-        y_true,
-        y_pred,
-        labels=labels,
-        target_names=list(groups),
-        output_dict=True,
-        zero_division=0,
-    )
-    rows = []
-    for group in groups:
-        item = report.get(group, {}) or {}
-        rows.append({
-            "group": group,
-            "precision": item.get("precision", 0.0),
-            "recall": item.get("recall", 0.0),
-            "f1": item.get("f1-score", 0.0),
-            "support": item.get("support", 0.0),
-        })
-    return rows
-
-
-def _group_counts(y_train: np.ndarray, y_test: np.ndarray, groups: Sequence[str]) -> List[Dict[str, Any]]:
-    rows = []
-    for idx, group in enumerate(groups):
-        rows.append({
-            "group": group,
-            "train": int(np.sum(y_train == idx)),
-            "test": int(np.sum(y_test == idx)),
-        })
-    return rows
-
-
-def _validate_graph(graph: Optional[Dict[str, Any]]) -> PipelineGraph:
-    if not graph:
-        raise ValueError("M4 benchmark requires an Architect-approved ts_classification graph.")
-    if graph.get("task_type") != "ts_classification":
-        raise ValueError("M4 benchmark graph must use task_type='ts_classification'.")
-    pipeline_graph = PipelineGraph.from_dict(graph)
-    ok, message = pipeline_graph.validate()
-    if not ok:
-        raise ValueError(f"Invalid M4 benchmark graph: {message}")
-    return pipeline_graph
-
-
-def run_m4_classification_benchmark(
-    graph: Optional[Dict[str, Any]] = None,
-    n_per_group: int = 100,
-    window_length: int = 50,
-    test_size: float = 0.3,
-    primary_metric: str = "f1",
-    random_state: int = 42,
-    standardize: bool = True,
-    groups: Optional[Sequence[str]] = None,
-) -> Dict[str, Any]:
-    pipeline_graph = _validate_graph(graph)
-    (x_train, y_train), (x_test, y_test), meta = load_m4_classification(
-        n_per_group=n_per_group,
-        window_length=window_length,
-        test_size=test_size,
-        random_state=random_state,
-        standardize=standardize,
-        groups=groups,
-    )
-
-    train_data = _to_input_data(x_train, y_train)
-    test_data = _to_input_data(x_test, y_test)
-
-    pipeline = pipeline_graph.to_fedot_pipeline()
-    pipeline.fit(train_data)
-
-    train_preds = _predict_labels(pipeline, train_data)
-    test_preds = _predict_labels(pipeline, test_data)
-    train_metrics = compute_metrics("ts_classification", y_train, train_preds, primary_metric)
-    test_metrics = compute_metrics("ts_classification", y_test, test_preds, primary_metric)
-
-    groups_used = meta["groups"]
-    return {
-        "benchmark": "M4",
-        "mode": "frequency-group ts_classification",
-        "task_type": "ts_classification",
-        "score": test_metrics.get("primary_score", 0.0),
-        "metrics": test_metrics,
-        "train_metrics": train_metrics,
-        "test_metrics": test_metrics,
-        "split_info": {
-            "test_size": min(max(float(test_size), 0.05), 0.5),
-            "n_train": int(len(y_train)),
-            "n_test": int(len(y_test)),
-        },
-        "dataset": meta,
-        "graph": pipeline_graph.to_dict(),
-        "class_report": _class_report(y_test, test_preds, groups_used),
-        "group_counts": _group_counts(y_train, y_test, groups_used),
     }

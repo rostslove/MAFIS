@@ -65,7 +65,6 @@ Rules:
 - If feedback contains suggested_mutations, reflect them in the returned graph. Do not return the previous graph unchanged.
 - If feedback mentions class imbalance and param hints allow it, use explicit balancing params such as xgboost.scale_pos_weight or class_weight="balanced".
 - If feedback mentions unstable cross-validation, use a simpler model or explicit regularization params from param_hints.
-- If data_profile.benchmark is "M4", create a ts_classification graph for classifying frequency groups from fixed-length time-series windows.
 """
 
     def __init__(self, name: str = "Architect", mcp_client=None):
@@ -90,23 +89,6 @@ Rules:
 
             if not graph:
                 result.diagnostics.extend(diagnostics)
-                if self._requires_explicit_architect_graph(data_context):
-                    result.diagnostics.append(
-                        {
-                            "agent": "Architect",
-                            "kind": "architect_required_for_benchmark",
-                            "summary": "Architect did not produce a valid benchmark graph.",
-                            "technical_message": "M4 benchmark mode does not use a deterministic default graph.",
-                            "recommendations": [
-                                "Retry with a shorter request.",
-                                "Mention exact ts_classification operations from the catalog.",
-                                "Use the graph editor to create and approve a benchmark graph manually.",
-                            ],
-                            "recoverable": True,
-                        }
-                    )
-                    result.tool_calls = self.get_tool_calls()
-                    return result
                 graph, mermaid = await self._fallback_graph_with_tools(data_context, prev_graph)
                 analysis = self._fallback_analysis(data_context.task_type, bool(prev_graph))
                 reasoning = self._fallback_reasoning(graph, data_context.task_type)
@@ -134,20 +116,6 @@ Rules:
 
         except Exception as e:
             logger.exception(f"[Architect] error")
-            if self._requires_explicit_architect_graph(data_context):
-                result.analysis = f"Architect failed: {e}"
-                result.diagnostics.append(
-                    {
-                        "agent": "Architect",
-                        "kind": "architect_error",
-                        "summary": "Architect could not complete the benchmark graph proposal flow.",
-                        "technical_message": str(e),
-                        "recommendations": ["Retry or create a benchmark graph manually in the editor."],
-                        "recoverable": True,
-                    }
-                )
-                result.tool_calls = self.get_tool_calls()
-                return result
             result.graph, result.mermaid = self._fallback_graph(data_context.task_type, prev_graph)
             result.analysis = f"Fallback: {e}"
             result.reasoning = self._fallback_reasoning(result.graph, data_context.task_type)
@@ -166,17 +134,14 @@ Rules:
 
     async def _structured_graph_proposal(self, data_context: DataContext, prev_feedback, prev_graph):
         diagnostics = []
-        if data_context.profile.get("benchmark"):
-            profile = data_context.profile
-        else:
-            profile = await self.call_mcp_tool(
-                "get_data_profile",
-                {
-                    "csv_path": data_context.csv_path,
-                    "target_column": data_context.target_column,
-                    "task_type": data_context.task_type,
-                },
-            )
+        profile = await self.call_mcp_tool(
+            "get_data_profile",
+            {
+                "csv_path": data_context.csv_path,
+                "target_column": data_context.target_column,
+                "task_type": data_context.task_type,
+            },
+        )
         operations = await self.call_mcp_tool("get_available_operations", {"task_type": data_context.task_type})
 
         prompt = self._build_structured_prompt(data_context, profile, operations, prev_feedback, prev_graph)
@@ -240,15 +205,14 @@ Rules:
         return default.to_dict(), default.to_mermaid()
 
     async def _fallback_graph_with_tools(self, data_context: DataContext, prev_graph: Optional[dict] = None):
-        if not data_context.profile.get("benchmark"):
-            await self.call_mcp_tool(
-                "get_data_profile",
-                {
-                    "csv_path": data_context.csv_path,
-                    "target_column": data_context.target_column,
-                    "task_type": data_context.task_type,
-                },
-            )
+        await self.call_mcp_tool(
+            "get_data_profile",
+            {
+                "csv_path": data_context.csv_path,
+                "target_column": data_context.target_column,
+                "task_type": data_context.task_type,
+            },
+        )
         await self.call_mcp_tool("get_available_operations", {"task_type": data_context.task_type})
 
         graph, mermaid = self._fallback_graph(data_context.task_type, prev_graph)
@@ -326,10 +290,6 @@ Rules:
             "Return only the GraphProposal JSON object.\n"
             f"{json.dumps(payload, ensure_ascii=False)}"
         )
-
-    @staticmethod
-    def _requires_explicit_architect_graph(dc: DataContext) -> bool:
-        return bool(dc.profile.get("requires_architect_graph"))
 
     @staticmethod
     def _fallback_analysis(task_type: str, reused_previous: bool) -> str:

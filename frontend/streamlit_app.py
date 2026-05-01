@@ -1037,64 +1037,57 @@ def render_evaluation_history(current_result: Dict[str, Any]) -> None:
             )
 
 
-def set_m4_graph(result: Dict[str, Any]) -> None:
-    st.session_state.m4_graph = result.get("graph", {}) or {}
-    st.session_state.m4_profile = result.get("profile", {}) or {}
-    st.session_state.m4_architect_analysis = result.get("analysis", "")
-    st.session_state.m4_architect_reasoning = result.get("reasoning", "")
-    st.session_state.m4_architect_diagnostics = result.get("diagnostics", []) or []
-    st.session_state.m4_architect_tool_calls = result.get("tool_calls", []) or []
-    st.session_state.m4_graph_approved = False
+def adopt_m4_dataset(result: Dict[str, Any]) -> None:
+    """Promote a loaded M4 CSV to the active dataset (same shape as CSV upload)."""
+    csv_path = result.get("csv_path")
+    if not csv_path:
+        raise RuntimeError("M4 loader did not return a CSV path.")
+
+    local_path = Path(csv_path)
+    if not local_path.exists():
+        local_path = shared_data_dir() / Path(csv_path).name
+    if not local_path.exists():
+        raise FileNotFoundError(f"Loaded M4 CSV not found at {csv_path}.")
+
+    df = pd.read_csv(local_path)
+    st.session_state.df = df
+    st.session_state.csv_path = csv_path if Path("/app/data").exists() else str(local_path)
+    st.session_state.uploaded_signature = f"m4:{local_path.name}"
+    st.session_state.target_column = result.get("target_column", "frequency_group")
+    st.session_state.task_type = result.get("task_type", "ts_classification")
+    st.session_state.forecast_length = None
+    st.session_state.result = {}
+    st.session_state.evaluation_history = []
+    st.session_state.graph = {}
+    st.session_state.approved_graph = None
+    st.session_state.graph_approved = False
+    st.session_state.m4_dataset_info = result
 
 
-def approve_m4_graph() -> None:
-    graph = st.session_state.get("m4_graph") or {}
-    if graph:
-        st.session_state.m4_approved_graph = graph
-        st.session_state.m4_graph_approved = True
-
-
-def render_m4_benchmark_result(result: Dict[str, Any]) -> None:
-    if not result:
+def render_m4_dataset_info(info: Dict[str, Any]) -> None:
+    if not info:
         return
-
-    if result.get("error"):
-        st.error(result["error"])
-        render_diagnostics(result.get("diagnostics", []) or [], "Benchmark diagnostics", use_expander=False)
-        return
-
-    st.markdown("#### M4 Benchmark Result")
-    metrics = result.get("test_metrics", {}) or result.get("metrics", {}) or {}
-    train_metrics = result.get("train_metrics", {}) or {}
-    primary_metric = metrics.get("primary_metric") or "score"
-    primary_value = metrics.get("primary_metric_value", result.get("score", 0))
-    train_value = train_metrics.get("primary_metric_value", "")
-    dataset = result.get("dataset", {}) or {}
-
+    st.markdown("#### Loaded M4 Dataset")
     cols = st.columns(4)
-    cols[0].metric(f"Test {primary_metric}", format_number(primary_value))
-    cols[1].metric(f"Train {primary_metric}", format_number(train_value))
-    cols[2].metric("Groups", len(dataset.get("groups", []) or []))
-    cols[3].metric("Window", dataset.get("window_length", ""))
+    cols[0].metric("Samples", info.get("n_samples", 0))
+    cols[1].metric("Window", info.get("window_length", 0))
+    cols[2].metric("Groups", len(info.get("groups", []) or []))
+    cols[3].metric("Per group", info.get("n_per_group", 0))
+    st.caption(
+        f"CSV: `{info.get('csv_path', '')}` - target column: `{info.get('target_column', '')}`. "
+        "Open the Data, Architect, Graph Editor and Feedback tabs to run the standard pipeline."
+    )
 
-    render_graph(result.get("graph", {}), show_details=False)
-    render_split_info(result.get("split_info", {}) or {})
+    balance = info.get("class_balance") or {}
+    if balance:
+        st.write("Class balance")
+        st.dataframe(
+            pd.DataFrame([{"group": group, "rows": count} for group, count in balance.items()]),
+            use_container_width=True,
+            hide_index=True,
+        )
 
-    train_col, test_col = st.columns(2)
-    with train_col:
-        render_metric_table("Train metrics", train_metrics)
-    with test_col:
-        render_metric_table("Test metrics (hold-out)", metrics)
-
-    if result.get("class_report"):
-        st.write("Per-group test metrics")
-        st.dataframe(pd.DataFrame(result["class_report"]), use_container_width=True, hide_index=True)
-
-    if result.get("group_counts"):
-        st.write("Group split")
-        st.dataframe(pd.DataFrame(result["group_counts"]), use_container_width=True, hide_index=True)
-
-    source_files = dataset.get("source_files", []) or []
+    source_files = info.get("source_files") or []
     if source_files:
         with st.expander("M4 source files"):
             st.dataframe(pd.DataFrame(source_files), use_container_width=True, hide_index=True)
@@ -1104,135 +1097,70 @@ def benchmarks_tab(config: Dict[str, Any]) -> None:
     st.subheader("Benchmarks")
     bench_config = (config.get("benchmarks", {}) or {}).get("m4_classification", {})
     groups = bench_config.get("groups") or DEFAULT_M4_GROUPS
-    metric_options = config.get("metrics_by_task", {}).get("ts_classification") or DEFAULT_METRICS_BY_TASK["ts_classification"]
 
     st.write("M4 frequency-group classification")
     st.caption(
-        "Uses real M4 train CSV files downloaded through datasetsforecast. "
-        "Each time series is one sample; the target class is its frequency group."
+        "Loads M4 train CSVs through datasetsforecast and saves a fixed-window classification CSV "
+        "into the shared data directory. After loading, the rest of the pipeline is exactly the same "
+        "as for any uploaded CSV: pick a target, ask Architect for a graph, approve it, evaluate."
     )
 
-    settings_col, graph_col = st.columns([1, 1])
-    with settings_col:
-        selected_groups = st.multiselect(
-            "M4 groups",
-            groups,
-            default=groups,
-            help="At least two groups are recommended because the benchmark is classification by frequency group.",
-        )
-        n_per_group = st.number_input(
-            "Series per group",
-            min_value=10,
-            max_value=1000,
-            value=int(bench_config.get("default_n_per_group", 100)),
-            step=10,
-        )
-        window_length = st.number_input(
-            "Window length",
-            min_value=8,
-            max_value=500,
-            value=int(bench_config.get("default_window_length", 50)),
-            step=5,
-        )
-        test_size = st.slider(
-            "M4 test size",
-            min_value=0.05,
-            max_value=0.5,
-            value=float(st.session_state.get("m4_test_size", 0.3)),
-            step=0.05,
-            key="m4_test_size",
-        )
-        metric = st.selectbox(
-            "M4 primary metric",
-            metric_options,
-            index=metric_options.index("f1") if "f1" in metric_options else 0,
-        )
-        standardize = st.checkbox("Standardize each series", value=True)
-        message = st.text_area(
-            "Request to Architect",
-            placeholder="Example: prefer fast feature extraction, avoid deep neural models, or try frequency-domain features.",
-            height=90,
-            key="m4_architect_message",
-        )
-        if st.button("Ask Architect For M4 Graph", type="primary", use_container_width=True, key="m4_ask_architect"):
-            payload = {
-                "message": message,
-                "current_graph": st.session_state.get("m4_graph"),
-                "groups": selected_groups or groups,
-                "n_per_group": int(n_per_group),
-                "window_length": int(window_length),
-                "test_size": float(test_size),
-                "primary_metric": metric,
-                "standardize": bool(standardize),
-            }
-            try:
-                with st.spinner("Architect is drafting an M4 benchmark graph..."):
-                    result = post_json("/benchmarks/m4/architect", payload, timeout=240)
-                set_m4_graph(result)
-                st.success("Architect proposed an M4 benchmark graph. Approve it before running the benchmark.")
-            except Exception as exc:
-                st.error(f"M4 Architect failed: {exc}")
-
-    graph = st.session_state.get("m4_graph", {}) or {}
-    with graph_col:
-        status = "approved" if st.session_state.get("m4_graph_approved") else "draft"
-        st.write(f"M4 Architect graph ({status})")
-        if graph:
-            render_graph(graph, show_details=False)
-            st.dataframe(pd.DataFrame(graph_rows(graph)), use_container_width=True, hide_index=True)
-            action_cols = st.columns(2)
-            if action_cols[0].button("Approve M4 Graph", use_container_width=True, key="m4_approve_graph"):
-                approve_m4_graph()
-                st.success("M4 graph approved for benchmark.")
-            if action_cols[1].button("Discard M4 Draft", use_container_width=True, key="m4_discard_graph"):
-                st.session_state.m4_graph = st.session_state.get("m4_approved_graph", {}) or {}
-                st.session_state.m4_graph_approved = bool(st.session_state.get("m4_graph"))
-                st.info("M4 draft discarded.")
-            if st.session_state.get("m4_architect_analysis"):
-                st.write("Analysis")
-                st.write(st.session_state.m4_architect_analysis)
-            if st.session_state.get("m4_architect_reasoning"):
-                st.write("Reasoning")
-                st.write(st.session_state.m4_architect_reasoning)
-            render_diagnostics(st.session_state.get("m4_architect_diagnostics", []), "M4 Architect diagnostics")
-            render_tool_calls(st.session_state.get("m4_architect_tool_calls", []), "M4 Architect tool calls")
-        else:
-            st.info("Ask Architect to draft an M4 graph first.")
-            st.write("Available ts_classification operations")
-            render_operation_catalog(config, "ts_classification", "m4_benchmark")
+    selected_groups = st.multiselect(
+        "M4 groups",
+        groups,
+        default=groups,
+        help="At least two groups are recommended because the benchmark is classification by frequency group.",
+    )
+    cols = st.columns(3)
+    n_per_group = cols[0].number_input(
+        "Series per group",
+        min_value=10,
+        max_value=1000,
+        value=int(bench_config.get("default_n_per_group", 100)),
+        step=10,
+    )
+    window_length = cols[1].number_input(
+        "Window length",
+        min_value=8,
+        max_value=500,
+        value=int(bench_config.get("default_window_length", 50)),
+        step=5,
+    )
+    standardize = cols[2].checkbox("Standardize each series", value=True)
 
     if len(selected_groups or []) < 2:
         st.warning("Select at least two M4 groups for a classification benchmark.")
 
-    approved_graph = st.session_state.get("m4_approved_graph") or {}
-    can_run = bool(approved_graph) and st.session_state.get("m4_graph_approved") and len(selected_groups or []) >= 2
+    can_load = len(selected_groups or []) >= 2
     if st.button(
-        "Run M4 Benchmark",
+        "Load M4 Dataset",
         type="primary",
         use_container_width=True,
-        key="run_m4_benchmark",
-        disabled=not can_run,
+        key="m4_load_dataset",
+        disabled=not can_load,
     ):
         payload = {
-            "graph": approved_graph,
             "groups": selected_groups or groups,
             "n_per_group": int(n_per_group),
             "window_length": int(window_length),
-            "test_size": float(test_size),
-            "primary_metric": metric,
             "standardize": bool(standardize),
         }
         try:
-            with st.spinner("Downloading/loading M4 and running the benchmark..."):
-                st.session_state.m4_benchmark_result = post_json("/benchmarks/m4", payload, timeout=3600)
-            st.success("M4 benchmark completed.")
+            with st.spinner("Downloading/loading M4 and saving CSV..."):
+                result = post_json("/benchmarks/m4/load", payload, timeout=900)
+            adopt_m4_dataset(result)
+            st.success(
+                f"M4 dataset loaded: {result.get('n_samples', 0)} samples written to "
+                f"`{result.get('csv_filename', '')}`. Switch to Architect or Graph Editor to continue."
+            )
         except Exception as exc:
-            st.error(f"M4 benchmark failed: {exc}")
+            st.error(f"M4 loading failed: {exc}")
 
-    if not approved_graph:
-        st.caption("Benchmark run is disabled until an Architect graph is approved.")
+    render_m4_dataset_info(st.session_state.get("m4_dataset_info") or {})
 
-    render_m4_benchmark_result(st.session_state.get("m4_benchmark_result", {}) or {})
+    st.divider()
+    st.write("Available ts_classification operations")
+    render_operation_catalog(config, "ts_classification", "m4_benchmark")
 
 
 def results_tab() -> None:
