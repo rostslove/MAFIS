@@ -23,7 +23,6 @@ def shared_data_dir() -> Path:
     return repo_data
 
 
-@st.cache_data(ttl=60)
 def load_config() -> Dict[str, Any]:
     try:
         response = requests.get(f"{BACKEND_URL}/config", timeout=5)
@@ -33,7 +32,6 @@ def load_config() -> Dict[str, Any]:
         return {"operations": {}, "metrics_by_task": {}, "supported_tasks": TASK_TYPES}
 
 
-@st.cache_data(ttl=60)
 def load_tools() -> Dict[str, Any]:
     try:
         response = requests.get(f"{BACKEND_URL}/tools", timeout=5)
@@ -224,8 +222,6 @@ def render_operation_catalog(config: Dict[str, Any], task_type: str, key_suffix:
         return
     st.info("Operation catalog is unavailable. Check that backend /config is reachable, then refresh metadata.")
     if st.button("Refresh Backend Metadata", key=f"refresh_metadata_{key_suffix}_{task_type}"):
-        load_config.clear()
-        load_tools.clear()
         st.rerun()
 
 
@@ -337,8 +333,6 @@ def sidebar() -> None:
         except Exception:
             st.error("backend unavailable")
         if st.button("Refresh Backend Metadata", key="sidebar_refresh_metadata"):
-            load_config.clear()
-            load_tools.clear()
             st.rerun()
 
 
