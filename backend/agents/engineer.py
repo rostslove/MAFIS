@@ -92,6 +92,8 @@ Do not change graph structure; only node parameters may be tuned."""
             "target_column": dc.target_column,
             "iterations": 20,
         }
+        if dc.primary_metric:
+            args["primary_metric"] = dc.primary_metric
         if dc.forecast_length:
             args["forecast_length"] = dc.forecast_length
 
@@ -113,6 +115,8 @@ Do not change graph structure; only node parameters may be tuned."""
             "csv_path": dc.csv_path,
             "target_column": dc.target_column,
         }
+        if dc.primary_metric:
+            args["primary_metric"] = dc.primary_metric
         if dc.forecast_length:
             args["forecast_length"] = dc.forecast_length
         trained = await self.call_mcp_tool("train_graph", args)

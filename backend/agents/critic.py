@@ -123,6 +123,8 @@ Return JSON only."""
             "target_column": dc.target_column,
             "cv_folds": 3,
         }
+        if dc.primary_metric:
+            args["primary_metric"] = dc.primary_metric
         if dc.forecast_length:
             args["forecast_length"] = dc.forecast_length
         validation = await self.call_mcp_tool("validate_graph", args)
@@ -138,6 +140,8 @@ Return JSON only."""
             "csv_path": dc.csv_path,
             "target_column": dc.target_column,
         }
+        if dc.primary_metric:
+            args["primary_metric"] = dc.primary_metric
         if dc.forecast_length:
             args["forecast_length"] = dc.forecast_length
         importance = await self.call_mcp_tool("get_node_importance", args)
@@ -171,10 +175,16 @@ Return JSON only."""
         cv = ""
         if isinstance(validation, dict) and "score_mean" in validation:
             cv = f", CV mean {validation.get('score_mean', 0):.4f} +/- {validation.get('score_std', 0):.4f}"
+        metric = engineer.graph_metrics.get("primary_metric") or dc.primary_metric or "primary"
+        metric_value = engineer.graph_metrics.get("primary_metric_value", engineer.graph_score)
+        try:
+            metric_value_text = f"{float(metric_value):.4f}"
+        except (TypeError, ValueError):
+            metric_value_text = str(metric_value)
         issues = dc.profile.get("issues", [])
         issue_text = f" Data issues: {issues}." if issues and issues != ["none"] else ""
         return (
-            f"Graph score {engineer.graph_score:.4f}{cv}. "
+            f"Graph {metric}={metric_value_text}; ranking score={engineer.graph_score:.4f}{cv}. "
             f"Assessment is based on graph metrics, validation stability, node behavior, and data profile."
             f"{issue_text}"
         )
@@ -203,10 +213,16 @@ Return JSON only."""
             return weaknesses
         if engineer.graph_score <= 0:
             weaknesses.append("The graph score is zero or unavailable")
-        if engineer.graph_score < Critic._target_quality_floor(dc.task_type):
+        if engineer.graph_score < Critic._target_quality_floor(dc.task_type, dc.primary_metric):
             weaknesses.append("The graph metric is below the target quality floor for this task")
+        if dc.task_type in ("classification", "ts_classification"):
+            f1 = engineer.graph_metrics.get("f1")
+            if isinstance(f1, (int, float)) and f1 < 0.70:
+                weaknesses.append("Weighted F1 is below the desired standalone quality level")
         if validation.get("score_std", 0) > 0.1:
             weaknesses.append("Cross-validation variance is high")
+        elif validation.get("score_std", 0) > 0.05:
+            weaknesses.append("Cross-validation variance is noticeable")
         issues = dc.profile.get("issues", []) or []
         for issue in issues:
             if issue != "none":
@@ -228,13 +244,28 @@ Return JSON only."""
             return mutations[:2]
 
         current_root = next((n for n in nodes if n.get("id") == root_id), {})
+        current_operation = current_root.get("operation", "")
 
-        score_floor = self._target_quality_floor(dc.task_type)
+        score_floor = self._target_quality_floor(dc.task_type, dc.primary_metric)
+        f1 = engineer.graph_metrics.get("f1")
+        low_f1 = isinstance(f1, (int, float)) and f1 < 0.70
         unstable = validation.get("score_std", 0) > 0.1
+        noticeable_variance = validation.get("score_std", 0) > 0.05
+
+        if dc.task_type == "classification" and (dc.profile.get("is_imbalanced") or low_f1):
+            mutation = self._classification_balance_mutation(root_id, current_operation, dc.profile)
+            if mutation:
+                mutations = self._merge_set_params_mutation(mutations, mutation)
+
         if engineer.graph_score < score_floor or unstable:
-            candidate = self._next_model_candidate(dc.task_type, current_root.get("operation", ""))
+            candidate = self._next_model_candidate(dc.task_type, current_operation)
             if candidate:
                 mutations.append({"type": "replace", "node_id": root_id, "new_operation": candidate})
+
+        if noticeable_variance:
+            mutation = self._regularization_mutation(root_id, current_operation)
+            if mutation:
+                mutations = self._merge_set_params_mutation(mutations, mutation)
 
         if dc.task_type.startswith("ts_") and not any("fourier" in n.get("operation", "") for n in nodes):
             mutations.append(
@@ -261,7 +292,7 @@ Return JSON only."""
             plan.extend(self._diagnostic_recommendations(engineer.diagnostics))
             return self._unique_strings(plan)
 
-        quality_floor = self._target_quality_floor(dc.task_type)
+        quality_floor = self._target_quality_floor(dc.task_type, dc.primary_metric)
         if engineer.graph_score < quality_floor:
             plan.append(
                 f"The graph score is below the standalone target floor for {dc.task_type} "
@@ -274,7 +305,7 @@ Return JSON only."""
             plan.append("Cross-validation variance is noticeable; prefer simpler models or stronger regularization.")
 
         if dc.profile.get("is_imbalanced"):
-            plan.append("Target classes look imbalanced; prefer metrics such as F1/precision and consider class weighting.")
+            plan.append("Target classes look imbalanced; prefer metrics such as F1/precision and add model-level balancing parameters.")
 
         for mutation in mutations:
             if mutation.get("type") == "replace":
@@ -289,6 +320,61 @@ Return JSON only."""
                 plan.append(f"Architect can draft a new graph by updating parameters of node '{mutation.get('node_id')}'.")
 
         return self._unique_strings(plan)[:6]
+
+    @staticmethod
+    def _classification_balance_mutation(node_id: str, operation: str, profile: Dict[str, Any]) -> Dict[str, Any]:
+        ratio = Critic._imbalance_ratio(profile)
+        weight = round(min(max(1.0 / ratio, 1.0), 20.0), 3) if ratio else 3.0
+        if operation == "xgboost":
+            return {"type": "set_params", "node_id": node_id, "params": {"scale_pos_weight": weight}}
+        if operation in ("rf", "logit", "lgbm", "dt"):
+            params: Dict[str, Any] = {"class_weight": "balanced"}
+            if operation == "logit":
+                params["max_iter"] = 1000
+            return {"type": "set_params", "node_id": node_id, "params": params}
+        return {
+            "type": "replace",
+            "node_id": node_id,
+            "new_operation": "logit",
+            "params": {"class_weight": "balanced", "max_iter": 1000},
+        }
+
+    @staticmethod
+    def _regularization_mutation(node_id: str, operation: str) -> Dict[str, Any]:
+        params_by_operation: Dict[str, Dict[str, Any]] = {
+            "xgboost": {"max_depth": 3, "learning_rate": 0.05, "n_estimators": 200},
+            "rf": {"max_depth": 8, "n_estimators": 300},
+            "logit": {"C": 0.5, "max_iter": 1000},
+            "lgbm": {"num_leaves": 31, "learning_rate": 0.05, "n_estimators": 200},
+            "dt": {"max_depth": 6},
+            "xgbreg": {"max_depth": 3, "learning_rate": 0.05, "n_estimators": 200},
+            "treg": {"max_depth": 8, "n_estimators": 300},
+            "ridge": {"alpha": 2.0},
+        }
+        params = params_by_operation.get(operation)
+        if not params:
+            return {}
+        return {"type": "set_params", "node_id": node_id, "params": params}
+
+    @staticmethod
+    def _merge_set_params_mutation(mutations: List[Dict[str, Any]], mutation: Dict[str, Any]) -> List[Dict[str, Any]]:
+        if mutation.get("type") != "set_params":
+            mutations.append(mutation)
+            return mutations
+        for existing in mutations:
+            if existing.get("type") == "set_params" and existing.get("node_id") == mutation.get("node_id"):
+                existing["params"] = {**existing.get("params", {}), **mutation.get("params", {})}
+                return mutations
+        mutations.append(mutation)
+        return mutations
+
+    @staticmethod
+    def _imbalance_ratio(profile: Dict[str, Any]) -> float:
+        try:
+            ratio = float(profile.get("imbalance_ratio"))
+            return ratio if ratio > 0 else 0.0
+        except (TypeError, ValueError):
+            return 0.0
 
     @staticmethod
     def _collect_diagnostics(
@@ -336,7 +422,9 @@ Return JSON only."""
         return roots[0] if roots else ""
 
     @staticmethod
-    def _target_quality_floor(task_type: str) -> float:
+    def _target_quality_floor(task_type: str, primary_metric: str = "") -> float:
+        if primary_metric in {"rmse", "mse", "mae", "mape", "smape"}:
+            return float("-inf")
         return {
             "classification": 0.75,
             "regression": 0.60,
@@ -363,4 +451,5 @@ Return JSON only."""
             return False
         if validation.get("score_std", 0) > 0.1:
             return False
-        return engineer.graph_score >= Critic._target_quality_floor(task_type)
+        metric = engineer.graph_metrics.get("primary_metric", "")
+        return engineer.graph_score >= Critic._target_quality_floor(task_type, str(metric))

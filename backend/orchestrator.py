@@ -50,6 +50,7 @@ async def run_orchestration_stream(
     initial_graph: Optional[Dict[str, Any]] = None,
     initial_fedot_config: Optional[Dict[str, Any]] = None,
     forecast_length: Optional[int] = None,
+    primary_metric: Optional[str] = None,
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """Evaluate one user-approved graph and yield SSE-friendly events."""
     del fedot_url, initial_fedot_config
@@ -76,11 +77,14 @@ async def run_orchestration_stream(
         task_type=task_type,
         profile=profile,
         forecast_length=forecast_length,
+        primary_metric=primary_metric,
     )
     yield _event(
         "status",
         message=f"Data profiled: {profile.get('n_samples')} samples, {profile.get('n_features')} numeric features",
     )
+    if primary_metric:
+        yield _event("status", message=f"Primary metric: {primary_metric}")
 
     mcp_client: Optional[MCPToolClient] = None
     try:
@@ -141,7 +145,7 @@ async def run_orchestration_stream(
                     "agent_done",
                     agent="Engineer",
                     iteration=iteration,
-                    summary=f"Graph score: {engineer_result.graph_score:.4f}",
+                    summary=_engineer_summary(engineer_result),
                     diagnostics=engineer_result.diagnostics,
                     graph_error=engineer_result.graph_error,
                     tool_calls_count=len(engineer_result.tool_calls),
@@ -189,6 +193,8 @@ async def run_orchestration_stream(
                     "iteration_done",
                     iteration=iteration,
                     graph_score=engineer_result.graph_score,
+                    primary_metric=engineer_result.graph_metrics.get("primary_metric"),
+                    primary_metric_value=engineer_result.graph_metrics.get("primary_metric_value"),
                     winner=critic_result.winner,
                     graph=architect_result.graph,
                     mermaid=architect_result.mermaid,
@@ -217,6 +223,7 @@ async def run_orchestration_stream(
         final_result = {
             "status": "success",
             "task_type": task_type,
+            "primary_metric": primary_metric,
             "is_time_series": is_ts_task(task_type),
             "forecast_length": forecast_length,
             "profile": profile,
@@ -242,6 +249,7 @@ async def run_orchestration(
     initial_graph: Optional[Dict[str, Any]] = None,
     initial_fedot_config: Optional[Dict[str, Any]] = None,
     forecast_length: Optional[int] = None,
+    primary_metric: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Collect streaming events and return the final result."""
     final_result: Dict[str, Any] = {"status": "failed", "error": "No result"}
@@ -254,6 +262,7 @@ async def run_orchestration(
         initial_graph=initial_graph,
         initial_fedot_config=initial_fedot_config,
         forecast_length=forecast_length,
+        primary_metric=primary_metric,
     ):
         if evt.get("event") == "complete":
             final_result = evt.get("result", final_result)
@@ -269,6 +278,7 @@ async def propose_architecture(
     message: str = "",
     current_graph: Optional[Dict[str, Any]] = None,
     forecast_length: Optional[int] = None,
+    primary_metric: Optional[str] = None,
 ) -> Dict[str, Any]:
     """One-shot Architect interaction for the frontend graph approval flow."""
     csv_path = normalize_csv_path(csv_path)
@@ -282,6 +292,7 @@ async def propose_architecture(
         task_type=task_type,
         profile=profile,
         forecast_length=forecast_length,
+        primary_metric=primary_metric,
     )
 
     mcp_client = await _connect_mcp()
@@ -321,12 +332,14 @@ async def propose_revision_from_critic(
     critic_feedback: Dict[str, Any],
     message: str = "",
     forecast_length: Optional[int] = None,
+    primary_metric: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create a new draft graph from explicit Critic feedback; user must approve it."""
     csv_path = normalize_csv_path(csv_path)
     if task_type not in SUPPORTED_TASKS:
         return {"error": f"Unknown task type: {task_type}"}
 
+    profile = _profile_data(csv_path, target_column, task_type, forecast_length)
     graph = PipelineGraph.from_dict(current_graph)
     ok, validation_message = graph.validate()
     if not ok:
@@ -350,7 +363,7 @@ async def propose_revision_from_critic(
 
     if applied:
         return {
-            "profile": _profile_data(csv_path, target_column, task_type, forecast_length),
+            "profile": profile,
             "graph": draft.to_dict(),
             "mermaid": draft.to_mermaid(),
             "analysis": "Architect drafted a new graph by applying Critic feedback. It is not approved yet.",
@@ -361,8 +374,66 @@ async def propose_revision_from_critic(
             "tool_calls": [],
         }
 
+    data_context = DataContext(
+        csv_path=csv_path,
+        target_column=target_column,
+        task_type=task_type,
+        profile=profile,
+        forecast_length=forecast_length,
+        primary_metric=primary_metric,
+    )
+    feedback = CriticFeedback(
+        winner=critic_feedback.get("winner", "needs_revision"),
+        assessment=critic_feedback.get("assessment", ""),
+        strengths=critic_feedback.get("strengths", []) or [],
+        weaknesses=critic_feedback.get("weaknesses", []) or [],
+        suggested_mutations=[],
+        improvement_plan=critic_feedback.get("improvement_plan", []) or [],
+        should_stop=False,
+    )
+    if message:
+        feedback.weaknesses.append(f"User note: {message}")
+
+    mcp_client = await _connect_mcp()
+    try:
+        architect = Architect(mcp_client=mcp_client)
+        result = await architect.execute(
+            data_context=data_context,
+            iteration=1,
+            prev_feedback=feedback,
+            prev_graph=current_graph,
+        )
+        revised_graph = result.graph
+        heuristic_applied = []
+        if _same_graph(revised_graph, current_graph):
+            heuristic_mutation = _heuristic_revision_mutation(graph, profile, critic_feedback)
+            if heuristic_mutation:
+                candidate = graph.apply_mutation(heuristic_mutation)
+                ok, validation_message = candidate.validate()
+                if ok:
+                    revised_graph = candidate.to_dict()
+                    heuristic_applied.append(heuristic_mutation)
+                else:
+                    diagnostics.append(diagnose_runtime_error(validation_message, task_type=task_type, graph=candidate))
+        return {
+            "profile": profile,
+            "graph": revised_graph,
+            "mermaid": PipelineGraph.from_dict(revised_graph).to_mermaid(),
+            "analysis": "Architect drafted a revised graph from Critic feedback. It is not approved yet.",
+            "reasoning": result.reasoning or _revision_reasoning(critic_feedback, heuristic_applied, message),
+            "diagnostics": diagnostics + result.diagnostics,
+            "applied_mutations": heuristic_applied,
+            "requires_approval": True,
+            "tool_calls": [tc.to_dict() for tc in result.tool_calls],
+        }
+    except Exception as exc:
+        logger.exception("Architect revision proposal failed")
+        diagnostics.append(diagnose_runtime_error(exc, task_type=task_type, graph=graph))
+    finally:
+        await mcp_client.cleanup()
+
     return {
-        "profile": _profile_data(csv_path, target_column, task_type, forecast_length),
+        "profile": profile,
         "graph": graph.to_dict(),
         "mermaid": graph.to_mermaid(),
         "analysis": "Critic did not provide a valid structural mutation, so Architect kept the current graph as the draft.",
@@ -386,6 +457,60 @@ def _revision_reasoning(critic_feedback: Dict[str, Any], applied: list, message:
     if message:
         parts.append(f"User note: {message}")
     return "\n".join(parts)
+
+
+def _same_graph(left: Dict[str, Any], right: Dict[str, Any]) -> bool:
+    return json.dumps(left or {}, sort_keys=True) == json.dumps(right or {}, sort_keys=True)
+
+
+def _heuristic_revision_mutation(
+    graph: PipelineGraph,
+    profile: Dict[str, Any],
+    critic_feedback: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    if graph.task_type != "classification":
+        return None
+    root_id = graph.root_id()
+    root = next((node for node in graph.nodes if node.id == root_id), None)
+    if root is None:
+        return None
+    feedback_text = " ".join(
+        str(item)
+        for item in [
+            critic_feedback.get("assessment", ""),
+            *(critic_feedback.get("weaknesses", []) or []),
+            *(critic_feedback.get("improvement_plan", []) or []),
+        ]
+    ).lower()
+    wants_balance = profile.get("is_imbalanced") or "imbalance" in feedback_text or "class weight" in feedback_text
+    wants_regularization = "variance" in feedback_text or "regularization" in feedback_text
+
+    params: Dict[str, Any] = {}
+    if wants_balance:
+        try:
+            ratio = float(profile.get("imbalance_ratio") or 0)
+        except (TypeError, ValueError):
+            ratio = 0
+        weight = round(min(max(1.0 / ratio, 1.0), 20.0), 3) if ratio else 3.0
+        if root.operation == "xgboost":
+            params["scale_pos_weight"] = weight
+        elif root.operation in ("rf", "logit", "lgbm", "dt"):
+            params["class_weight"] = "balanced"
+            if root.operation == "logit":
+                params["max_iter"] = 1000
+
+    if wants_regularization:
+        params.update({
+            "xgboost": {"max_depth": 3, "learning_rate": 0.05, "n_estimators": 200},
+            "rf": {"max_depth": 8, "n_estimators": 300},
+            "logit": {"C": 0.5, "max_iter": 1000},
+            "lgbm": {"num_leaves": 31, "learning_rate": 0.05, "n_estimators": 200},
+            "dt": {"max_depth": 6},
+        }.get(root.operation, {}))
+
+    if params:
+        return {"type": "set_params", "node_id": root_id, "params": params}
+    return None
 
 
 def mutate_graph_locally(graph: Dict[str, Any], mutation: Dict[str, Any]) -> Dict[str, Any]:
@@ -412,6 +537,16 @@ def _get_best_iteration(all_results):
             best_score = score
             best = item
     return best or (all_results[-1] if all_results else {})
+
+
+def _engineer_summary(engineer_result: EngineerResult) -> str:
+    metric = engineer_result.graph_metrics.get("primary_metric") or "score"
+    value = engineer_result.graph_metrics.get("primary_metric_value", engineer_result.graph_score)
+    try:
+        value_text = f"{float(value):.4f}"
+    except (TypeError, ValueError):
+        value_text = str(value)
+    return f"{metric}: {value_text}; ranking score: {engineer_result.graph_score:.4f}"
 
 
 def _create_summary(all_results, task_type):

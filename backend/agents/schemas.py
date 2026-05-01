@@ -41,6 +41,7 @@ class DataContext:
     task_type: str
     profile: Dict[str, Any] = field(default_factory=dict)
     forecast_length: Optional[int] = None
+    primary_metric: Optional[str] = None
     iteration_history: List[IterationRecord] = field(default_factory=list)
 
     @property
@@ -71,7 +72,7 @@ class ArchitectResult:
 @dataclass
 class EngineerResult:
     graph_score: float = 0.0
-    graph_metrics: Dict[str, float] = field(default_factory=dict)
+    graph_metrics: Dict[str, Any] = field(default_factory=dict)
     tuned_nodes: List[Dict[str, Any]] = field(default_factory=list)
     graph_error: str = ""
     target_info: Dict[str, Any] = field(default_factory=dict)

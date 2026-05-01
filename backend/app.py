@@ -17,6 +17,7 @@ from graph_engine import (
     OPERATION_DESCRIPTIONS,
     SUPPORTED_TASKS,
     get_operation_catalog,
+    get_training_strategy_hints,
 )
 from orchestrator import (
     mutate_graph_locally,
@@ -82,6 +83,7 @@ async def get_config(request):
         "operations": OPERATIONS,
         "operation_catalog": {task: get_operation_catalog(task) for task in SUPPORTED_TASKS},
         "operation_descriptions": OPERATION_DESCRIPTIONS,
+        "training_strategy_hints": {task: get_training_strategy_hints(task) for task in SUPPORTED_TASKS},
         "default_graphs": DEFAULT_GRAPHS,
         "llm_configured": bool(os.getenv("LLM_API_KEY") or os.getenv("OPENROUTER_API_KEY") or LLM_BASE_URL),
         "openrouter_configured": "openrouter.ai" in LLM_BASE_URL and bool(os.getenv("OPENROUTER_API_KEY")),
@@ -110,6 +112,7 @@ async def architect_chat(request):
             message=payload.get("message", ""),
             current_graph=payload.get("current_graph"),
             forecast_length=payload.get("forecast_length"),
+            primary_metric=payload.get("primary_metric"),
         )
         if result.get("error"):
             return _error(result["error"], 400)
@@ -130,6 +133,7 @@ async def architect_revise(request):
             critic_feedback=payload.get("critic_feedback") or {},
             message=payload.get("message", ""),
             forecast_length=payload.get("forecast_length"),
+            primary_metric=payload.get("primary_metric"),
         )
         if result.get("error"):
             return _error(result["error"], 400)
@@ -158,6 +162,7 @@ async def orchestrate(request):
             iterations=int(payload.get("iterations", 1) or 1),
             initial_graph=payload.get("initial_graph"),
             forecast_length=payload.get("forecast_length"),
+            primary_metric=payload.get("primary_metric"),
         )
         return JSONResponse(result)
     except Exception as exc:
@@ -177,6 +182,7 @@ async def orchestrate_stream(request):
                 iterations=int(payload.get("iterations", 1) or 1),
                 initial_graph=payload.get("initial_graph"),
                 forecast_length=payload.get("forecast_length"),
+                primary_metric=payload.get("primary_metric"),
             ):
                 yield f"data: {json.dumps(evt, default=str, ensure_ascii=False)}\n\n"
         except Exception as exc:

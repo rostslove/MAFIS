@@ -205,11 +205,92 @@ OPERATION_DESCRIPTIONS: Dict[str, str] = {
 }
 
 
-def get_operation_catalog(task_type: str) -> Dict[str, List[Dict[str, str]]]:
+OPERATION_PARAM_HINTS: Dict[str, List[Dict[str, Any]]] = {
+    "xgboost": [
+        {
+            "name": "scale_pos_weight",
+            "when": "binary class imbalance",
+            "example": "majority_count / minority_count",
+        },
+        {"name": "max_depth", "when": "noticeable CV variance", "example": 3},
+        {"name": "learning_rate", "when": "noticeable CV variance", "example": 0.05},
+        {"name": "n_estimators", "when": "stable boosting with lower learning rate", "example": 200},
+    ],
+    "rf": [
+        {"name": "class_weight", "when": "class imbalance", "example": "balanced"},
+        {"name": "max_depth", "when": "overfitting or unstable CV", "example": 8},
+        {"name": "n_estimators", "when": "stabilize ensemble estimate", "example": 300},
+    ],
+    "logit": [
+        {"name": "class_weight", "when": "class imbalance", "example": "balanced"},
+        {"name": "C", "when": "regularization strength", "example": 0.5},
+        {"name": "max_iter", "when": "safer convergence", "example": 1000},
+    ],
+    "lgbm": [
+        {"name": "class_weight", "when": "class imbalance", "example": "balanced"},
+        {"name": "num_leaves", "when": "regularize leaf-wise growth", "example": 31},
+        {"name": "learning_rate", "when": "noticeable CV variance", "example": 0.05},
+        {"name": "n_estimators", "when": "stable boosting with lower learning rate", "example": 200},
+    ],
+    "dt": [
+        {"name": "class_weight", "when": "class imbalance", "example": "balanced"},
+        {"name": "max_depth", "when": "avoid overfitting", "example": 6},
+    ],
+    "ridge": [
+        {"name": "alpha", "when": "stronger regularization", "example": 2.0},
+    ],
+    "xgbreg": [
+        {"name": "max_depth", "when": "noticeable CV variance", "example": 3},
+        {"name": "learning_rate", "when": "noticeable CV variance", "example": 0.05},
+        {"name": "n_estimators", "when": "stable boosting with lower learning rate", "example": 200},
+    ],
+    "treg": [
+        {"name": "max_depth", "when": "avoid overfitting", "example": 8},
+        {"name": "n_estimators", "when": "stabilize ensemble estimate", "example": 300},
+    ],
+}
+
+
+TRAINING_STRATEGY_HINTS: Dict[str, List[Dict[str, Any]]] = {
+    "classification": [
+        {
+            "name": "imbalance_aware_quality",
+            "description": "For imbalanced classification, judge revisions by F1/precision as well as accuracy.",
+            "fedot_industrial_reference": "Custom ApiTemplate examples use learning_config.optimisation_loss.quality_loss='f1'.",
+        },
+        {
+            "name": "manual_params_over_tuner",
+            "description": "Classification tuner is intentionally avoided here; prefer explicit node params or model replacement.",
+            "fedot_industrial_reference": "Keeps the graph trainable while avoiding Fedot ROC-AUC tuner tracebacks.",
+        },
+        {
+            "name": "big_dataset_sampling",
+            "description": "For very large tabular datasets, Fedot.Industrial examples use strategy_params.learning_strategy='big_dataset' and sampling_strategy such as CUR.",
+            "fedot_industrial_reference": "examples/automl_example/custom_strategy/big_data/random_sampling_example.py",
+        },
+    ],
+    "regression": [
+        {
+            "name": "manual_params_or_tuner",
+            "description": "Regression graphs may be tuned by Fedot PipelineTuner; Critic can still propose explicit regularization params.",
+        },
+    ],
+}
+
+
+def get_training_strategy_hints(task_type: str) -> List[Dict[str, Any]]:
+    return TRAINING_STRATEGY_HINTS.get(task_type, [])
+
+
+def get_operation_catalog(task_type: str) -> Dict[str, List[Dict[str, Any]]]:
     ops = OPERATIONS.get(task_type, {})
     return {
         group: [
-            {"operation": name, "description": OPERATION_DESCRIPTIONS.get(name, "")}
+            {
+                "operation": name,
+                "description": OPERATION_DESCRIPTIONS.get(name, ""),
+                "param_hints": OPERATION_PARAM_HINTS.get(name, []),
+            }
             for name in names
         ]
         for group, names in ops.items()
@@ -606,33 +687,61 @@ def split_input_data(input_data: InputData, test_size: float = 0.2) -> Tuple[Inp
 
 # ============== Metrics ==============
 
-def compute_metrics(task_type: str, y_true, y_pred) -> Dict[str, float]:
-    """Compute standard metrics for the task. Returns {metric: value, primary_score: float}."""
+def compute_metrics(task_type: str, y_true, y_pred, primary_metric: Optional[str] = None) -> Dict[str, Any]:
+    """Compute metrics for the task.
+
+    ``primary_score`` is always higher-is-better. For regression losses such as
+    RMSE/MAE/MSE, the raw metric is reported unchanged and primary_score is the
+    negative loss so ranking still works consistently.
+    """
     from sklearn import metrics as skm
+    from sklearn.preprocessing import LabelEncoder
 
     y_true = np.asarray(y_true).flatten()
     y_pred = np.asarray(y_pred).flatten()
     n = min(len(y_true), len(y_pred))
     y_true, y_pred = y_true[:n], y_pred[:n]
 
-    out: Dict[str, float] = {}
+    out: Dict[str, Any] = {}
     try:
         if task_type in ("classification", "ts_classification"):
             out["accuracy"] = float(skm.accuracy_score(y_true, y_pred))
             out["f1"] = float(skm.f1_score(y_true, y_pred, average="weighted", zero_division=0))
             out["precision"] = float(skm.precision_score(y_true, y_pred, average="weighted", zero_division=0))
             try:
-                out["roc_auc"] = float(skm.roc_auc_score(y_true, y_pred))
+                encoder = LabelEncoder()
+                combined = np.concatenate([y_true.astype(str), y_pred.astype(str)])
+                encoder.fit(combined)
+                encoded_true = encoder.transform(y_true.astype(str))
+                encoded_pred = encoder.transform(y_pred.astype(str))
+                out["roc_auc"] = float(skm.roc_auc_score(encoded_true, encoded_pred))
             except Exception:
                 pass
-            out["primary_score"] = out.get("roc_auc", out["accuracy"])
+            selected = primary_metric if primary_metric in out else ("roc_auc" if "roc_auc" in out else "accuracy")
+            out["primary_score"] = out[selected]
         else:
             out["r2"] = float(skm.r2_score(y_true, y_pred))
             out["mse"] = float(skm.mean_squared_error(y_true, y_pred))
             out["rmse"] = float(np.sqrt(out["mse"]))
             out["mae"] = float(skm.mean_absolute_error(y_true, y_pred))
-            out["primary_score"] = out["r2"]
+            denom = np.where(np.abs(y_true) < 1e-12, np.nan, np.abs(y_true))
+            mape = np.nanmean(np.abs((y_true - y_pred) / denom)) * 100
+            if np.isfinite(mape):
+                out["mape"] = float(mape)
+            smape_denom = np.abs(y_true) + np.abs(y_pred)
+            smape_values = np.where(smape_denom < 1e-12, np.nan, 2 * np.abs(y_pred - y_true) / smape_denom)
+            smape = np.nanmean(smape_values) * 100
+            if np.isfinite(smape):
+                out["smape"] = float(smape)
+            selected = primary_metric if primary_metric in out else "r2"
+            out["primary_score"] = -out[selected] if selected in {"rmse", "mse", "mae", "mape", "smape"} else out[selected]
+        out["primary_metric"] = selected
+        out["primary_metric_value"] = out[selected]
+        out["primary_score_direction"] = "higher_is_better"
     except Exception as e:
         out["primary_score"] = 0.0
+        out["primary_metric"] = primary_metric or ""
+        out["primary_metric_value"] = 0.0
+        out["primary_score_direction"] = "higher_is_better"
         out["error"] = str(e)
     return out

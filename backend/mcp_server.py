@@ -25,7 +25,7 @@ from sklearn.preprocessing import LabelEncoder
 from data_profiler import DataProfiler
 from graph_engine import (
     OPERATIONS, METRICS_BY_TASK, SUPPORTED_TASKS, DEFAULT_GRAPHS,
-    PipelineGraph, compute_metrics, diagnose_runtime_error, get_operation_catalog, is_ts_task,
+    PipelineGraph, compute_metrics, diagnose_runtime_error, get_operation_catalog, get_training_strategy_hints, is_ts_task,
     load_input_data, split_input_data,
 )
 from path_utils import normalize_csv_path
@@ -198,6 +198,7 @@ def get_available_operations(task_type: str) -> str:
         "models": ops["models"],
         "catalog": get_operation_catalog(task_type),
         "metrics": METRICS_BY_TASK.get(task_type, []),
+        "training_strategies": get_training_strategy_hints(task_type),
         "default_graph": DEFAULT_GRAPHS.get(task_type, []),
     })
 
@@ -259,7 +260,13 @@ def visualize_graph(graph_json: str) -> str:
 # ================================================================
 
 @mcp.tool()
-def train_graph(graph_json: str, csv_path: str, target_column: str, forecast_length: Optional[int] = None) -> str:
+def train_graph(
+    graph_json: str,
+    csv_path: str,
+    target_column: str,
+    forecast_length: Optional[int] = None,
+    primary_metric: Optional[str] = None,
+) -> str:
     """Train a pipeline graph as-is on the data. Returns score and per-task metrics."""
     try:
         csv_path = normalize_csv_path(csv_path)
@@ -275,7 +282,7 @@ def train_graph(graph_json: str, csv_path: str, target_column: str, forecast_len
         pipeline.fit(train)
         preds = _predict_pipeline(pipeline, val, graph.task_type)
 
-        metrics = compute_metrics(graph.task_type, val.target, preds)
+        metrics = compute_metrics(graph.task_type, val.target, preds, primary_metric)
         _store_run(pipeline, graph, input_data, preds)
 
         target_info = _target_info(csv_path, target_column, graph.task_type)
@@ -306,6 +313,7 @@ def tune_graph_hyperparameters(
     target_column: str,
     iterations: int = 20,
     forecast_length: Optional[int] = None,
+    primary_metric: Optional[str] = None,
 ) -> str:
     """Tune node hyperparameters of a graph using Fedot's PipelineTuner. Returns tuned graph + score."""
     try:
@@ -353,7 +361,7 @@ def tune_graph_hyperparameters(
 
         pipeline.fit(train)
         preds = _predict_pipeline(pipeline, val, graph.task_type)
-        metrics = compute_metrics(graph.task_type, val.target, preds)
+        metrics = compute_metrics(graph.task_type, val.target, preds, primary_metric)
         _store_run(pipeline, graph, input_data, preds)
 
         # Extract tuned params back per node
@@ -385,7 +393,14 @@ def tune_graph_hyperparameters(
 
 
 @mcp.tool()
-def validate_graph(graph_json: str, csv_path: str, target_column: str, cv_folds: int = 3, forecast_length: Optional[int] = None) -> str:
+def validate_graph(
+    graph_json: str,
+    csv_path: str,
+    target_column: str,
+    cv_folds: int = 3,
+    forecast_length: Optional[int] = None,
+    primary_metric: Optional[str] = None,
+) -> str:
     """Cross-validate the graph. Returns mean & std of the primary metric across folds."""
     try:
         csv_path = normalize_csv_path(csv_path)
@@ -420,7 +435,7 @@ def validate_graph(graph_json: str, csv_path: str, target_column: str, cv_folds:
             pipeline = graph.to_fedot_pipeline()
             pipeline.fit(train)
             preds = _predict_pipeline(pipeline, val, graph.task_type)
-            m = compute_metrics(graph.task_type, val.target, preds)
+            m = compute_metrics(graph.task_type, val.target, preds, primary_metric)
             scores.append(m["primary_score"])
 
         return json.dumps({
@@ -428,6 +443,8 @@ def validate_graph(graph_json: str, csv_path: str, target_column: str, cv_folds:
             "score_std": float(np.std(scores)),
             "fold_scores": scores,
             "cv_folds": cv_folds,
+            "primary_metric": primary_metric,
+            "primary_score_direction": "higher_is_better",
         })
     except Exception as e:
         logger.exception("validate_graph failed")
@@ -440,7 +457,13 @@ def validate_graph(graph_json: str, csv_path: str, target_column: str, cv_folds:
 # ================================================================
 
 @mcp.tool()
-def get_node_importance(graph_json: str, csv_path: str, target_column: str, forecast_length: Optional[int] = None) -> str:
+def get_node_importance(
+    graph_json: str,
+    csv_path: str,
+    target_column: str,
+    forecast_length: Optional[int] = None,
+    primary_metric: Optional[str] = None,
+) -> str:
     """Estimate per-node importance via leave-one-out ablation (training-only, can be slow)."""
     try:
         csv_path = normalize_csv_path(csv_path)
@@ -455,6 +478,7 @@ def get_node_importance(graph_json: str, csv_path: str, target_column: str, fore
             graph.task_type,
             val.target,
             _predict_pipeline(full_pipe, val, graph.task_type),
+            primary_metric,
         )["primary_score"]
 
         importances: Dict[str, float] = {}
@@ -473,6 +497,7 @@ def get_node_importance(graph_json: str, csv_path: str, target_column: str, fore
                     graph.task_type,
                     val.target,
                     _predict_pipeline(pipe, val, graph.task_type),
+                    primary_metric,
                 )["primary_score"]
                 importances[node.id] = round(full_score - score, 4)
             except Exception as e:
@@ -527,9 +552,12 @@ def generate_report(evaluations_json: str) -> str:
         for it in iterations:
             eng = it.get("engineer", {})
             score = float(eng.get("graph_score", 0))
+            metrics = eng.get("graph_metrics", {}) or {}
             summaries.append({
                 "iteration": it.get("iteration", "?"),
                 "graph_score": score,
+                "primary_metric": metrics.get("primary_metric", ""),
+                "primary_metric_value": metrics.get("primary_metric_value", score),
                 "winner": it.get("critic", {}).get("winner", "?"),
                 "stop": it.get("critic", {}).get("should_stop", False),
             })

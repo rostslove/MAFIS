@@ -76,11 +76,20 @@ Return JSON only:
         if not summaries:
             return "No successful evaluation summaries were produced."
         lines = [
-            f"Evaluation {item.get('iteration')}: graph={item.get('graph_score', 0):.4f}, "
+            f"Evaluation {item.get('iteration')}: "
+            f"{item.get('primary_metric') or 'score'}={Scribe._fmt(item.get('primary_metric_value', item.get('graph_score', 0)))}, "
+            f"ranking_score={Scribe._fmt(item.get('graph_score', 0))}, "
             f"decision={item.get('winner', 'n/a')}"
             for item in summaries
         ]
         return "\n".join(lines)
+
+    @staticmethod
+    def _fmt(value: Any) -> str:
+        try:
+            return f"{float(value):.4f}"
+        except (TypeError, ValueError):
+            return str(value)
 
     @staticmethod
     def _default_recommendations(iterations: List[Dict[str, Any]]) -> List[str]:

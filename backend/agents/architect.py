@@ -61,7 +61,10 @@ Rules:
 - Use only operations listed in AVAILABLE_OPERATIONS.
 - If AVAILABLE_OPERATIONS.preprocessing is empty, do not add preprocessing nodes.
 - The graph must have exactly one root model node.
-- For ordinary tabular classification/regression, prefer one direct model node unless feedback explicitly asks for another valid model.
+- For ordinary tabular classification/regression, prefer one direct model node unless feedback explicitly asks for another valid model or explicit model parameters.
+- If feedback contains suggested_mutations, reflect them in the returned graph. Do not return the previous graph unchanged.
+- If feedback mentions class imbalance and param hints allow it, use explicit balancing params such as xgboost.scale_pos_weight or class_weight="balanced".
+- If feedback mentions unstable cross-validation, use a simpler model or explicit regularization params from param_hints.
 """
 
     def __init__(self, name: str = "Architect", mcp_client=None):
@@ -228,6 +231,7 @@ Rules:
             f"Task: {dc.task_type} (TS: {dc.is_time_series})\n"
             f"CSV: {dc.csv_path}\n"
             f"Target: {dc.target_column}\n"
+            f"Primary metric: {dc.primary_metric or 'default'}\n"
             f"Profile: {profile.get('n_samples')} samples x {profile.get('n_features')} features\n"
             f"Issues: {profile.get('issues', [])}\n"
         )
@@ -265,6 +269,7 @@ Rules:
             "is_time_series": dc.is_time_series,
             "csv_path": dc.csv_path,
             "target_column": dc.target_column,
+            "primary_metric": dc.primary_metric,
             "data_profile": profile,
             "available_operations": operations,
             "previous_graph": prev_graph,
@@ -276,9 +281,12 @@ Rules:
                 "assessment": prev_fb.assessment,
                 "weaknesses": prev_fb.weaknesses,
                 "suggested_mutations": prev_fb.suggested_mutations,
+                "improvement_plan": prev_fb.improvement_plan,
             }
         return (
             "Create one valid graph proposal for this payload.\n"
+            "Use available_operations.catalog[].param_hints when setting params.\n"
+            "Use available_operations.training_strategies as training guidance, but encode the actionable change in graph nodes/params.\n"
             "Return only the GraphProposal JSON object.\n"
             f"{json.dumps(payload, ensure_ascii=False)}"
         )
