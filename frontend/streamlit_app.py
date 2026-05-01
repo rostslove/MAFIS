@@ -1,5 +1,8 @@
 import json
 import os
+import copy
+import hashlib
+import io
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -76,8 +79,20 @@ def graph_to_dot(graph: Dict[str, Any]) -> str:
 
 
 def save_uploaded_csv(uploaded_file) -> str:
-    df = pd.read_csv(uploaded_file)
+    data = uploaded_file.getvalue()
+    signature = f"{uploaded_file.name}:{hashlib.sha256(data).hexdigest()}"
+    if (
+        st.session_state.get("uploaded_signature") == signature
+        and st.session_state.get("csv_path")
+        and "df" in st.session_state
+    ):
+        return st.session_state.csv_path
+
+    df = pd.read_csv(io.BytesIO(data))
     st.session_state.df = df
+    st.session_state.result = {}
+    st.session_state.evaluation_history = []
+    st.session_state.uploaded_signature = signature
     data_dir = shared_data_dir()
     filename = f"uploaded_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv"
     path = data_dir / filename
@@ -224,6 +239,47 @@ def format_number(value: Any) -> str:
         return f"{float(value):.4f}"
     except (TypeError, ValueError):
         return str(value)
+
+
+def latest_iteration(result: Dict[str, Any]) -> Dict[str, Any]:
+    for item in reversed((result or {}).get("iterations", [])):
+        if "error" not in item:
+            return item
+    return {}
+
+
+def result_label(result: Dict[str, Any]) -> str:
+    item = latest_iteration(result)
+    graph = item.get("architect", {}).get("graph", {}) if item else {}
+    rows = graph_rows(graph) if graph else []
+    if not rows:
+        return "evaluation"
+    model = next((row for row in rows if row["role"] == "model"), rows[-1])
+    params = "" if model["params"] == "-" else f" ({model['params']})"
+    return f"{model['operation']}{params}"
+
+
+def result_metric_value(result: Dict[str, Any]) -> tuple[str, Any]:
+    item = latest_iteration(result)
+    engineer = item.get("engineer", {}) if item else {}
+    metrics = engineer.get("test_metrics", {}) or engineer.get("graph_metrics", {}) or {}
+    metric = metrics.get("primary_metric") or result.get("primary_metric") or "score"
+    value = metrics.get("primary_metric_value", engineer.get("graph_score"))
+    return str(metric), value
+
+
+def archive_current_result(reason: str) -> None:
+    current = st.session_state.get("result")
+    if not current or not latest_iteration(current):
+        return
+    history = st.session_state.setdefault("evaluation_history", [])
+    history.insert(0, {
+        "saved_at": pd.Timestamp.now().strftime("%H:%M:%S"),
+        "reason": reason,
+        "label": result_label(current),
+        "result": copy.deepcopy(current),
+    })
+    del history[20:]
 
 
 def metric_rows(metrics: Dict[str, Any]) -> List[Dict[str, str]]:
@@ -402,6 +458,7 @@ def stream_run(payload: Dict[str, Any]) -> None:
             elif event_type == "error":
                 lines.append(f"ERROR: {event.get('message')}")
             elif event_type == "complete":
+                archive_current_result("Previous full evaluation")
                 st.session_state.result = event.get("result", {})
                 progress.progress(1.0)
                 lines.append("Run completed.")
@@ -699,13 +756,6 @@ def evaluation_panel() -> None:
             st.error(f"Run failed: {exc}")
 
 
-def latest_iteration(result: Dict[str, Any]) -> Dict[str, Any]:
-    for item in reversed(result.get("iterations", [])):
-        if "error" not in item:
-            return item
-    return {}
-
-
 def render_engineer_report(engineer: Dict[str, Any]) -> None:
     st.markdown("#### Engineer Report")
     target_info = engineer.get("target_info", {}) or {}
@@ -845,6 +895,8 @@ def request_engineer_tuning(iteration: Dict[str, Any], iterations: int) -> Dict[
     if result.get("error"):
         return result
 
+    archive_current_result("Before hyperparameter tuning")
+
     architect = iteration.setdefault("architect", {})
     tuned_graph = result.get("graph") or graph
     architect["graph"] = tuned_graph
@@ -902,6 +954,75 @@ def render_engineer_tuning_controls(iteration: Dict[str, Any]) -> None:
             st.error(f"Engineer tuning failed: {exc}")
 
 
+def _numeric_or_none(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def evaluation_summary_row(kind: str, result: Dict[str, Any], current_metric: str, current_value: Any) -> Dict[str, Any]:
+    item = latest_iteration(result)
+    engineer = item.get("engineer", {}) if item else {}
+    critic = item.get("critic", {}) if item else {}
+    metric, value = result_metric_value(result)
+    train_metrics = engineer.get("train_metrics", {}) or {}
+    train_value = train_metrics.get("primary_metric_value")
+    current_float = _numeric_or_none(current_value)
+    value_float = _numeric_or_none(value)
+    delta = ""
+    if kind != "current" and metric == current_metric and current_float is not None and value_float is not None:
+        delta = format_number(current_float - value_float)
+    return {
+        "kind": kind,
+        "graph": result_label(result),
+        "metric": metric,
+        "test value": format_number(value),
+        "train value": format_number(train_value) if train_value is not None else "",
+        "delta to current": delta,
+        "critic": critic.get("winner", ""),
+        "test_size": (engineer.get("split_info", {}) or {}).get("test_size", ""),
+    }
+
+
+def render_evaluation_history(current_result: Dict[str, Any]) -> None:
+    history = st.session_state.get("evaluation_history", []) or []
+    st.markdown("#### Evaluation History")
+    if not history:
+        st.caption("No previous evaluations yet. Run another approved graph to compare changes here.")
+        return
+
+    current_metric, current_value = result_metric_value(current_result)
+    rows = [evaluation_summary_row("current", current_result, current_metric, current_value)]
+    for entry in history:
+        row = evaluation_summary_row(entry.get("reason", "previous"), entry.get("result", {}), current_metric, current_value)
+        row["saved_at"] = entry.get("saved_at", "")
+        rows.append(row)
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    with st.expander("Inspect Previous Evaluation"):
+        options = [
+            f"{idx + 1}. {entry.get('saved_at', '')} - {entry.get('label', 'evaluation')}"
+            for idx, entry in enumerate(history)
+        ]
+        selected = st.selectbox("Previous run", options, key="history_selected_run")
+        selected_entry = history[options.index(selected)]
+        previous_result = selected_entry.get("result", {})
+        previous_item = latest_iteration(previous_result)
+        st.write(selected_entry.get("reason", "previous"))
+        render_graph(previous_item.get("architect", {}).get("graph", {}), show_details=False)
+        previous_engineer = previous_item.get("engineer", {}) or {}
+        render_split_info(previous_engineer.get("split_info", {}) or {})
+        train_col, test_col = st.columns(2)
+        with train_col:
+            render_metric_table("Previous train metrics", previous_engineer.get("train_metrics", {}) or {})
+        with test_col:
+            render_metric_table(
+                "Previous test metrics (hold-out)",
+                previous_engineer.get("test_metrics", {}) or previous_engineer.get("graph_metrics", {}) or {},
+            )
+
+
 def results_tab() -> None:
     st.subheader("Evaluation Result")
     result = st.session_state.get("result")
@@ -938,6 +1059,7 @@ def results_tab() -> None:
     render_engineer_tuning_controls(item)
     engineer = item.get("engineer", {})
     render_engineer_report(engineer)
+    render_evaluation_history(result)
     if engineer.get("tuned_nodes"):
         st.info("Critic feedback below is from the last full evaluation. Run Evaluate Approved Graph again to reassess the tuned parameters.")
     render_critic_feedback(critic)
