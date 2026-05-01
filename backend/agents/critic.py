@@ -2,7 +2,7 @@
 
 import json
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .base_agent import BaseAgent, extract_json_block
 from .schemas import ArchitectResult, CriticFeedback, DataContext, EngineerResult
@@ -158,8 +158,8 @@ Return JSON only."""
         context = f"""Task: {dc.task_type}
 Profile: {json.dumps(dc.profile, ensure_ascii=False)}
 Graph: {json.dumps(graph, ensure_ascii=False)}
-Graph score: {engineer.graph_score}
-Graph metrics: {json.dumps(engineer.graph_metrics, ensure_ascii=False)}
+Test ranking score: {engineer.graph_score}
+Test metrics: {json.dumps(engineer.graph_metrics, ensure_ascii=False)}
 Validation: {json.dumps(validation, ensure_ascii=False)}
 Initial assessment: {initial.assessment}
 Allowed operations are constrained by the graph task type. Suggest at most 2 concrete mutations.
@@ -184,8 +184,8 @@ Return JSON only."""
         issues = dc.profile.get("issues", [])
         issue_text = f" Data issues: {issues}." if issues and issues != ["none"] else ""
         return (
-            f"Graph {metric}={metric_value_text}; ranking score={engineer.graph_score:.4f}{cv}. "
-            f"Assessment is based on graph metrics, validation stability, node behavior, and data profile."
+            f"Test {metric}={metric_value_text}; test ranking score={engineer.graph_score:.4f}{cv}. "
+            f"Assessment is based on test metrics, validation stability, node behavior, and data profile."
             f"{issue_text}"
         )
 
@@ -212,9 +212,9 @@ Return JSON only."""
             weaknesses.extend(Critic._diagnostic_recommendations(engineer.diagnostics))
             return weaknesses
         if engineer.graph_score <= 0:
-            weaknesses.append("The graph score is zero or unavailable")
+            weaknesses.append("The test graph score is zero or unavailable")
         if engineer.graph_score < Critic._target_quality_floor(dc.task_type, dc.primary_metric):
-            weaknesses.append("The graph metric is below the target quality floor for this task")
+            weaknesses.append("The test graph metric is below the target quality floor for this task")
         if dc.task_type in ("classification", "ts_classification"):
             f1 = engineer.graph_metrics.get("f1")
             if isinstance(f1, (int, float)) and f1 < 0.70:
@@ -240,17 +240,18 @@ Return JSON only."""
             for mutation in diagnostic.get("suggested_mutations", []) or []:
                 if isinstance(mutation, dict):
                     mutations.append(mutation)
-        if mutations:
-            return mutations[:2]
 
         current_root = next((n for n in nodes if n.get("id") == root_id), {})
         current_operation = current_root.get("operation", "")
+        existing_ops = {n.get("operation") for n in nodes}
 
         score_floor = self._target_quality_floor(dc.task_type, dc.primary_metric)
         f1 = engineer.graph_metrics.get("f1")
         low_f1 = isinstance(f1, (int, float)) and f1 < 0.70
         unstable = validation.get("score_std", 0) > 0.1
         noticeable_variance = validation.get("score_std", 0) > 0.05
+        train_test_gap = self._train_test_gap(engineer)
+        overfitting = train_test_gap is not None and train_test_gap > 0.1
 
         if dc.task_type == "classification" and (dc.profile.get("is_imbalanced") or low_f1):
             mutation = self._classification_balance_mutation(root_id, current_operation, dc.profile)
@@ -258,14 +259,39 @@ Return JSON only."""
                 mutations = self._merge_set_params_mutation(mutations, mutation)
 
         if engineer.graph_score < score_floor or unstable:
-            candidate = self._next_model_candidate(dc.task_type, current_operation)
+            candidate = self._next_model_candidate(
+                dc.task_type, current_operation, history=dc.iteration_history
+            )
             if candidate:
                 mutations.append({"type": "replace", "node_id": root_id, "new_operation": candidate})
 
-        if noticeable_variance:
+        if noticeable_variance or overfitting:
             mutation = self._regularization_mutation(root_id, current_operation)
             if mutation:
                 mutations = self._merge_set_params_mutation(mutations, mutation)
+
+        # Meta-feature driven additions: scaling and PCA when profile flags them.
+        feature_stats = dc.profile.get("feature_stats", {}) or {}
+        if (
+            feature_stats.get("mean_std_ratio", 0) > 3
+            and "scaling" not in existing_ops
+            and not dc.task_type.startswith("ts_")
+        ):
+            mutations.append({
+                "type": "add",
+                "node": {"id": "scale_auto", "operation": "scaling", "params": {}, "inputs": []},
+                "rewire_input_of": root_id,
+            })
+        if (
+            dc.profile.get("issues") and "high_dimensionality" in " ".join(dc.profile.get("issues", []))
+            and "pca" not in existing_ops
+            and not dc.task_type.startswith("ts_")
+        ):
+            mutations.append({
+                "type": "add",
+                "node": {"id": "pca_auto", "operation": "pca", "params": {}, "inputs": []},
+                "rewire_input_of": root_id,
+            })
 
         if dc.task_type.startswith("ts_") and not any("fourier" in n.get("operation", "") for n in nodes):
             mutations.append(
@@ -276,7 +302,48 @@ Return JSON only."""
                 }
             )
 
-        return mutations[:2]
+        mutations = self._dedupe_mutations(mutations, current_root, dc.iteration_history)
+        return mutations[:3]
+
+    @staticmethod
+    def _train_test_gap(engineer: EngineerResult) -> Optional[float]:
+        try:
+            train = float(engineer.train_metrics.get("primary_score"))
+            test = float(engineer.test_metrics.get("primary_score"))
+        except (TypeError, ValueError):
+            return None
+        return train - test
+
+    @staticmethod
+    def _dedupe_mutations(
+        mutations: List[Dict[str, Any]],
+        current_root: Dict[str, Any],
+        history: List[Any],
+    ) -> List[Dict[str, Any]]:
+        """Drop set_params whose params are already on the node and replaces that
+        match the current op or that the system already tried in earlier iterations."""
+        current_params = current_root.get("params", {}) or {}
+        current_op = current_root.get("operation", "")
+        tried_ops = {current_op}
+        for record in history or []:
+            for node in (getattr(record, "graph", {}) or {}).get("nodes", []):
+                if node.get("id") == current_root.get("id"):
+                    tried_ops.add(node.get("operation", ""))
+
+        cleaned: List[Dict[str, Any]] = []
+        for mutation in mutations:
+            kind = mutation.get("type")
+            if kind == "set_params" and mutation.get("node_id") == current_root.get("id"):
+                new_params = mutation.get("params", {}) or {}
+                fresh = {k: v for k, v in new_params.items() if current_params.get(k) != v}
+                if not fresh:
+                    continue
+                mutation = {**mutation, "params": fresh}
+            elif kind == "replace" and mutation.get("node_id") == current_root.get("id"):
+                if mutation.get("new_operation") in tried_ops:
+                    continue
+            cleaned.append(mutation)
+        return cleaned
 
     def _build_improvement_plan(
         self,
@@ -295,7 +362,7 @@ Return JSON only."""
         quality_floor = self._target_quality_floor(dc.task_type, dc.primary_metric)
         if engineer.graph_score < quality_floor:
             plan.append(
-                f"The graph score is below the standalone target floor for {dc.task_type} "
+                f"The test graph score is below the standalone target floor for {dc.task_type} "
                 f"({engineer.graph_score:.4f} < {quality_floor:.2f})."
             )
         else:
@@ -434,14 +501,18 @@ Return JSON only."""
         }.get(task_type, 0.0)
 
     @staticmethod
-    def _next_model_candidate(task_type: str, current: str) -> str:
+    def _next_model_candidate(task_type: str, current: str, history: List[Any] = None) -> str:
         candidates = {
-            "classification": ["xgboost", "rf", "logit"],
-            "regression": ["xgbreg", "treg", "ridge"],
+            "classification": ["xgboost", "rf", "lgbm", "logit", "knn", "dt"],
+            "regression": ["xgbreg", "treg", "ridge", "lasso", "knnreg"],
             "ts_classification": ["industrial_freq_clf", "industrial_stat_clf"],
             "ts_regression": ["industrial_freq_reg", "industrial_stat_reg"],
         }.get(task_type, [])
-        return next((candidate for candidate in candidates if candidate != current), "")
+        tried = {current}
+        for record in history or []:
+            for node in (getattr(record, "graph", {}) or {}).get("nodes", []):
+                tried.add(node.get("operation", ""))
+        return next((candidate for candidate in candidates if candidate not in tried), "")
 
     @staticmethod
     def _should_stop(engineer: EngineerResult, feedback: CriticFeedback, validation: Dict[str, Any], task_type: str) -> bool:

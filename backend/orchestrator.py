@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 from typing import Any, AsyncGenerator, Dict, Optional
@@ -51,6 +52,7 @@ async def run_orchestration_stream(
     initial_fedot_config: Optional[Dict[str, Any]] = None,
     forecast_length: Optional[int] = None,
     primary_metric: Optional[str] = None,
+    test_size: float = 0.2,
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """Evaluate one user-approved graph and yield SSE-friendly events."""
     del fedot_url, initial_fedot_config
@@ -78,11 +80,13 @@ async def run_orchestration_stream(
         profile=profile,
         forecast_length=forecast_length,
         primary_metric=primary_metric,
+        test_size=test_size,
     )
     yield _event(
         "status",
         message=f"Data profiled: {profile.get('n_samples')} samples, {profile.get('n_features')} numeric features",
     )
+    yield _event("status", message=f"Train/test split: test_size={test_size:.2f}")
     if primary_metric:
         yield _event("status", message=f"Primary metric: {primary_metric}")
 
@@ -250,6 +254,7 @@ async def run_orchestration(
     initial_fedot_config: Optional[Dict[str, Any]] = None,
     forecast_length: Optional[int] = None,
     primary_metric: Optional[str] = None,
+    test_size: float = 0.2,
 ) -> Dict[str, Any]:
     """Collect streaming events and return the final result."""
     final_result: Dict[str, Any] = {"status": "failed", "error": "No result"}
@@ -263,6 +268,7 @@ async def run_orchestration(
         initial_fedot_config=initial_fedot_config,
         forecast_length=forecast_length,
         primary_metric=primary_metric,
+        test_size=test_size,
     ):
         if evt.get("event") == "complete":
             final_result = evt.get("result", final_result)
@@ -320,6 +326,37 @@ async def propose_architecture(
             "diagnostics": result.diagnostics,
             "tool_calls": [tc.to_dict() for tc in result.tool_calls],
         }
+    finally:
+        await mcp_client.cleanup()
+
+
+async def tune_approved_graph(
+    csv_path: str,
+    target_column: str,
+    task_type: str,
+    graph: Dict[str, Any],
+    forecast_length: Optional[int] = None,
+    primary_metric: Optional[str] = None,
+    test_size: float = 0.2,
+    iterations: int = 30,
+) -> Dict[str, Any]:
+    """Thin wrapper around the MCP `tune_graph_hyperparameters` tool."""
+    csv_path = normalize_csv_path(csv_path)
+    args: Dict[str, Any] = {
+        "graph_json": json.dumps(graph, ensure_ascii=False),
+        "csv_path": csv_path,
+        "target_column": target_column,
+        "iterations": iterations,
+        "test_size": test_size,
+    }
+    if primary_metric:
+        args["primary_metric"] = primary_metric
+    if forecast_length:
+        args["forecast_length"] = forecast_length
+
+    mcp_client = await _connect_mcp()
+    try:
+        return await mcp_client.call_tool("tune_graph_hyperparameters", args)
     finally:
         await mcp_client.cleanup()
 

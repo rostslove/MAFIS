@@ -25,6 +25,7 @@ from orchestrator import (
     propose_revision_from_critic,
     run_orchestration,
     run_orchestration_stream,
+    tune_approved_graph,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -153,6 +154,14 @@ async def graph_mutate(request):
         return _error(str(exc), 400)
 
 
+def _payload_test_size(payload: Dict[str, Any]) -> float:
+    try:
+        ts = float(payload.get("test_size", 0.2))
+    except (TypeError, ValueError):
+        ts = 0.2
+    return min(max(ts, 0.05), 0.5)
+
+
 async def orchestrate(request):
     payload = await _json_body(request)
     try:
@@ -164,10 +173,30 @@ async def orchestrate(request):
             initial_graph=payload.get("initial_graph"),
             forecast_length=payload.get("forecast_length"),
             primary_metric=payload.get("primary_metric"),
+            test_size=_payload_test_size(payload),
         )
         return JSONResponse(result)
     except Exception as exc:
         logger.exception("Orchestration failed")
+        return _error(str(exc), 500)
+
+
+async def engineer_tune(request):
+    payload = await _json_body(request)
+    try:
+        result = await tune_approved_graph(
+            csv_path=payload.get("csv_path", ""),
+            target_column=payload.get("target_column", ""),
+            task_type=payload.get("task_type", "classification"),
+            graph=payload.get("graph") or {},
+            forecast_length=payload.get("forecast_length"),
+            primary_metric=payload.get("primary_metric"),
+            test_size=_payload_test_size(payload),
+            iterations=int(payload.get("iterations", 30) or 30),
+        )
+        return JSONResponse(result)
+    except Exception as exc:
+        logger.exception("Engineer tuning failed")
         return _error(str(exc), 500)
 
 
@@ -184,6 +213,7 @@ async def orchestrate_stream(request):
                 initial_graph=payload.get("initial_graph"),
                 forecast_length=payload.get("forecast_length"),
                 primary_metric=payload.get("primary_metric"),
+                test_size=_payload_test_size(payload),
             ):
                 yield f"data: {json.dumps(evt, default=str, ensure_ascii=False)}\n\n"
         except Exception as exc:
@@ -211,6 +241,7 @@ routes = [
     Route("/graph/mutate", graph_mutate, methods=["POST"]),
     Route("/orchestrate", orchestrate, methods=["POST"]),
     Route("/orchestrate/stream", orchestrate_stream, methods=["POST"]),
+    Route("/engineer/tune", engineer_tune, methods=["POST"]),
 ]
 
 app = Starlette(debug=False, routes=routes)

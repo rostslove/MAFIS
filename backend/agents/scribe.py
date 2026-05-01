@@ -48,7 +48,7 @@ Return JSON only:
 
             report.title = llm_report.get("title") or f"GraphAutoML report: {data_context.task_type}"
             report.summary = llm_report.get("summary") or (
-                f"Completed {n_evaluations} approved graph evaluation(s). Best graph score: {best_score:.4f}."
+                f"Completed {n_evaluations} approved graph evaluation(s). Best test score: {best_score:.4f}."
             )
             report.methodology = llm_report.get("methodology") or (
                 "Architect prepared a graph, Engineer trained the approved graph, "

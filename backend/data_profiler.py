@@ -51,12 +51,49 @@ class DataProfiler:
         mean_of_means = float(np.nanmean(np.abs(mean_values))) if mean_values.size > 0 else 0
         mean_std_ratio = float(np.nanmean(std_values) / mean_of_means) if mean_of_means != 0 else 0
 
-        profile["feature_stats"] = {
+        feature_stats = {
             "numeric_count": n_features,
             "mean_std_ratio": round(mean_std_ratio, 3),
             "has_missing": bool(has_missing),
             "missing_ratio": round(missing_ratio, 4),
         }
+
+        if X_arr.size > 0 and n_features > 0:
+            with np.errstate(invalid="ignore", divide="ignore"):
+                centered = X_arr - mean_values
+                std_safe = np.where(std_values > 0, std_values, 1.0)
+                z = centered / std_safe
+                skew = np.nanmean(z ** 3, axis=0)
+                kurt = np.nanmean(z ** 4, axis=0) - 3
+            feature_stats["skewness_median"] = round(float(np.nanmedian(np.abs(skew))), 3)
+            feature_stats["kurtosis_median"] = round(float(np.nanmedian(kurt)), 3)
+
+            try:
+                outlier_mask = np.abs(z) > 3
+                feature_stats["outlier_ratio"] = round(float(np.nanmean(outlier_mask)), 4)
+            except Exception:
+                feature_stats["outlier_ratio"] = 0.0
+
+            if n_features > 1 and n_samples > 1:
+                try:
+                    sample = X_arr if n_samples <= 5000 else X_arr[np.random.default_rng(0).choice(n_samples, 5000, replace=False)]
+                    corr = np.corrcoef(sample, rowvar=False)
+                    abs_corr = np.abs(corr)
+                    np.fill_diagonal(abs_corr, np.nan)
+                    feature_stats["max_abs_correlation"] = round(float(np.nanmax(abs_corr)), 3)
+                    feature_stats["mean_abs_correlation"] = round(float(np.nanmean(abs_corr)), 3)
+                except Exception:
+                    pass
+
+        if isinstance(X, pd.DataFrame):
+            non_numeric = X.select_dtypes(exclude=[np.number])
+            if not non_numeric.empty:
+                cardinalities = {col: int(non_numeric[col].nunique()) for col in non_numeric.columns}
+                feature_stats["categorical_count"] = len(cardinalities)
+                feature_stats["max_categorical_cardinality"] = max(cardinalities.values()) if cardinalities else 0
+                feature_stats["high_cardinality_categoricals"] = sum(1 for c in cardinalities.values() if c > 50)
+
+        profile["feature_stats"] = feature_stats
 
         # Target statistics
         if y_arr is not None:
@@ -98,6 +135,14 @@ class DataProfiler:
             issues.append("large_dataset")
         if n_features > n_samples:
             issues.append("high_dimensionality")
+        if profile.get("feature_stats", {}).get("skewness_median", 0) > 1.5:
+            issues.append("skewed_features")
+        if profile.get("feature_stats", {}).get("max_abs_correlation", 0) > 0.95:
+            issues.append("multicollinearity")
+        if profile.get("feature_stats", {}).get("high_cardinality_categoricals", 0) > 0:
+            issues.append("high_cardinality_categoricals")
+        if profile.get("feature_stats", {}).get("outlier_ratio", 0) > 0.05:
+            issues.append("frequent_outliers")
 
         profile["issues"] = issues if issues else ["none"]
         profile["recommendations"] = DataProfiler._generate_recommendations(profile)
@@ -127,6 +172,14 @@ class DataProfiler:
                 recommendations.append("Consider sampling or distributed training")
             if "high_dimensionality" in issue:
                 recommendations.append("Apply PCA or feature selection")
+            if "skewed_features" in issue:
+                recommendations.append("Apply log/Box-Cox transform or use tree-based models")
+            if "multicollinearity" in issue:
+                recommendations.append("Drop correlated features or use regularized models (ridge/lasso)")
+            if "high_cardinality_categoricals" in issue:
+                recommendations.append("Use target/frequency encoding for high-cardinality categoricals")
+            if "frequent_outliers" in issue:
+                recommendations.append("Use RobustScaler or tree-based models tolerant to outliers")
 
         if profile.get("sample_feature_ratio", 0) < 10:
             recommendations.append("Low sample-to-feature ratio: prefer simpler models")

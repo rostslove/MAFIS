@@ -19,6 +19,13 @@ DEFAULT_METRICS_BY_TASK = {
     "ts_regression": ["r2", "rmse", "mae"],
     "ts_forecasting": ["rmse", "mae", "mape", "smape"],
 }
+METRIC_METADATA_KEYS = {
+    "error",
+    "primary_metric",
+    "primary_metric_value",
+    "primary_score",
+    "primary_score_direction",
+}
 
 
 def shared_data_dir() -> Path:
@@ -85,6 +92,7 @@ def current_payload(extra: Dict[str, Any] | None = None) -> Dict[str, Any]:
         "target_column": st.session_state.get("target_column", ""),
         "task_type": st.session_state.get("task_type", "classification"),
         "primary_metric": st.session_state.get("primary_metric", ""),
+        "test_size": float(st.session_state.get("test_size", 0.2)),
     }
     if st.session_state.get("forecast_length"):
         payload["forecast_length"] = int(st.session_state.forecast_length)
@@ -218,6 +226,47 @@ def format_number(value: Any) -> str:
         return str(value)
 
 
+def metric_rows(metrics: Dict[str, Any]) -> List[Dict[str, str]]:
+    return [
+        {"metric": key, "value": format_number(value)}
+        for key, value in (metrics or {}).items()
+        if key not in METRIC_METADATA_KEYS and value is not None
+    ]
+
+
+def render_metric_table(title: str, metrics: Dict[str, Any]) -> None:
+    st.write(title)
+    if not metrics:
+        st.caption("No metrics returned for this split.")
+        return
+
+    primary_metric = metrics.get("primary_metric")
+    primary_value = metrics.get("primary_metric_value")
+    if primary_metric and primary_value is not None:
+        st.caption(f"Primary metric: {primary_metric} = {format_number(primary_value)}")
+
+    rows = metric_rows(metrics)
+    if rows:
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    else:
+        st.caption("No displayable metric values.")
+
+
+def render_split_info(split_info: Dict[str, Any]) -> None:
+    if not split_info:
+        return
+    test_size = split_info.get("test_size")
+    parts = []
+    if split_info.get("n_train") is not None:
+        parts.append(f"train rows: {split_info['n_train']}")
+    if split_info.get("n_test") is not None:
+        parts.append(f"test rows: {split_info['n_test']}")
+    if test_size is not None:
+        parts.append(f"test_size: {format_number(test_size)}")
+    if parts:
+        st.caption("Hold-out split - " + ", ".join(parts))
+
+
 def graph_rows(graph: Dict[str, Any]) -> List[Dict[str, str]]:
     root_id = root_node_id(graph)
     rows = []
@@ -341,7 +390,7 @@ def stream_run(payload: Dict[str, Any]) -> None:
                 primary_metric = event.get("primary_metric") or "score"
                 primary_value = event.get("primary_metric_value", event.get("graph_score", 0))
                 lines.append(
-                    f"Evaluation done: {primary_metric}={format_number(primary_value)}, "
+                    f"Evaluation done: test {primary_metric}={format_number(primary_value)}, "
                     f"critic decision={event.get('winner')}"
                 )
                 if event.get("graph"):
@@ -395,6 +444,15 @@ def sidebar(config: Dict[str, Any]) -> None:
                 st.session_state.forecast_length = st.number_input("Forecast length", min_value=1, value=14)
             else:
                 st.session_state.forecast_length = None
+
+            st.session_state.test_size = st.slider(
+                "Test size (hold-out split)",
+                min_value=0.05,
+                max_value=0.5,
+                value=float(st.session_state.get("test_size", 0.2)),
+                step=0.05,
+                help="Share of the dataset reserved for the test split. Train metrics and test metrics are reported separately.",
+            )
 
         st.divider()
         st.caption(f"Backend: {BACKEND_URL}")
@@ -679,18 +737,33 @@ def render_engineer_report(engineer: Dict[str, Any]) -> None:
     if engineer.get("graph_error"):
         st.error(engineer["graph_error"])
 
-    metrics = engineer.get("graph_metrics", {}) or {}
-    if metrics:
-        primary_metric = metrics.get("primary_metric", "")
-        if primary_metric:
-            st.write(f"Primary metric: `{primary_metric}`")
-        metric_rows = [
-            {"metric": k, "value": v}
-            for k, v in metrics.items()
-            if k not in {"error", "primary_metric", "primary_metric_value", "primary_score_direction"}
+    render_split_info(engineer.get("split_info", {}) or {})
+
+    train_metrics = engineer.get("train_metrics", {}) or {}
+    test_metrics = engineer.get("test_metrics", {}) or {}
+    if train_metrics or test_metrics:
+        train_col, test_col = st.columns(2)
+        with train_col:
+            render_metric_table("Train metrics", train_metrics)
+        with test_col:
+            render_metric_table("Test metrics (hold-out)", test_metrics)
+    else:
+        metrics = engineer.get("graph_metrics", {}) or {}
+        if metrics:
+            render_metric_table("Test metrics (hold-out)", metrics)
+
+    tuned_nodes = engineer.get("tuned_nodes", []) or []
+    if tuned_nodes:
+        st.write("Tuned hyperparameters")
+        rows = [
+            {
+                "node": node.get("id", ""),
+                "operation": node.get("operation", ""),
+                "params": format_params(node.get("tuned_params", {}) or {}),
+            }
+            for node in tuned_nodes
         ]
-        st.write("Graph metrics")
-        st.dataframe(pd.DataFrame(metric_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
     render_diagnostics(engineer.get("diagnostics", []), "Engineer diagnostics", use_expander=False)
 
@@ -717,7 +790,7 @@ def render_critic_feedback(critic: Dict[str, Any]) -> None:
             st.write(f"- {item}")
     if critic.get("suggested_mutations"):
         st.write(
-            "Concrete mutations for Architect (alternatives — pick the ones you want applied; "
+            "Concrete mutations for Architect (alternatives - pick the ones you want applied; "
             "combining incompatible ones may produce an invalid graph)"
         )
         rows = mutation_rows(critic["suggested_mutations"])
@@ -726,7 +799,7 @@ def render_critic_feedback(critic: Dict[str, Any]) -> None:
             if row.get("target"):
                 label += f" -> `{row['target']}`"
             if row.get("details"):
-                label += f" — {row['details']}"
+                label += f" - {row['details']}"
             st.checkbox(label, value=(idx == 0), key=f"critic_mut_{idx}")
 
     render_diagnostics(critic.get("diagnostics", []), "Critic diagnostics", use_expander=False)
@@ -763,6 +836,72 @@ def request_architect_revision(iteration: Dict[str, Any], message: str = "") -> 
         st.success("Architect prepared a new draft (no mutations selected; LLM-driven revision). Approve it to make it the active pipeline.")
 
 
+def request_engineer_tuning(iteration: Dict[str, Any], iterations: int) -> Dict[str, Any]:
+    graph = st.session_state.get("approved_graph") or iteration.get("architect", {}).get("graph", {})
+    payload = current_payload({"graph": graph, "iterations": int(iterations)})
+    result = post_json("/engineer/tune", payload, timeout=1800)
+    st.session_state.tune_last_result = result
+
+    if result.get("error"):
+        return result
+
+    architect = iteration.setdefault("architect", {})
+    tuned_graph = result.get("graph") or graph
+    architect["graph"] = tuned_graph
+    st.session_state.graph = tuned_graph
+    st.session_state.approved_graph = tuned_graph
+    st.session_state.graph_approved = True
+
+    previous = iteration.get("engineer", {}) or {}
+    metrics = result.get("metrics", {}) or {}
+    iteration["engineer"] = {
+        **previous,
+        "graph_score": result.get("score", metrics.get("primary_score", previous.get("graph_score", 0))),
+        "graph_metrics": metrics,
+        "train_metrics": result.get("train_metrics", {}) or {},
+        "test_metrics": result.get("test_metrics", {}) or metrics,
+        "split_info": result.get("split_info", {}) or {},
+        "tuned_nodes": result.get("tuned_nodes", []) or [],
+        "graph_error": result.get("error", "") or "",
+        "target_info": result.get("target_info", {}) or previous.get("target_info", {}),
+        "training_notes": result.get("training_notes", []) or previous.get("training_notes", []),
+        "diagnostics": result.get("diagnostics", []) or [],
+        "tool_calls": previous.get("tool_calls", []),
+    }
+    return result
+
+
+def render_engineer_tuning_controls(iteration: Dict[str, Any]) -> None:
+    st.markdown("#### Engineer Tuning")
+    st.caption(
+        "Runs the existing MCP `tune_graph_hyperparameters` tool on the approved graph, "
+        "then recalculates train and hold-out test metrics with the selected split."
+    )
+    tune_cols = st.columns([1, 2])
+    iterations = tune_cols[0].number_input(
+        "Tuning iterations",
+        min_value=1,
+        max_value=100,
+        value=int(st.session_state.get("tune_iterations", 30)),
+        step=5,
+        key="tune_iterations",
+    )
+    if tune_cols[1].button("Tune Approved Graph", use_container_width=True, key="engineer_tune_approved"):
+        try:
+            with st.spinner("Engineer is tuning the approved graph..."):
+                result = request_engineer_tuning(iteration, int(iterations))
+            if result.get("error"):
+                st.warning(result.get("error"))
+                render_diagnostics(result.get("diagnostics", []) or [], "Tuning diagnostics", use_expander=False)
+            else:
+                st.session_state.tune_success_message = (
+                    "Tuning completed. Metrics were recalculated on train and test splits."
+                )
+                st.rerun()
+        except Exception as exc:
+            st.error(f"Engineer tuning failed: {exc}")
+
+
 def results_tab() -> None:
     st.subheader("Evaluation Result")
     result = st.session_state.get("result")
@@ -775,22 +914,32 @@ def results_tab() -> None:
         st.error("No successful evaluation found.")
         return
 
+    tune_message = st.session_state.get("tune_success_message", "")
+    if tune_message:
+        del st.session_state["tune_success_message"]
+    if tune_message:
+        st.success(tune_message)
+
     engineer = item.get("engineer", {})
     critic = item.get("critic", {})
 
-    metrics = engineer.get("graph_metrics", {}) or {}
+    metrics = engineer.get("test_metrics", {}) or engineer.get("graph_metrics", {}) or {}
     primary_metric = metrics.get("primary_metric") or result.get("primary_metric") or "score"
     primary_value = metrics.get("primary_metric_value", engineer.get("graph_score", 0))
 
     col1, col2, col3 = st.columns(3)
-    col1.metric(str(primary_metric), format_number(primary_value))
+    col1.metric(f"Test {primary_metric}", format_number(primary_value))
     col2.metric("Critic decision", critic.get("winner", ""))
     col3.metric("Suggested changes", len(critic.get("suggested_mutations", []) or []))
 
     st.markdown("#### Evaluated Graph")
     render_graph(item.get("architect", {}).get("graph", {}), show_details=False)
 
+    render_engineer_tuning_controls(item)
+    engineer = item.get("engineer", {})
     render_engineer_report(engineer)
+    if engineer.get("tuned_nodes"):
+        st.info("Critic feedback below is from the last full evaluation. Run Evaluate Approved Graph again to reassess the tuned parameters.")
     render_critic_feedback(critic)
 
     st.markdown("#### Next Pipeline Decision")

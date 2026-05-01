@@ -266,8 +266,9 @@ def train_graph(
     target_column: str,
     forecast_length: Optional[int] = None,
     primary_metric: Optional[str] = None,
+    test_size: float = 0.2,
 ) -> str:
-    """Train a pipeline graph as-is on the data. Returns score and per-task metrics."""
+    """Train a pipeline graph as-is on the data. Returns score and per-task metrics on the held-out test split."""
     try:
         csv_path = normalize_csv_path(csv_path)
         graph = PipelineGraph.from_dict(json.loads(graph_json))
@@ -275,15 +276,20 @@ def train_graph(
         if not ok:
             return json.dumps(_invalid_graph_payload(msg, graph))
 
+        ts = float(test_size) if test_size is not None else 0.2
+        ts = min(max(ts, 0.05), 0.5)
+
         input_data = load_input_data(csv_path, target_column, graph.task_type, forecast_length)
-        train, val = split_input_data(input_data)
+        train, val = split_input_data(input_data, test_size=ts)
 
         pipeline = graph.to_fedot_pipeline()
         pipeline.fit(train)
-        preds = _predict_pipeline(pipeline, val, graph.task_type)
+        train_preds = _predict_pipeline(pipeline, train, graph.task_type)
+        test_preds = _predict_pipeline(pipeline, val, graph.task_type)
 
-        metrics = compute_metrics(graph.task_type, val.target, preds, primary_metric)
-        _store_run(pipeline, graph, input_data, preds)
+        train_metrics = compute_metrics(graph.task_type, train.target, train_preds, primary_metric)
+        test_metrics = compute_metrics(graph.task_type, val.target, test_preds, primary_metric)
+        _store_run(pipeline, graph, input_data, test_preds)
 
         target_info = _target_info(csv_path, target_column, graph.task_type)
         training_notes = []
@@ -293,8 +299,15 @@ def train_graph(
             )
 
         return json.dumps({
-            "score": metrics["primary_score"],
-            "metrics": metrics,
+            "score": test_metrics["primary_score"],
+            "metrics": test_metrics,
+            "train_metrics": train_metrics,
+            "test_metrics": test_metrics,
+            "split_info": {
+                "test_size": ts,
+                "n_train": len(train.features),
+                "n_test": len(val.features),
+            },
             "graph": graph.to_dict(),
             "n_train": len(train.features),
             "n_val": len(val.features),
@@ -314,6 +327,7 @@ def tune_graph_hyperparameters(
     iterations: int = 20,
     forecast_length: Optional[int] = None,
     primary_metric: Optional[str] = None,
+    test_size: float = 0.2,
 ) -> str:
     """Tune node hyperparameters of a graph using Fedot's PipelineTuner. Returns tuned graph + score."""
     try:
@@ -348,8 +362,11 @@ def tune_graph_hyperparameters(
                 "target_info": _target_info(csv_path, target_column, graph.task_type),
             })
 
+        ts = float(test_size) if test_size is not None else 0.2
+        ts = min(max(ts, 0.05), 0.5)
+
         input_data = load_input_data(csv_path, target_column, graph.task_type, forecast_length)
-        train, val = split_input_data(input_data)
+        train, val = split_input_data(input_data, test_size=ts)
 
         pipeline = graph.to_fedot_pipeline()
 
@@ -360,15 +377,21 @@ def tune_graph_hyperparameters(
             logger.warning(f"Tuning failed, using untuned pipeline: {e}")
 
         pipeline.fit(train)
-        preds = _predict_pipeline(pipeline, val, graph.task_type)
-        metrics = compute_metrics(graph.task_type, val.target, preds, primary_metric)
-        _store_run(pipeline, graph, input_data, preds)
+        train_preds = _predict_pipeline(pipeline, train, graph.task_type)
+        test_preds = _predict_pipeline(pipeline, val, graph.task_type)
+        train_metrics = compute_metrics(graph.task_type, train.target, train_preds, primary_metric)
+        test_metrics = compute_metrics(graph.task_type, val.target, test_preds, primary_metric)
+        metrics = test_metrics
+        _store_run(pipeline, graph, input_data, test_preds)
 
         # Extract tuned params back per node
         tuned_nodes = []
         try:
             for fnode, gnode in zip(pipeline.nodes, graph.nodes):
-                tuned_nodes.append({"id": gnode.id, "operation": gnode.operation, "tuned_params": dict(getattr(fnode, "parameters", {}) or {})})
+                tuned_params = dict(getattr(fnode, "parameters", {}) or {})
+                if tuned_params:
+                    gnode.params = {**(gnode.params or {}), **tuned_params}
+                tuned_nodes.append({"id": gnode.id, "operation": gnode.operation, "tuned_params": tuned_params})
         except Exception:
             pass
 
@@ -382,6 +405,13 @@ def tune_graph_hyperparameters(
         return json.dumps({
             "score": metrics["primary_score"],
             "metrics": metrics,
+            "train_metrics": train_metrics,
+            "test_metrics": test_metrics,
+            "split_info": {
+                "test_size": ts,
+                "n_train": len(train.features),
+                "n_test": len(val.features),
+            },
             "graph": graph.to_dict(),
             "tuned_nodes": tuned_nodes,
             "target_info": target_info,

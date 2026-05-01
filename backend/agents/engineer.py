@@ -36,6 +36,9 @@ Do not change graph structure; only node parameters may be tuned."""
             if isinstance(graph_run, dict):
                 result.graph_score = float(graph_run.get("score") or 0)
                 result.graph_metrics = graph_run.get("metrics", {}) or {}
+                result.train_metrics = graph_run.get("train_metrics", {}) or {}
+                result.test_metrics = graph_run.get("test_metrics", {}) or {}
+                result.split_info = graph_run.get("split_info", {}) or {}
                 result.tuned_nodes = graph_run.get("tuned_nodes", []) or []
                 result.graph_error = graph_run.get("error", "") or ""
                 result.target_info = graph_run.get("target_info", {}) or result.target_info
@@ -53,7 +56,7 @@ Do not change graph structure; only node parameters may be tuned."""
 
             result.tool_calls = self.get_tool_calls()
             logger.info(
-                "[Engineer] graph=%.4f",
+                "[Engineer] test_primary=%.4f",
                 result.graph_score,
             )
             return result
@@ -91,6 +94,7 @@ Do not change graph structure; only node parameters may be tuned."""
             "csv_path": dc.csv_path,
             "target_column": dc.target_column,
             "iterations": 20,
+            "test_size": dc.test_size,
         }
         if dc.primary_metric:
             args["primary_metric"] = dc.primary_metric
@@ -114,6 +118,7 @@ Do not change graph structure; only node parameters may be tuned."""
             "graph_json": graph_json,
             "csv_path": dc.csv_path,
             "target_column": dc.target_column,
+            "test_size": dc.test_size,
         }
         if dc.primary_metric:
             args["primary_metric"] = dc.primary_metric
