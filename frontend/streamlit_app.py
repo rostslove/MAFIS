@@ -217,6 +217,18 @@ def graph_rows(graph: Dict[str, Any]) -> List[Dict[str, str]]:
     return rows
 
 
+def render_operation_catalog(config: Dict[str, Any], task_type: str, key_suffix: str = "catalog") -> None:
+    rows = operation_rows(config, task_type)
+    if rows:
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        return
+    st.info("Operation catalog is unavailable. Check that backend /config is reachable, then refresh metadata.")
+    if st.button("Refresh Backend Metadata", key=f"refresh_metadata_{key_suffix}_{task_type}"):
+        load_config.clear()
+        load_tools.clear()
+        st.rerun()
+
+
 def mutate_graph(mutation: Dict[str, Any]) -> None:
     graph = st.session_state.get("graph")
     if not graph:
@@ -315,6 +327,10 @@ def sidebar() -> None:
             st.success(health.get("status", "connected"))
         except Exception:
             st.error("backend unavailable")
+        if st.button("Refresh Backend Metadata", key="sidebar_refresh_metadata"):
+            load_config.clear()
+            load_tools.clear()
+            st.rerun()
 
 
 def data_tab() -> None:
@@ -338,8 +354,7 @@ def architect_tab(config: Dict[str, Any]) -> None:
 
     with col_left:
         st.write("Available atomic operations")
-        rows = operation_rows(config, task_type)
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        render_operation_catalog(config, task_type, "architect")
 
         message = st.text_area(
             "Request to Architect",
@@ -347,7 +362,7 @@ def architect_tab(config: Dict[str, Any]) -> None:
             height=110,
         )
         ask_col, default_col = st.columns(2)
-        if ask_col.button("Ask Architect", type="primary", use_container_width=True):
+        if ask_col.button("Ask Architect", type="primary", use_container_width=True, key="architect_ask"):
             try:
                 payload = current_payload(
                     {
@@ -362,7 +377,7 @@ def architect_tab(config: Dict[str, Any]) -> None:
             except Exception as exc:
                 st.error(f"Architect failed: {exc}")
 
-        if default_col.button("Use Reliable Default", use_container_width=True):
+        if default_col.button("Use Reliable Default", use_container_width=True, key="architect_use_default"):
             graph = {
                 "task_type": task_type,
                 "nodes": config.get("default_graphs", {}).get(task_type, []),
@@ -391,10 +406,10 @@ def architect_tab(config: Dict[str, Any]) -> None:
         render_diagnostics(st.session_state.get("architect_diagnostics", []), "Architect diagnostics")
         if st.session_state.get("graph"):
             action_cols = st.columns(2)
-            if action_cols[0].button("Approve Draft", use_container_width=True):
+            if action_cols[0].button("Approve Draft", use_container_width=True, key="architect_approve_draft"):
                 approve_graph()
                 st.success("Graph approved.")
-            if action_cols[1].button("Discard Draft", use_container_width=True, disabled=not st.session_state.get("approved_graph")):
+            if action_cols[1].button("Discard Draft", use_container_width=True, disabled=not st.session_state.get("approved_graph"), key="architect_discard_draft"):
                 discard_draft()
                 st.info("Draft discarded; approved graph restored.")
         render_tool_calls(st.session_state.get("architect_tool_calls", []), "Architect tool calls")
@@ -405,6 +420,8 @@ def graph_editor_tab(config: Dict[str, Any]) -> None:
     graph = st.session_state.get("graph", {})
     if not graph:
         st.info("Ask Architect for a graph, then edit it here.")
+        st.write("Available atomic operations")
+        render_operation_catalog(config, st.session_state.get("task_type", "classification"), "editor_empty")
         return
 
     task_type = graph.get("task_type", st.session_state.get("task_type", "classification"))
@@ -416,10 +433,10 @@ def graph_editor_tab(config: Dict[str, Any]) -> None:
 
     status_col, approve_col, discard_col = st.columns([2, 1, 1])
     status_col.caption("Approved" if st.session_state.get("graph_approved") else "Draft")
-    if approve_col.button("Approve Edited Graph", use_container_width=True):
+    if approve_col.button("Approve Edited Graph", use_container_width=True, key="editor_approve_graph"):
         approve_graph()
         st.success("Graph approved.")
-    if discard_col.button("Discard Draft", use_container_width=True, disabled=not st.session_state.get("approved_graph")):
+    if discard_col.button("Discard Draft", use_container_width=True, disabled=not st.session_state.get("approved_graph"), key="editor_discard_draft"):
         discard_draft()
         st.info("Draft discarded; approved graph restored.")
 
@@ -429,7 +446,7 @@ def graph_editor_tab(config: Dict[str, Any]) -> None:
     catalog_rows = operation_rows(config, task_type)
     if catalog_rows:
         with st.expander("Operation catalog"):
-            st.dataframe(pd.DataFrame(catalog_rows), use_container_width=True, hide_index=True)
+            render_operation_catalog(config, task_type, "editor")
 
     col_insert, col_model, col_params = st.columns(3)
 
@@ -512,7 +529,7 @@ def run_tab() -> None:
 
     st.write("Approved graph for evaluation")
     render_graph(approved_graph, show_details=True)
-    if st.button("Evaluate Approved Graph", type="primary", use_container_width=True):
+    if st.button("Evaluate Approved Graph", type="primary", use_container_width=True, key="evaluate_approved_graph"):
         payload = current_payload(
             {
                 "iterations": 1,
@@ -662,12 +679,12 @@ def results_tab() -> None:
         height=90,
     )
     col_apply, col_keep = st.columns(2)
-    if col_apply.button("Ask Architect To Draft Critic Changes", type="primary", use_container_width=True):
+    if col_apply.button("Ask Architect To Draft Critic Changes", type="primary", use_container_width=True, key="critic_draft_changes"):
         try:
             request_architect_revision(item, msg)
         except Exception as exc:
             st.error(f"Architect revision failed: {exc}")
-    if col_keep.button("Keep Current Approved Pipeline", use_container_width=True):
+    if col_keep.button("Keep Current Approved Pipeline", use_container_width=True, key="critic_keep_current"):
         discard_draft()
         st.info("Current approved pipeline kept. No new draft accepted.")
 

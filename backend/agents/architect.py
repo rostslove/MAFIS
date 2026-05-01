@@ -61,6 +61,7 @@ The root is n3."
             user_msg = self._build_user_message(data_context, iteration, prev_feedback, prev_graph)
             response = await self.call_llm(user_msg)
             text = response.get("full_response", "")
+            used_fallback = False
             if not response.get("success", True):
                 result.diagnostics.append(
                     {
@@ -83,13 +84,31 @@ The root is n3."
             # If LLM didn't successfully propose, fall back to default
             if not graph:
                 result.diagnostics.extend(self._extract_diagnostics_from_log())
-                graph, mermaid = self._fallback_graph(data_context.task_type, prev_graph)
+                result.diagnostics.append(
+                    {
+                        "agent": "Architect",
+                        "kind": "llm_tool_call_not_emitted",
+                        "summary": "The local LLM did not emit a structured MCP tool call, so Architect used a deterministic MCP-backed proposal.",
+                        "technical_message": text[:1000],
+                        "recommendations": [
+                            "This is recoverable: the fallback still calls MCP tools and produces a valid draft graph.",
+                            "Approve the graph if it is suitable, or edit it manually before evaluation.",
+                        ],
+                        "recoverable": True,
+                    }
+                )
+                graph, mermaid = await self._fallback_graph_with_tools(data_context, prev_graph)
+                used_fallback = True
                 logger.info("[Architect] Using fallback graph for %s", data_context.task_type)
 
             result.graph = graph
             result.mermaid = mermaid
-            result.analysis = self._extract_section(text, "ANALYSIS") or text[:500] or self._fallback_analysis(data_context.task_type, bool(prev_graph))
-            result.reasoning = self._extract_section(text, "REASONING") or self._fallback_reasoning(graph, data_context.task_type)
+            if used_fallback:
+                result.analysis = self._fallback_analysis(data_context.task_type, bool(prev_graph))
+                result.reasoning = self._fallback_reasoning(graph, data_context.task_type)
+            else:
+                result.analysis = self._extract_section(text, "ANALYSIS") or text[:500] or self._fallback_analysis(data_context.task_type, bool(prev_graph))
+                result.reasoning = self._extract_section(text, "REASONING") or self._fallback_reasoning(graph, data_context.task_type)
             result.tool_calls = self.get_tool_calls()
             return result
 
@@ -125,6 +144,26 @@ The root is n3."
                 pass
         default = PipelineGraph.default(task_type)
         return default.to_dict(), default.to_mermaid()
+
+    async def _fallback_graph_with_tools(self, data_context: DataContext, prev_graph: Optional[dict] = None):
+        await self.call_mcp_tool(
+            "get_data_profile",
+            {
+                "csv_path": data_context.csv_path,
+                "target_column": data_context.target_column,
+                "task_type": data_context.task_type,
+            },
+        )
+        await self.call_mcp_tool("get_available_operations", {"task_type": data_context.task_type})
+
+        graph, mermaid = self._fallback_graph(data_context.task_type, prev_graph)
+        proposed = await self.call_mcp_tool(
+            "propose_graph",
+            {"graph_json": json.dumps(graph, ensure_ascii=False)},
+        )
+        if isinstance(proposed, dict) and proposed.get("valid") and proposed.get("graph"):
+            return proposed["graph"], proposed.get("mermaid", mermaid)
+        return graph, mermaid
 
     def _build_user_message(self, dc: DataContext, iteration: int, prev_fb, prev_graph) -> str:
         profile = dc.profile
