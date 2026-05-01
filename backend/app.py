@@ -134,6 +134,7 @@ async def architect_revise(request):
             message=payload.get("message", ""),
             forecast_length=payload.get("forecast_length"),
             primary_metric=payload.get("primary_metric"),
+            selected_mutations=payload.get("selected_mutations"),
         )
         if result.get("error"):
             return _error(result["error"], 400)

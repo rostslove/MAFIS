@@ -333,8 +333,14 @@ async def propose_revision_from_critic(
     message: str = "",
     forecast_length: Optional[int] = None,
     primary_metric: Optional[str] = None,
+    selected_mutations: Optional[list] = None,
 ) -> Dict[str, Any]:
-    """Create a new draft graph from explicit Critic feedback; user must approve it."""
+    """Create a new draft graph from explicit Critic feedback; user must approve it.
+
+    Critic mutations are alternatives, not a sequence. ``selected_mutations`` lets
+    the frontend pass the subset the user picked via checkboxes. If omitted, only
+    the first suggested mutation is applied to avoid combining incompatible
+    alternatives (e.g. xgboost-only params plus a replace to rf)."""
     csv_path = normalize_csv_path(csv_path)
     if task_type not in SUPPORTED_TASKS:
         return {"error": f"Unknown task type: {task_type}"}
@@ -345,7 +351,11 @@ async def propose_revision_from_critic(
     if not ok:
         return {"error": f"Current graph is invalid: {validation_message}"}
 
-    mutations = critic_feedback.get("suggested_mutations", []) or []
+    all_mutations = critic_feedback.get("suggested_mutations", []) or []
+    if selected_mutations is not None:
+        mutations = [m for m in selected_mutations if isinstance(m, dict)]
+    else:
+        mutations = all_mutations[:1]
     diagnostics = []
     draft = graph
     applied = []

@@ -716,24 +716,51 @@ def render_critic_feedback(critic: Dict[str, Any]) -> None:
         for item in critic["improvement_plan"]:
             st.write(f"- {item}")
     if critic.get("suggested_mutations"):
-        st.write("Concrete mutations for Architect")
-        st.dataframe(pd.DataFrame(mutation_rows(critic["suggested_mutations"])), use_container_width=True, hide_index=True)
+        st.write(
+            "Concrete mutations for Architect (alternatives — pick the ones you want applied; "
+            "combining incompatible ones may produce an invalid graph)"
+        )
+        rows = mutation_rows(critic["suggested_mutations"])
+        for idx, (mutation, row) in enumerate(zip(critic["suggested_mutations"], rows)):
+            label = f"**{row['action']}** `{row['node']}`"
+            if row.get("target"):
+                label += f" -> `{row['target']}`"
+            if row.get("details"):
+                label += f" — {row['details']}"
+            st.checkbox(label, value=(idx == 0), key=f"critic_mut_{idx}")
 
     render_diagnostics(critic.get("diagnostics", []), "Critic diagnostics", use_expander=False)
+
+
+def selected_critic_mutations(critic: Dict[str, Any]) -> List[Dict[str, Any]]:
+    mutations = critic.get("suggested_mutations", []) or []
+    selected = []
+    for idx, mutation in enumerate(mutations):
+        if st.session_state.get(f"critic_mut_{idx}"):
+            selected.append(mutation)
+    return selected
 
 
 def request_architect_revision(iteration: Dict[str, Any], message: str = "") -> None:
     current_graph = st.session_state.get("approved_graph") or iteration.get("architect", {}).get("graph", {})
     critic = iteration.get("critic", {})
+    selected = selected_critic_mutations(critic)
     payload = current_payload({
         "current_graph": current_graph,
         "critic_feedback": critic,
         "message": message,
+        "selected_mutations": selected,
     })
     result = post_json("/architect/revise", payload, timeout=180)
     set_graph(result, approved=False)
     st.session_state.architect_tool_calls = result.get("tool_calls", [])
-    st.success("Architect prepared a new draft. Approve it to make it the active pipeline.")
+    if selected:
+        st.success(
+            f"Architect prepared a new draft from {len(selected)} selected mutation(s). "
+            "Approve it to make it the active pipeline."
+        )
+    else:
+        st.success("Architect prepared a new draft (no mutations selected; LLM-driven revision). Approve it to make it the active pipeline.")
 
 
 def results_tab() -> None:

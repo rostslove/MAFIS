@@ -575,9 +575,12 @@ class PipelineGraph:
             new_op = mutation["new_operation"]
             for n in nodes:
                 if n.id == nid:
+                    old_op = n.operation
                     n.operation = new_op
                     if "params" in mutation:
                         n.params = mutation["params"]
+                    elif old_op != new_op:
+                        n.params = {}
 
         elif op == "set_params":
             nid = mutation["node_id"]
