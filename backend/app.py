@@ -69,6 +69,13 @@ def _error(message: str, status_code: int = 400) -> JSONResponse:
     return JSONResponse({"detail": message}, status_code=status_code)
 
 
+def _compact_error(exc: Exception, limit: int = 1200) -> str:
+    message = str(exc)
+    if len(message) <= limit:
+        return message
+    return message[:limit].rstrip() + "... [truncated]"
+
+
 async def health(request):
     return JSONResponse({"status": "healthy", "service": "graph-automl-mcp"})
 
@@ -232,7 +239,7 @@ async def benchmark_m4(request):
         return JSONResponse(result)
     except Exception as exc:
         logger.exception("M4 benchmark failed")
-        return _error(str(exc), 500)
+        return _error(_compact_error(exc), 500)
 
 
 async def benchmark_m4_architect(request):

@@ -52,6 +52,8 @@ def m4_classification_profile(
         "n_samples": n_samples,
         "n_features": length,
         "feature_shape": [n_samples, length],
+        "fedot_feature_shape": [1, n_samples, length],
+        "n_channels": 1,
         "target": "frequency_group",
         "target_type": "multiclass",
         "classes": list(selected_groups),
@@ -170,12 +172,19 @@ def load_m4_classification(
 
 
 def _to_input_data(features: np.ndarray, target: np.ndarray) -> InputData:
+    matrix = np.asarray(features, dtype=float)
+    if matrix.ndim != 2:
+        raise ValueError(f"M4 benchmark features must be a 2D matrix, got shape {matrix.shape}.")
+
+    # Fedot.Industrial's channel-independent converter expects channels first.
+    # One univariate M4 channel becomes a single 2D sample matrix downstream.
+    ts_features = matrix[np.newaxis, :, :]
     return InputData(
-        idx=np.arange(len(features)),
-        features=features.astype(float),
+        idx=np.arange(matrix.shape[0]),
+        features=ts_features,
         target=target,
         task=Task(TaskTypesEnum.classification),
-        data_type=DataTypesEnum.table,
+        data_type=DataTypesEnum.ts,
     )
 
 
