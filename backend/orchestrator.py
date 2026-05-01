@@ -4,7 +4,7 @@ from typing import Any, AsyncGenerator, Dict, Optional
 
 import pandas as pd
 
-from agents import Architect, ArchitectResult, Critic, CriticFeedback, DataContext, Engineer, IterationRecord, Scribe
+from agents import Architect, ArchitectResult, Critic, CriticFeedback, DataContext, Engineer, EngineerResult, IterationRecord, Scribe
 from data_profiler import DataProfiler
 from graph_engine import SUPPORTED_TASKS, PipelineGraph, diagnose_runtime_error, is_ts_task
 from mcp_client import MCPToolClient
