@@ -20,12 +20,7 @@ if _backend_dir not in sys.path:
 
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import LogisticRegression, Ridge
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.pipeline import Pipeline as SkPipeline
-from sklearn.model_selection import train_test_split
-from xgboost import XGBClassifier, XGBRegressor
+from sklearn.preprocessing import LabelEncoder
 
 from data_profiler import DataProfiler
 from graph_engine import (
@@ -141,13 +136,13 @@ def _target_info(csv_path: str, target_column: str, task_type: str) -> Dict[str,
         "unique_values": int(values.nunique()),
         "sample_values": [str(v) for v in values.head(10).tolist()],
         "fedot_receives_raw_target": task_type in ("classification", "ts_classification"),
-        "baseline_encoded": False,
+        "reference_encoded": False,
     }
     if task_type in ("classification", "ts_classification") and not np.issubdtype(y.dtype, np.number):
         encoder = LabelEncoder()
         encoder.fit(values.astype(str).values)
-        info["baseline_encoded"] = True
-        info["baseline_encoding"] = {str(label): int(code) for code, label in enumerate(encoder.classes_)}
+        info["reference_encoded"] = True
+        info["reference_encoding"] = {str(label): int(code) for code, label in enumerate(encoder.classes_)}
     return info
 
 
@@ -169,24 +164,6 @@ def _invalid_graph_payload(message: str, graph: PipelineGraph) -> Dict[str, Any]
         "diagnostics": [diagnostic],
         "recommendations": diagnostic.get("recommendations", []),
     }
-
-
-# ============== Sklearn baselines ==============
-
-def _baselines(task_type: str) -> Dict[str, SkPipeline]:
-    if task_type in ("classification", "ts_classification"):
-        return {
-            "logreg": SkPipeline([("scaler", StandardScaler()), ("model", LogisticRegression(max_iter=1000))]),
-            "rf": SkPipeline([("scaler", StandardScaler()), ("model", RandomForestClassifier(n_estimators=100, random_state=42))]),
-            "xgb": SkPipeline([("scaler", StandardScaler()), ("model", XGBClassifier(n_estimators=100, random_state=42))]),
-        }
-    if task_type in ("regression", "ts_regression"):
-        return {
-            "ridge": SkPipeline([("scaler", StandardScaler()), ("model", Ridge(alpha=1.0))]),
-            "rf": SkPipeline([("scaler", StandardScaler()), ("model", RandomForestRegressor(n_estimators=100, random_state=42))]),
-            "xgb": SkPipeline([("scaler", StandardScaler()), ("model", XGBRegressor(n_estimators=100, random_state=42))]),
-        }
-    return {}
 
 
 # ================================================================
@@ -278,56 +255,6 @@ def visualize_graph(graph_json: str) -> str:
 
 
 # ================================================================
-#                          BASELINES
-# ================================================================
-
-@mcp.tool()
-def get_baselines(task_type: str) -> str:
-    """List sklearn baseline names for the task. Empty for ts_forecasting."""
-    if task_type == "ts_forecasting":
-        return json.dumps({"baselines": [], "note": "Baselines unavailable for ts_forecasting"})
-    return json.dumps({"baselines": list(_baselines(task_type).keys())})
-
-
-@mcp.tool()
-def train_baseline(csv_path: str, target_column: str, baseline_name: str, task_type: str = "classification") -> str:
-    """Train an sklearn baseline. Returns score and metrics."""
-    try:
-        csv_path = normalize_csv_path(csv_path)
-        if task_type == "ts_forecasting":
-            return json.dumps({"name": baseline_name, "score": 0, "error": "Baselines unavailable for ts_forecasting"})
-
-        baselines = _baselines(task_type)
-        if baseline_name not in baselines:
-            return json.dumps({"name": baseline_name, "score": 0, "error": f"Unknown baseline; available: {list(baselines.keys())}"})
-
-        df = pd.read_csv(csv_path)
-        y = df[target_column].values
-        X = df.drop(columns=[target_column]).select_dtypes(include=[np.number]).values
-        baseline_encoded = False
-        if task_type in ("classification", "ts_classification") and not np.issubdtype(np.asarray(y).dtype, np.number):
-            y = LabelEncoder().fit_transform(pd.Series(y).astype(str).values)
-            baseline_encoded = True
-
-        stratify = y if task_type in ("classification", "ts_classification") else None
-        X_tr, X_va, y_tr, y_va = train_test_split(X, y, test_size=0.2, random_state=42, stratify=stratify)
-
-        pipe = baselines[baseline_name]
-        pipe.fit(X_tr, y_tr)
-        preds = pipe.predict(X_va)
-        metrics = compute_metrics(task_type, y_va, preds)
-        return json.dumps({
-            "name": baseline_name,
-            "score": metrics["primary_score"],
-            "metrics": metrics,
-            "target_info": _target_info(csv_path, target_column, task_type),
-            "baseline_encoded_target": baseline_encoded,
-        })
-    except Exception as e:
-        return json.dumps({"name": baseline_name, "score": 0, "error": str(e)})
-
-
-# ================================================================
 #                          GRAPH TRAIN / TUNE
 # ================================================================
 
@@ -353,9 +280,9 @@ def train_graph(graph_json: str, csv_path: str, target_column: str, forecast_len
 
         target_info = _target_info(csv_path, target_column, graph.task_type)
         training_notes = []
-        if target_info.get("fedot_receives_raw_target") and target_info.get("baseline_encoded"):
+        if target_info.get("fedot_receives_raw_target") and target_info.get("reference_encoded"):
             training_notes.append(
-                "Fedot graph received the raw string classification target; sklearn baselines encoded it only for baseline fitting."
+                "Fedot graph received the raw string classification target; reference mapping is shown only for readable diagnostics."
             )
 
         return json.dumps({
@@ -401,7 +328,7 @@ def tune_graph_hyperparameters(
                 ),
                 "recommendations": [
                     "Use train_graph for classification graphs.",
-                    "Let Critic compare the trained graph with baselines and suggest a model replacement.",
+                    "Let Critic inspect the trained graph and suggest model replacement or explicit parameters.",
                 ],
                 "recoverable": True,
             }
@@ -439,9 +366,9 @@ def tune_graph_hyperparameters(
 
         target_info = _target_info(csv_path, target_column, graph.task_type)
         training_notes = []
-        if target_info.get("fedot_receives_raw_target") and target_info.get("baseline_encoded"):
+        if target_info.get("fedot_receives_raw_target") and target_info.get("reference_encoded"):
             training_notes.append(
-                "Fedot graph received the raw string classification target; sklearn baselines encoded it only for baseline fitting."
+                "Fedot graph received the raw string classification target; reference mapping is shown only for readable diagnostics."
             )
 
         return json.dumps({
@@ -513,32 +440,6 @@ def validate_graph(graph_json: str, csv_path: str, target_column: str, cv_folds:
 # ================================================================
 
 @mcp.tool()
-def analyze_errors(baseline_results_json: str, graph_score: float, task_type: str) -> str:
-    """Compare graph score against sklearn baselines. Returns winner + statistics."""
-    try:
-        baselines = json.loads(baseline_results_json)
-        scores = [b["score"] for b in baselines if b.get("score", 0) > 0]
-        out: Dict[str, Any] = {
-            "task_type": task_type,
-            "graph_score": graph_score,
-            "n_baselines": len(baselines),
-        }
-        if scores:
-            best = max(baselines, key=lambda b: b.get("score", 0))
-            out["best_baseline"] = {"name": best["name"], "score": best["score"]}
-            out["graph_beats_baselines"] = graph_score > best["score"]
-            out["delta"] = round(graph_score - best["score"], 4)
-            out["baseline_mean"] = round(float(np.mean(scores)), 4)
-        else:
-            out["graph_beats_baselines"] = True
-        out["failed_baselines"] = [b["name"] for b in baselines if b.get("error")]
-        return json.dumps(out)
-    except Exception as e:
-        payload = _failure_payload(e, task_type=getattr(locals().get("graph", None), "task_type", ""), graph=locals().get("graph"))
-        return json.dumps({"error": payload["error"], "diagnostics": payload["diagnostics"], "recommendations": payload["recommendations"]})
-
-
-@mcp.tool()
 def get_node_importance(graph_json: str, csv_path: str, target_column: str, forecast_length: Optional[int] = None) -> str:
     """Estimate per-node importance via leave-one-out ablation (training-only, can be slow)."""
     try:
@@ -547,7 +448,7 @@ def get_node_importance(graph_json: str, csv_path: str, target_column: str, fore
         input_data = load_input_data(csv_path, target_column, graph.task_type, forecast_length)
         train, val = split_input_data(input_data)
 
-        # Baseline: full graph
+        # Reference score: full graph
         full_pipe = graph.to_fedot_pipeline()
         full_pipe.fit(train)
         full_score = compute_metrics(
@@ -615,10 +516,10 @@ def explain_graph(top_k: int = 10) -> str:
 # ================================================================
 
 @mcp.tool()
-def generate_report(iterations_json: str) -> str:
-    """Compile per-iteration data into a structured report (best score, summaries, mermaid of best graph)."""
+def generate_report(evaluations_json: str) -> str:
+    """Compile evaluation data into a structured report (best score, summaries, mermaid of best graph)."""
     try:
-        iterations = json.loads(iterations_json)
+        iterations = json.loads(evaluations_json)
         best_score = -1.0
         best_iter = None
         summaries: List[Dict[str, Any]] = []
@@ -629,7 +530,6 @@ def generate_report(iterations_json: str) -> str:
             summaries.append({
                 "iteration": it.get("iteration", "?"),
                 "graph_score": score,
-                "best_baseline": eng.get("best_baseline_score", 0),
                 "winner": it.get("critic", {}).get("winner", "?"),
                 "stop": it.get("critic", {}).get("should_stop", False),
             })
@@ -646,7 +546,9 @@ def generate_report(iterations_json: str) -> str:
                 pass
 
         return json.dumps({
+            "n_evaluations": len(iterations),
             "n_iterations": len(iterations),
+            "evaluation_summaries": summaries,
             "iteration_summaries": summaries,
             "best_score": best_score,
             "best_graph": best_graph,

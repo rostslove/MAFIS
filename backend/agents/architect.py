@@ -168,7 +168,7 @@ The root is n3."
     def _build_user_message(self, dc: DataContext, iteration: int, prev_fb, prev_graph) -> str:
         profile = dc.profile
         msg = (
-            f"Iteration: {iteration}\n"
+            f"Evaluation request: {iteration}\n"
             f"Task: {dc.task_type} (TS: {dc.is_time_series})\n"
             f"CSV: {dc.csv_path}\n"
             f"Target: {dc.target_column}\n"
@@ -179,10 +179,10 @@ The root is n3."
             msg += f"Forecast length: {dc.forecast_length}\n"
 
         if dc.iteration_history:
-            msg += "\nPREVIOUS ITERATIONS:\n"
+            msg += "\nPREVIOUS APPROVED EVALUATIONS:\n"
             for rec in dc.iteration_history:
-                msg += f"  Iter {rec.iteration}: graph_score={rec.graph_score:.4f}, baseline={rec.best_baseline_score:.4f}, winner={rec.winner}\n"
-            msg += "Avoid repeating approaches that didn't improve. Build on what worked.\n"
+                msg += f"  Eval {rec.iteration}: graph_score={rec.graph_score:.4f}, decision={rec.winner}\n"
+            msg += "Avoid repeating approaches that did not address Critic feedback. Build on what worked.\n"
 
         if prev_graph:
             msg += f"\nPREVIOUS GRAPH:\n{json.dumps(prev_graph)}\n"
@@ -190,7 +190,7 @@ The root is n3."
         if prev_fb:
             msg += (
                 f"\nFEEDBACK:\n"
-                f"  source/winner: {prev_fb.winner}\n"
+                f"  decision: {prev_fb.winner}\n"
                 f"  assessment: {prev_fb.assessment}\n"
                 f"  weaknesses/user notes: {prev_fb.weaknesses}\n"
                 f"  suggested_mutations: {json.dumps(prev_fb.suggested_mutations)}\n"
@@ -223,7 +223,7 @@ The root is n3."
         if task_type in ("classification", "regression"):
             return (
                 f"Graph structure: {operations}. For tabular CSV data, the first reliable candidate is a direct model node; "
-                "baselines are trained separately to judge whether a more complex graph is justified."
+                "Critic will judge whether a more complex graph or explicit parameters are justified."
             )
         return (
             f"Graph structure: {operations}. The graph first extracts or transforms signal structure and then sends it to "

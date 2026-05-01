@@ -1,4 +1,4 @@
-"""Scribe: turns GraphAutoML iterations into a compact final report."""
+"""Scribe: turns a GraphAutoML evaluation into a compact final report."""
 
 import logging
 from typing import Any, Dict, List
@@ -12,12 +12,12 @@ logger = logging.getLogger("Scribe")
 
 
 class Scribe(BaseAgent):
-    """Reporting agent called once after the iterative loop."""
+    """Reporting agent called once after graph evaluation."""
 
     ALLOWED_TOOLS = ["generate_report"]
 
     SYSTEM_PROMPT = """You are the Scribe Agent for GraphAutoML.
-Write a concise technical report from the iteration summary.
+Write a concise technical report from the approved graph evaluation summary.
 Return JSON only:
 {
   "title": "...",
@@ -37,22 +37,22 @@ Return JSON only:
         try:
             tool_report = await self.call_mcp_tool(
                 "generate_report",
-                {"iterations_json": json.dumps(all_iterations, ensure_ascii=False)},
+                {"evaluations_json": json.dumps(all_iterations, ensure_ascii=False)},
             )
             if not isinstance(tool_report, dict):
                 tool_report = {}
 
             llm_report: Dict[str, Any] = {}
             best_score = tool_report.get("best_score", 0)
-            n_iterations = tool_report.get("n_iterations", len(all_iterations))
+            n_evaluations = tool_report.get("n_evaluations", tool_report.get("n_iterations", len(all_iterations)))
 
             report.title = llm_report.get("title") or f"GraphAutoML report: {data_context.task_type}"
             report.summary = llm_report.get("summary") or (
-                f"Completed {n_iterations} iteration(s). Best graph score: {best_score:.4f}."
+                f"Completed {n_evaluations} approved graph evaluation(s). Best graph score: {best_score:.4f}."
             )
             report.methodology = llm_report.get("methodology") or (
-                "Architect proposed graph structures, Engineer tuned graph parameters and trained baselines, "
-                "Critic validated results and suggested graph mutations."
+                "Architect prepared a graph, Engineer trained the approved graph, "
+                "and Critic evaluated graph quality using metrics, validation stability, diagnostics and data profile."
             )
             report.results = llm_report.get("results") or self._default_results(tool_report)
             report.recommendations = llm_report.get("recommendations") or self._default_recommendations(all_iterations)
@@ -72,12 +72,12 @@ Return JSON only:
 
     @staticmethod
     def _default_results(tool_report: Dict[str, Any]) -> str:
-        summaries = tool_report.get("iteration_summaries", [])
+        summaries = tool_report.get("evaluation_summaries", tool_report.get("iteration_summaries", []))
         if not summaries:
-            return "No successful iteration summaries were produced."
+            return "No successful evaluation summaries were produced."
         lines = [
-            f"Iteration {item.get('iteration')}: graph={item.get('graph_score', 0):.4f}, "
-            f"baseline={item.get('best_baseline', 0):.4f}, winner={item.get('winner', 'n/a')}"
+            f"Evaluation {item.get('iteration')}: graph={item.get('graph_score', 0):.4f}, "
+            f"decision={item.get('winner', 'n/a')}"
             for item in summaries
         ]
         return "\n".join(lines)
@@ -85,7 +85,7 @@ Return JSON only:
     @staticmethod
     def _default_recommendations(iterations: List[Dict[str, Any]]) -> List[str]:
         if not iterations:
-            return ["Run at least one GraphAutoML iteration"]
+            return ["Run at least one approved graph evaluation"]
         last = iterations[-1].get("critic", {})
         diagnostics = []
         diagnostics.extend(iterations[-1].get("engineer", {}).get("diagnostics", []) or [])
@@ -99,5 +99,5 @@ Return JSON only:
             return recommendations[:4]
         suggestions = last.get("suggested_mutations", [])
         if suggestions:
-            return ["Review the final Critic mutations before another run", "Increase tuning iterations for the approved graph"]
+            return ["Review the final Critic mutations before approving a new graph", "Use explicit node parameters for manual refinement"]
         return ["Export and validate the best graph on a held-out dataset"]

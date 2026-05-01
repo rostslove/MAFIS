@@ -25,11 +25,10 @@ class ToolCall:
 
 @dataclass
 class IterationRecord:
-    """Compact record of one iteration for cross-iteration memory."""
+    """Compact record of one approved graph evaluation for agent memory."""
     iteration: int = 0
     graph: Dict[str, Any] = field(default_factory=dict)
     graph_score: float = 0.0
-    best_baseline_score: float = 0.0
     winner: str = ""
     suggested_mutations: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -70,22 +69,10 @@ class ArchitectResult:
 
 
 @dataclass
-class BaselineResult:
-    name: str
-    score: float = 0.0
-    metrics: Dict[str, float] = field(default_factory=dict)
-    error: Optional[str] = None
-    target_info: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
 class EngineerResult:
-    baseline_results: List[BaselineResult] = field(default_factory=list)
     graph_score: float = 0.0
     graph_metrics: Dict[str, float] = field(default_factory=dict)
     tuned_nodes: List[Dict[str, Any]] = field(default_factory=list)
-    best_baseline_score: float = 0.0
-    best_baseline_name: str = ""
     graph_error: str = ""
     target_info: Dict[str, Any] = field(default_factory=dict)
     training_notes: List[str] = field(default_factory=list)
@@ -94,15 +81,9 @@ class EngineerResult:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "baseline_results": [
-                {"name": r.name, "score": r.score, "metrics": r.metrics, "error": r.error, "target_info": r.target_info}
-                for r in self.baseline_results
-            ],
             "graph_score": self.graph_score,
             "graph_metrics": self.graph_metrics,
             "tuned_nodes": self.tuned_nodes,
-            "best_baseline_score": self.best_baseline_score,
-            "best_baseline_name": self.best_baseline_name,
             "graph_error": self.graph_error,
             "target_info": self.target_info,
             "training_notes": self.training_notes,
@@ -113,7 +94,7 @@ class EngineerResult:
 
 @dataclass
 class CriticFeedback:
-    winner: str = ""  # "graph" or "baseline"
+    winner: str = ""  # "accepted" or "needs_revision"
     assessment: str = ""
     strengths: List[str] = field(default_factory=list)
     weaknesses: List[str] = field(default_factory=list)

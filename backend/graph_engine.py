@@ -81,8 +81,8 @@ OPERATIONS: Dict[str, Dict[str, List[str]]] = {
         # Fedot.Industrial 0.5 routes common preprocessing operations through
         # industrial multidimensional strategies. On ordinary tabular CSV data
         # they can receive 1D column slices and fail inside sklearn. Keep the
-        # default tabular graph model-only; sklearn baselines still provide a
-        # sanity check with scaling.
+        # default tabular graph model-only; Critic can suggest model changes
+        # after the first approved evaluation.
         "preprocessing": [],
         "models": ["rf", "xgboost", "logit", "knn", "lgbm", "mlp", "dt"],
     },
@@ -156,7 +156,7 @@ DEFAULT_GRAPHS: Dict[str, List[Dict[str, Any]]] = {
 
 
 OPERATION_DESCRIPTIONS: Dict[str, str] = {
-    "rf": "Random forest classifier; robust baseline for tabular classification.",
+    "rf": "Random forest classifier; robust starter model for tabular classification.",
     "xgboost": "Gradient boosting classifier; useful for nonlinear tabular patterns.",
     "logit": "Linear logistic model; good for small or mostly linear classification tasks.",
     "knn": "Nearest-neighbor classifier; sensitive to feature scale.",
@@ -165,7 +165,7 @@ OPERATION_DESCRIPTIONS: Dict[str, str] = {
     "dt": "Decision tree classifier; interpretable but can overfit.",
     "ridge": "Regularized linear regressor; stable default for tabular regression.",
     "lasso": "Sparse linear regressor; can suppress weak features.",
-    "xgbreg": "Gradient boosting regressor; strong nonlinear tabular baseline.",
+    "xgbreg": "Gradient boosting regressor; strong nonlinear tabular model.",
     "treg": "Tree ensemble regressor; robust nonlinear regression model.",
     "lgbmreg": "LightGBM regressor; fast gradient boosting when available.",
     "knnreg": "Nearest-neighbor regressor; sensitive to feature scale.",

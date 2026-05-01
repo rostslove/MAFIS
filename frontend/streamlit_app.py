@@ -250,7 +250,8 @@ def stream_run(payload: Dict[str, Any]) -> None:
     log_box = st.empty()
     progress = st.progress(0)
     lines: List[str] = []
-    total_steps = max(1, payload.get("iterations", 1) * 3 + 1)
+    seen_diagnostics = set()
+    total_steps = 4
     done_steps = 0
 
     with requests.post(f"{BACKEND_URL}/orchestrate/stream", json=payload, stream=True, timeout=1800) as response:
@@ -265,23 +266,31 @@ def stream_run(payload: Dict[str, Any]) -> None:
 
             event_type = event.get("event")
             if event_type == "status":
-                lines.append(event.get("message", ""))
+                message = event.get("message", "")
+                if message:
+                    lines.append(message)
             elif event_type == "agent_start":
-                lines.append(f"Iteration {event.get('iteration')}: {event.get('agent')} started")
+                lines.append(f"{event.get('agent')}: started")
             elif event_type == "agent_done":
                 lines.append(f"{event.get('agent')}: {event.get('summary', '')}")
                 if event.get("diagnostics"):
                     for diagnostic in event["diagnostics"]:
-                        lines.append(f"{event.get('agent')} diagnostic: {diagnostic.get('summary', '')}")
+                        key = (event.get("agent"), diagnostic.get("kind"), diagnostic.get("summary"))
+                        if key not in seen_diagnostics:
+                            seen_diagnostics.add(key)
+                            lines.append(f"{event.get('agent')} note: {diagnostic.get('summary', '')}")
                 done_steps += 1
                 progress.progress(min(done_steps / total_steps, 1.0))
             elif event_type == "diagnostics":
                 for diagnostic in event.get("diagnostics", []):
-                    lines.append(f"{event.get('agent')} diagnostic: {diagnostic.get('summary', '')}")
+                    key = (event.get("agent"), diagnostic.get("kind"), diagnostic.get("summary"))
+                    if key not in seen_diagnostics:
+                        seen_diagnostics.add(key)
+                        lines.append(f"{event.get('agent')} note: {diagnostic.get('summary', '')}")
             elif event_type == "iteration_done":
                 lines.append(
-                    f"Iteration {event.get('iteration')} done: graph={event.get('graph_score', 0):.4f}, "
-                    f"baseline={event.get('best_baseline_score', 0):.4f}, winner={event.get('winner')}"
+                    f"Evaluation done: graph score={event.get('graph_score', 0):.4f}, "
+                    f"critic decision={event.get('winner')}"
                 )
                 if event.get("graph"):
                     st.session_state.graph = event["graph"]
@@ -510,9 +519,12 @@ def graph_editor_tab(config: Dict[str, Any]) -> None:
                 except json.JSONDecodeError as exc:
                     st.error(f"Invalid JSON: {exc}")
 
+    st.divider()
+    evaluation_panel()
 
-def run_tab() -> None:
-    st.subheader("Evaluate Approved Graph")
+
+def evaluation_panel() -> None:
+    st.markdown("### Evaluate Approved Graph")
     if not require_dataset():
         return
     approved_graph = st.session_state.get("approved_graph")
@@ -529,7 +541,7 @@ def run_tab() -> None:
 
     st.write("Approved graph for evaluation")
     render_graph(approved_graph, show_details=True)
-    if st.button("Evaluate Approved Graph", type="primary", use_container_width=True, key="evaluate_approved_graph"):
+    if st.button("Evaluate Approved Graph", type="primary", use_container_width=True, key="editor_evaluate_approved_graph"):
         payload = current_payload(
             {
                 "iterations": 1,
@@ -559,13 +571,13 @@ def render_engineer_report(engineer: Dict[str, Any]) -> None:
         cols[0].metric("Target", target_info.get("column", ""))
         cols[1].metric("Raw dtype", target_info.get("raw_dtype", ""))
         cols[2].metric("Unique", target_info.get("unique_values", 0))
-        cols[3].metric("Baseline encoded", "yes" if target_info.get("baseline_encoded") else "no")
+        cols[3].metric("Reference mapping", "yes" if target_info.get("reference_encoded") else "no")
         st.caption(
-            "Fedot graph receives raw target values. Encoding shown here is used only for sklearn baselines when needed."
+            "Fedot graph receives raw target values. Mapping is shown only to make class labels readable in diagnostics."
         )
-        if target_info.get("baseline_encoding"):
-            st.write("Sklearn baseline label mapping")
-            st.json(target_info["baseline_encoding"])
+        if target_info.get("reference_encoding"):
+            st.write("Reference label mapping")
+            st.json(target_info["reference_encoding"])
         if target_info.get("sample_values"):
             st.caption("Target sample: " + ", ".join(target_info["sample_values"][:8]))
 
@@ -584,24 +596,6 @@ def render_engineer_report(engineer: Dict[str, Any]) -> None:
         st.write("Graph metrics")
         st.dataframe(pd.DataFrame(metric_rows), use_container_width=True, hide_index=True)
 
-    baselines = engineer.get("baseline_results", []) or []
-    if baselines:
-        rows = []
-        for item in baselines:
-            metrics = item.get("metrics", {}) or {}
-            rows.append({
-                "baseline": item.get("name"),
-                "score": item.get("score", 0),
-                "accuracy": metrics.get("accuracy"),
-                "f1": metrics.get("f1"),
-                "roc_auc": metrics.get("roc_auc"),
-                "r2": metrics.get("r2"),
-                "rmse": metrics.get("rmse"),
-                "error": item.get("error"),
-            })
-        st.write("Baselines")
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
     render_diagnostics(engineer.get("diagnostics", []), "Engineer diagnostics", use_expander=False)
 
 
@@ -610,7 +604,7 @@ def render_critic_feedback(critic: Dict[str, Any]) -> None:
     st.write(critic.get("assessment", "No critic assessment."))
 
     cols = st.columns(2)
-    cols[0].metric("Winner", critic.get("winner", ""))
+    cols[0].metric("Decision", critic.get("winner", ""))
     cols[1].metric("Suggested changes", len(critic.get("suggested_mutations", []) or []))
 
     if critic.get("strengths"):
@@ -663,8 +657,8 @@ def results_tab() -> None:
 
     col1, col2, col3 = st.columns(3)
     col1.metric("Graph score", f"{engineer.get('graph_score', 0):.4f}")
-    col2.metric("Best baseline", f"{engineer.get('best_baseline_score', 0):.4f}")
-    col3.metric("Baseline model", engineer.get("best_baseline_name", ""))
+    col2.metric("Critic decision", critic.get("winner", ""))
+    col3.metric("Suggested changes", len(critic.get("suggested_mutations", []) or []))
 
     st.markdown("#### Evaluated Graph")
     render_graph(item.get("architect", {}).get("graph", {}), show_details=False)
@@ -731,7 +725,7 @@ def main() -> None:
     config = load_config()
     tools = load_tools()
 
-    tabs = st.tabs(["Data", "Architect", "Graph Editor", "Evaluate", "Feedback", "Report", "MCP Tools"])
+    tabs = st.tabs(["Data", "Architect", "Graph Editor", "Feedback", "Report", "MCP Tools"])
     with tabs[0]:
         data_tab()
     with tabs[1]:
@@ -739,12 +733,10 @@ def main() -> None:
     with tabs[2]:
         graph_editor_tab(config)
     with tabs[3]:
-        run_tab()
-    with tabs[4]:
         results_tab()
-    with tabs[5]:
+    with tabs[4]:
         report_tab()
-    with tabs[6]:
+    with tabs[5]:
         tools_tab(tools)
 
 

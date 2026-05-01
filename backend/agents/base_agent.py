@@ -6,7 +6,7 @@ import os
 import re
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from openai import OpenAI
 
@@ -83,6 +83,21 @@ def extract_json_block(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def extract_json_value(text: str) -> Optional[Any]:
+    if not text:
+        return None
+    fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+    candidates = [fenced.group(1)] if fenced else []
+    candidates.append(text)
+    for candidate in candidates:
+        try:
+            return json.loads(candidate.strip())
+        except json.JSONDecodeError:
+            pass
+    parsed = extract_json_block(text)
+    return parsed
+
+
 class BaseAgent(ABC):
     SYSTEM_PROMPT: str = ""
     ALLOWED_TOOLS: List[str] = []
@@ -153,6 +168,23 @@ class BaseAgent(ABC):
                 tool_calls = getattr(msg, "tool_calls", None) or []
 
                 if not tool_calls:
+                    pseudo_calls = self._extract_pseudo_tool_calls(msg.content or "", tools or [])
+                    if pseudo_calls:
+                        messages.append({"role": "assistant", "content": msg.content or ""})
+                        for name, args in pseudo_calls:
+                            result = await self.call_mcp_tool(name, args)
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        f"MCP tool result for {name}:\n"
+                                        f"{json.dumps(result, default=str, ensure_ascii=False)}\n\n"
+                                        "Continue from this result. If another tool is needed, return one JSON object "
+                                        "with keys name and arguments. Otherwise return final ANALYSIS and REASONING."
+                                    ),
+                                }
+                            )
+                        continue
                     return {"full_response": msg.content or "", "success": True, "rounds": round_num + 1}
 
                 messages.append({
@@ -184,6 +216,30 @@ class BaseAgent(ABC):
         except Exception as e:
             self.logger.error(f"[{self.name}] LLM error: {e}")
             return {"full_response": "", "success": False, "error": str(e)}
+
+    @staticmethod
+    def _extract_pseudo_tool_calls(text: str, tools: List[Dict[str, Any]]) -> List[Tuple[str, Dict[str, Any]]]:
+        if not text or not tools:
+            return []
+        allowed = {tool["function"]["name"] for tool in tools if "function" in tool and "name" in tool["function"]}
+        parsed = extract_json_value(text)
+        if parsed is None:
+            return []
+        items = parsed if isinstance(parsed, list) else [parsed]
+        calls: List[Tuple[str, Dict[str, Any]]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name") or item.get("tool") or item.get("tool_name")
+            args = item.get("arguments") or item.get("args") or {}
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+            if name in allowed and isinstance(args, dict):
+                calls.append((name, args))
+        return calls
 
     @abstractmethod
     async def execute(self, *args, **kwargs) -> Any:

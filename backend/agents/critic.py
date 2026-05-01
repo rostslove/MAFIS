@@ -11,17 +11,16 @@ logger = logging.getLogger("Critic")
 
 
 class Critic(BaseAgent):
-    """Evaluation agent for graph-vs-baseline analysis."""
+    """Evaluation agent for standalone graph quality analysis."""
 
     ALLOWED_TOOLS = [
         "validate_graph",
-        "analyze_errors",
         "get_node_importance",
         "explain_graph",
     ]
 
     SYSTEM_PROMPT = """You are an ML Critic for GraphAutoML.
-You inspect a trained pipeline graph, baseline scores, cross-validation, and node importance.
+You inspect a trained pipeline graph, data profile, cross-validation, and node importance.
 Suggest graph mutations only in this JSON shape:
 {
   "assessment": "...",
@@ -52,14 +51,6 @@ Return JSON only."""
         graph_json = json.dumps(graph, ensure_ascii=False)
 
         try:
-            baseline_json = json.dumps(
-                [
-                    {"name": r.name, "score": r.score, "metrics": r.metrics, "error": r.error}
-                    for r in engineer_result.baseline_results
-                ],
-                ensure_ascii=False,
-            )
-
             if engineer_result.graph_error:
                 validation = {
                     "skipped": "Graph training failed; cross-validation would repeat the same failure.",
@@ -67,14 +58,6 @@ Return JSON only."""
                 }
             else:
                 validation = await self._validate_graph(graph_json, data_context)
-            error_analysis = await self.call_mcp_tool(
-                "analyze_errors",
-                {
-                    "baseline_results_json": baseline_json,
-                    "graph_score": engineer_result.graph_score,
-                    "task_type": data_context.task_type,
-                },
-            )
             if engineer_result.graph_error or engineer_result.graph_score <= 0:
                 explanation = {
                     "skipped": "Graph was not trained successfully; explanation is unavailable.",
@@ -85,10 +68,9 @@ Return JSON only."""
                 explanation = await self.call_mcp_tool("explain_graph", {"top_k": 10})
                 node_importance = await self._maybe_get_node_importance(graph, graph_json, data_context)
 
-            feedback.winner = "graph" if engineer_result.graph_score >= engineer_result.best_baseline_score else "baseline"
-            feedback.assessment = self._build_assessment(engineer_result, validation, error_analysis)
-            feedback.strengths = self._strengths(engineer_result, validation, error_analysis)
-            feedback.weaknesses = self._weaknesses(engineer_result, validation, error_analysis)
+            feedback.assessment = self._build_assessment(engineer_result, validation, data_context)
+            feedback.strengths = self._strengths(engineer_result, validation, data_context)
+            feedback.weaknesses = self._weaknesses(engineer_result, validation, data_context)
             feedback.diagnostics = self._collect_diagnostics(engineer_result, validation, node_importance)
             feedback.explanation = explanation if isinstance(explanation, dict) else {}
             feedback.node_importance = (
@@ -102,34 +84,34 @@ Return JSON only."""
             llm_feedback = {}
             feedback.suggested_mutations = (
                 llm_feedback.get("suggested_mutations")
-                or self._fallback_mutations(graph, data_context, engineer_result)
+                or self._fallback_mutations(graph, data_context, engineer_result, validation if isinstance(validation, dict) else {})
             )
             feedback.improvement_plan = self._build_improvement_plan(
                 graph,
                 data_context,
                 engineer_result,
                 validation if isinstance(validation, dict) else {},
-                error_analysis if isinstance(error_analysis, dict) else {},
                 feedback.suggested_mutations,
             )
             feedback.should_stop = bool(
                 llm_feedback.get("should_stop")
                 if "should_stop" in llm_feedback
-                else self._should_stop(engineer_result, feedback)
+                else self._should_stop(engineer_result, feedback, validation if isinstance(validation, dict) else {}, data_context.task_type)
             )
+            feedback.winner = "accepted" if feedback.should_stop else "needs_revision"
             feedback.full_response = json.dumps(llm_feedback, ensure_ascii=False) if llm_feedback else "Deterministic critic fallback"
             feedback.tool_calls = self.get_tool_calls()
-            logger.info("[Critic] winner=%s, stop=%s", feedback.winner, feedback.should_stop)
+            logger.info("[Critic] decision=%s, stop=%s", feedback.winner, feedback.should_stop)
             return feedback
 
         except Exception as exc:
             logger.exception("[Critic] failed")
-            feedback.winner = "graph" if engineer_result.graph_score >= engineer_result.best_baseline_score else "baseline"
+            feedback.winner = "needs_revision"
             feedback.assessment = f"Critic fallback after error: {exc}"
             feedback.weaknesses = ["Critic LLM/tool analysis failed"]
             feedback.diagnostics = list(engineer_result.diagnostics)
-            feedback.suggested_mutations = self._fallback_mutations(graph, data_context, engineer_result)
-            feedback.improvement_plan = self._build_improvement_plan(graph, data_context, engineer_result, {}, {}, feedback.suggested_mutations)
+            feedback.suggested_mutations = self._fallback_mutations(graph, data_context, engineer_result, {})
+            feedback.improvement_plan = self._build_improvement_plan(graph, data_context, engineer_result, {}, feedback.suggested_mutations)
             feedback.should_stop = False
             feedback.tool_calls = self.get_tool_calls()
             return feedback
@@ -167,7 +149,6 @@ Return JSON only."""
         dc: DataContext,
         engineer: EngineerResult,
         validation: Dict[str, Any],
-        error_analysis: Dict[str, Any],
         initial: CriticFeedback,
     ) -> Dict[str, Any]:
         context = f"""Task: {dc.task_type}
@@ -175,9 +156,7 @@ Profile: {json.dumps(dc.profile, ensure_ascii=False)}
 Graph: {json.dumps(graph, ensure_ascii=False)}
 Graph score: {engineer.graph_score}
 Graph metrics: {json.dumps(engineer.graph_metrics, ensure_ascii=False)}
-Best baseline: {engineer.best_baseline_name} = {engineer.best_baseline_score}
 Validation: {json.dumps(validation, ensure_ascii=False)}
-Error analysis: {json.dumps(error_analysis, ensure_ascii=False)}
 Initial assessment: {initial.assessment}
 Allowed operations are constrained by the graph task type. Suggest at most 2 concrete mutations.
 Return JSON only."""
@@ -186,43 +165,37 @@ Return JSON only."""
         return parsed or {}
 
     @staticmethod
-    def _build_assessment(engineer: EngineerResult, validation: Dict[str, Any], error_analysis: Dict[str, Any]) -> str:
+    def _build_assessment(engineer: EngineerResult, validation: Dict[str, Any], dc: DataContext) -> str:
         if engineer.graph_error:
-            return (
-                f"Graph failed during training: {engineer.graph_error[:220]}. "
-                f"Best baseline is {engineer.best_baseline_name or 'none'} "
-                f"{engineer.best_baseline_score:.4f}."
-            )
+            return f"Graph failed during training: {engineer.graph_error[:220]}."
         cv = ""
         if isinstance(validation, dict) and "score_mean" in validation:
             cv = f", CV mean {validation.get('score_mean', 0):.4f} +/- {validation.get('score_std', 0):.4f}"
-        delta = error_analysis.get("delta") if isinstance(error_analysis, dict) else None
-        delta_text = f", delta vs baseline {delta}" if delta is not None else ""
+        issues = dc.profile.get("issues", [])
+        issue_text = f" Data issues: {issues}." if issues and issues != ["none"] else ""
         return (
-            f"Graph score {engineer.graph_score:.4f}, best baseline "
-            f"{engineer.best_baseline_name or 'none'} {engineer.best_baseline_score:.4f}"
-            f"{cv}{delta_text}."
+            f"Graph score {engineer.graph_score:.4f}{cv}. "
+            f"Assessment is based on graph metrics, validation stability, node behavior, and data profile."
+            f"{issue_text}"
         )
 
     @staticmethod
-    def _strengths(engineer: EngineerResult, validation: Dict[str, Any], error_analysis: Dict[str, Any]) -> List[str]:
+    def _strengths(engineer: EngineerResult, validation: Dict[str, Any], dc: DataContext) -> List[str]:
         strengths = []
         if engineer.graph_error:
-            if engineer.best_baseline_score > 0:
-                return ["Baselines trained successfully, so the dataset itself is readable"]
             return ["The failure was captured and converted into diagnostics"]
         if engineer.graph_score > 0:
             strengths.append("The proposed graph trained successfully")
-        if engineer.graph_score >= engineer.best_baseline_score:
-            strengths.append("The graph matches or beats the strongest baseline")
         if validation.get("score_std", 1) < 0.05:
             strengths.append("Cross-validation variance is low")
-        if error_analysis.get("graph_beats_baselines"):
-            strengths.append("Baseline comparison favors the graph")
+        if dc.task_type in ("classification", "regression") and len(engineer.graph_metrics) > 1:
+            strengths.append("The graph produced multiple interpretable quality metrics")
+        if not dc.profile.get("issues") or dc.profile.get("issues") == ["none"]:
+            strengths.append("The data profile does not show obvious structural issues")
         return strengths or ["The pipeline produced evaluable metrics"]
 
     @staticmethod
-    def _weaknesses(engineer: EngineerResult, validation: Dict[str, Any], error_analysis: Dict[str, Any]) -> List[str]:
+    def _weaknesses(engineer: EngineerResult, validation: Dict[str, Any], dc: DataContext) -> List[str]:
         weaknesses = []
         if engineer.graph_error:
             weaknesses.append("The graph could not be trained")
@@ -230,15 +203,17 @@ Return JSON only."""
             return weaknesses
         if engineer.graph_score <= 0:
             weaknesses.append("The graph score is zero or unavailable")
-        if engineer.best_baseline_score > engineer.graph_score:
-            weaknesses.append("A simple baseline currently outperforms the graph")
+        if engineer.graph_score < Critic._target_quality_floor(dc.task_type):
+            weaknesses.append("The graph metric is below the target quality floor for this task")
         if validation.get("score_std", 0) > 0.1:
             weaknesses.append("Cross-validation variance is high")
-        if error_analysis.get("failed_baselines"):
-            weaknesses.append(f"Some baselines failed: {error_analysis['failed_baselines']}")
-        return weaknesses or ["No major weakness detected from current metrics"]
+        issues = dc.profile.get("issues", []) or []
+        for issue in issues:
+            if issue != "none":
+                weaknesses.append(f"Data profile issue: {issue}")
+        return weaknesses
 
-    def _fallback_mutations(self, graph: Dict[str, Any], dc: DataContext, engineer: EngineerResult) -> List[Dict[str, Any]]:
+    def _fallback_mutations(self, graph: Dict[str, Any], dc: DataContext, engineer: EngineerResult, validation: Dict[str, Any]) -> List[Dict[str, Any]]:
         nodes = graph.get("nodes", [])
         root_id = self._root_id(nodes)
         if not root_id:
@@ -252,11 +227,14 @@ Return JSON only."""
         if mutations:
             return mutations[:2]
 
-        baseline_op = self._baseline_to_operation(dc.task_type, engineer.best_baseline_name)
         current_root = next((n for n in nodes if n.get("id") == root_id), {})
 
-        if engineer.best_baseline_score > engineer.graph_score and baseline_op and current_root.get("operation") != baseline_op:
-            mutations.append({"type": "replace", "node_id": root_id, "new_operation": baseline_op})
+        score_floor = self._target_quality_floor(dc.task_type)
+        unstable = validation.get("score_std", 0) > 0.1
+        if engineer.graph_score < score_floor or unstable:
+            candidate = self._next_model_candidate(dc.task_type, current_root.get("operation", ""))
+            if candidate:
+                mutations.append({"type": "replace", "node_id": root_id, "new_operation": candidate})
 
         if dc.task_type.startswith("ts_") and not any("fourier" in n.get("operation", "") for n in nodes):
             mutations.append(
@@ -275,26 +253,22 @@ Return JSON only."""
         dc: DataContext,
         engineer: EngineerResult,
         validation: Dict[str, Any],
-        error_analysis: Dict[str, Any],
         mutations: List[Dict[str, Any]],
     ) -> List[str]:
         plan: List[str] = []
         if engineer.graph_error:
-            plan.append("First fix the graph/runtime error before comparing model quality.")
+            plan.append("First fix the graph/runtime error before judging model quality.")
             plan.extend(self._diagnostic_recommendations(engineer.diagnostics))
             return self._unique_strings(plan)
 
-        delta = error_analysis.get("delta") if isinstance(error_analysis, dict) else None
-        if engineer.best_baseline_score > engineer.graph_score:
+        quality_floor = self._target_quality_floor(dc.task_type)
+        if engineer.graph_score < quality_floor:
             plan.append(
-                f"The graph is behind the best baseline ({engineer.best_baseline_name}) "
-                f"by about {abs(float(delta or engineer.best_baseline_score - engineer.graph_score)):.4f}."
+                f"The graph score is below the standalone target floor for {dc.task_type} "
+                f"({engineer.graph_score:.4f} < {quality_floor:.2f})."
             )
-            mapped = self._baseline_to_operation(dc.task_type, engineer.best_baseline_name)
-            if mapped:
-                plan.append(f"Replace the current model node with '{mapped}' because that family performed best as a baseline.")
         else:
-            plan.append("The graph is competitive with baselines; keep the structure and validate it on more data.")
+            plan.append("The graph passes the current standalone quality check; keep it unless domain constraints require changes.")
 
         if validation.get("score_std", 0) > 0.05:
             plan.append("Cross-validation variance is noticeable; prefer simpler models or stronger regularization.")
@@ -362,29 +336,31 @@ Return JSON only."""
         return roots[0] if roots else ""
 
     @staticmethod
-    def _baseline_to_operation(task_type: str, baseline_name: str) -> str:
-        mapping = {
-            "classification": {"logreg": "logit", "rf": "rf", "xgb": "xgboost"},
-            "regression": {"ridge": "ridge", "rf": "treg", "xgb": "xgbreg"},
-            "ts_classification": {
-                "logreg": "industrial_stat_clf",
-                "rf": "industrial_stat_clf",
-                "xgb": "industrial_freq_clf",
-            },
-            "ts_regression": {
-                "ridge": "industrial_stat_reg",
-                "rf": "industrial_stat_reg",
-                "xgb": "industrial_freq_reg",
-            },
-        }
-        return mapping.get(task_type, {}).get(baseline_name, "")
+    def _target_quality_floor(task_type: str) -> float:
+        return {
+            "classification": 0.75,
+            "regression": 0.60,
+            "ts_classification": 0.70,
+            "ts_regression": 0.50,
+            "ts_forecasting": 0.0,
+        }.get(task_type, 0.0)
 
     @staticmethod
-    def _should_stop(engineer: EngineerResult, feedback: CriticFeedback) -> bool:
+    def _next_model_candidate(task_type: str, current: str) -> str:
+        candidates = {
+            "classification": ["xgboost", "rf", "logit"],
+            "regression": ["xgbreg", "treg", "ridge"],
+            "ts_classification": ["industrial_freq_clf", "industrial_stat_clf"],
+            "ts_regression": ["industrial_freq_reg", "industrial_stat_reg"],
+        }.get(task_type, [])
+        return next((candidate for candidate in candidates if candidate != current), "")
+
+    @staticmethod
+    def _should_stop(engineer: EngineerResult, feedback: CriticFeedback, validation: Dict[str, Any], task_type: str) -> bool:
         if engineer.graph_score <= 0:
             return False
-        if feedback.winner != "graph":
+        if feedback.weaknesses:
             return False
-        return engineer.graph_score >= 0.95 or (
-            engineer.best_baseline_score > 0 and engineer.graph_score - engineer.best_baseline_score > 0.02
-        )
+        if validation.get("score_std", 0) > 0.1:
+            return False
+        return engineer.graph_score >= Critic._target_quality_floor(task_type)

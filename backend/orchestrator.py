@@ -107,11 +107,11 @@ async def run_orchestration_stream(
                 graph=graph.to_dict(),
                 mermaid=graph.to_mermaid(),
                 analysis="User-approved initial graph",
-                reasoning="The first iteration trains the approved graph without structural changes.",
+                reasoning="This evaluation trains the approved graph without structural changes.",
             )
 
         for iteration in range(1, max(1, iterations) + 1):
-            yield _event("status", message=f"Iteration {iteration}/{iterations}")
+            yield _event("status", message="Evaluating the approved pipeline")
 
             try:
                 yield _event("agent_start", agent="Architect", iteration=iteration, step="1/3")
@@ -141,11 +141,7 @@ async def run_orchestration_stream(
                     "agent_done",
                     agent="Engineer",
                     iteration=iteration,
-                    summary=(
-                        f"Graph score: {engineer_result.graph_score:.4f}; "
-                        f"best baseline: {engineer_result.best_baseline_name or 'none'} "
-                        f"{engineer_result.best_baseline_score:.4f}"
-                    ),
+                    summary=f"Graph score: {engineer_result.graph_score:.4f}",
                     diagnostics=engineer_result.diagnostics,
                     graph_error=engineer_result.graph_error,
                     tool_calls_count=len(engineer_result.tool_calls),
@@ -165,8 +161,8 @@ async def run_orchestration_stream(
                     agent="Critic",
                     iteration=iteration,
                     summary=(
-                        f"Winner: {critic_result.winner}; stop={critic_result.should_stop}; "
-                        f"mutations={len(critic_result.suggested_mutations)}"
+                        f"Decision: {critic_result.winner}; "
+                        f"suggested changes={len(critic_result.suggested_mutations)}"
                     ),
                     diagnostics=critic_result.diagnostics,
                     tool_calls_count=len(critic_result.tool_calls),
@@ -184,7 +180,6 @@ async def run_orchestration_stream(
                         iteration=iteration,
                         graph=architect_result.graph,
                         graph_score=engineer_result.graph_score,
-                        best_baseline_score=engineer_result.best_baseline_score,
                         winner=critic_result.winner,
                         suggested_mutations=critic_result.suggested_mutations,
                     )
@@ -194,7 +189,6 @@ async def run_orchestration_stream(
                     "iteration_done",
                     iteration=iteration,
                     graph_score=engineer_result.graph_score,
-                    best_baseline_score=engineer_result.best_baseline_score,
                     winner=critic_result.winner,
                     graph=architect_result.graph,
                     mermaid=architect_result.mermaid,
@@ -204,21 +198,10 @@ async def run_orchestration_stream(
                 prev_feedback = critic_result
                 prev_graph = architect_result.graph
 
-                if critic_result.should_stop:
-                    yield _event("status", message="Early stop: Critic accepted the graph")
-                    break
-
-                if len(data_context.iteration_history) >= 2:
-                    last = data_context.iteration_history[-1]
-                    before = data_context.iteration_history[-2]
-                    if abs(last.graph_score - before.graph_score) < 0.001 and last.graph_score > 0:
-                        yield _event("status", message="Early stop: graph score plateaued")
-                        break
-
             except Exception as exc:
-                logger.exception("Iteration %s failed", iteration)
+                logger.exception("Evaluation %s failed", iteration)
                 all_results.append({"iteration": iteration, "error": str(exc), "status": "failed"})
-                yield _event("error", message=f"Iteration {iteration} failed: {str(exc)[:200]}")
+                yield _event("error", message=f"Evaluation failed: {str(exc)[:200]}")
 
         yield _event("agent_start", agent="Scribe", iteration=0, step="final")
         scribe_result = await scribe.execute(all_results, data_context)
@@ -434,21 +417,17 @@ def _get_best_iteration(all_results):
 def _create_summary(all_results, task_type):
     ok = [item for item in all_results if "error" not in item]
     if not ok:
-        return {"status": "no successful iterations", "task_type": task_type}
+        return {"status": "no successful evaluations", "task_type": task_type}
 
     graph_scores = [float(item.get("engineer", {}).get("graph_score", 0) or 0) for item in ok]
-    baseline_scores = [float(item.get("engineer", {}).get("best_baseline_score", 0) or 0) for item in ok]
     return {
-        "total_iterations": len(all_results),
-        "successful_iterations": len(ok),
+        "total_evaluations": len(all_results),
+        "successful_evaluations": len(ok),
         "task_type": task_type,
         "is_time_series": is_ts_task(task_type),
         "avg_graph_score": sum(graph_scores) / len(graph_scores),
-        "avg_baseline_score": sum(baseline_scores) / len(baseline_scores),
         "max_graph_score": max(graph_scores),
-        "max_baseline_score": max(baseline_scores),
-        "graph_wins_count": sum(
-            1 for item in ok if item.get("critic", {}).get("winner") == "graph"
+        "accepted_count": sum(
+            1 for item in ok if item.get("critic", {}).get("winner") == "accepted"
         ),
-        "early_stopped": any(item.get("critic", {}).get("should_stop", False) for item in ok),
     }

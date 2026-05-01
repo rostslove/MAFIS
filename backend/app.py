@@ -32,9 +32,9 @@ logger = logging.getLogger(__name__)
 
 AGENT_TOOLS = {
     "architect": ["get_data_profile", "get_available_operations", "propose_graph", "mutate_graph", "visualize_graph"],
-    "engineer": ["get_baselines", "train_baseline", "tune_graph_hyperparameters", "train_graph"],
-    "critic": ["validate_graph", "analyze_errors", "get_node_importance", "explain_graph"],
-    "scribe": ["generate_report", "visualize_graph"],
+    "engineer": ["tune_graph_hyperparameters", "train_graph"],
+    "critic": ["validate_graph", "get_node_importance", "explain_graph"],
+    "scribe": ["generate_report"],
 }
 
 TOOL_DESCRIPTIONS = {
@@ -43,15 +43,12 @@ TOOL_DESCRIPTIONS = {
     "propose_graph": "Validate a graph candidate and return Mermaid markup",
     "mutate_graph": "Apply add/remove/replace/set_params/connect mutations to a graph",
     "visualize_graph": "Render graph JSON to Mermaid markup",
-    "get_baselines": "List simple sklearn baselines for the task",
-    "train_baseline": "Train and score one baseline model",
     "tune_graph_hyperparameters": "Tune node hyperparameters without changing graph structure",
     "train_graph": "Fit and score a graph exactly as proposed",
     "validate_graph": "Cross-validate a graph",
-    "analyze_errors": "Compare graph score with baseline scores",
     "get_node_importance": "Estimate node contribution by ablation",
     "explain_graph": "Explain the last trained graph if model internals expose importances",
-    "generate_report": "Compile iteration results into a final report summary",
+    "generate_report": "Compile evaluation results into a final report summary",
 }
 
 

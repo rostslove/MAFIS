@@ -1,11 +1,11 @@
-"""Engineer: trains the Architect graph and baseline models through MCP tools."""
+"""Engineer: trains the approved Architect graph through MCP tools."""
 
 import json
 import logging
 from typing import Any, Dict, List
 
 from .base_agent import BaseAgent
-from .schemas import ArchitectResult, BaselineResult, DataContext, EngineerResult
+from .schemas import ArchitectResult, DataContext, EngineerResult
 
 logger = logging.getLogger("Engineer")
 
@@ -14,14 +14,12 @@ class Engineer(BaseAgent):
     """Technical agent responsible for fitting and tuning a proposed graph."""
 
     ALLOWED_TOOLS = [
-        "get_baselines",
-        "train_baseline",
         "tune_graph_hyperparameters",
         "train_graph",
     ]
 
     SYSTEM_PROMPT = """You are an ML Engineer. You receive a validated pipeline graph.
-Your role is to train simple baselines, tune graph hyperparameters, and train the graph as-is.
+Your role is to tune graph hyperparameters when safe and train the graph as-is.
 Do not change graph structure; only node parameters may be tuned."""
 
     def __init__(self, name: str = "Engineer", mcp_client=None):
@@ -33,7 +31,6 @@ Do not change graph structure; only node parameters may be tuned."""
         graph_json = json.dumps(architect_result.graph, ensure_ascii=False)
 
         try:
-            await self._train_baselines(result, data_context)
             graph_run = await self._train_graph(graph_json, data_context)
 
             if isinstance(graph_run, dict):
@@ -48,23 +45,16 @@ Do not change graph structure; only node parameters may be tuned."""
                 if result.graph_error:
                     result.graph_metrics["error"] = result.graph_error
 
-            if result.target_info.get("baseline_encoded"):
+            if result.target_info.get("reference_encoded"):
                 result.training_notes.append(
-                    "Fedot graph used the raw target values; sklearn baselines used this label mapping: "
-                    f"{result.target_info.get('baseline_encoding', {})}"
+                    "Fedot graph used the raw target values. Reference label mapping for readable diagnostics: "
+                    f"{result.target_info.get('reference_encoding', {})}"
                 )
-
-            if result.baseline_results:
-                best = max(result.baseline_results, key=lambda r: r.score)
-                result.best_baseline_name = best.name
-                result.best_baseline_score = best.score
 
             result.tool_calls = self.get_tool_calls()
             logger.info(
-                "[Engineer] graph=%.4f, best baseline=%s %.4f",
+                "[Engineer] graph=%.4f",
                 result.graph_score,
-                result.best_baseline_name or "none",
-                result.best_baseline_score,
             )
             return result
 
@@ -85,56 +75,14 @@ Do not change graph structure; only node parameters may be tuned."""
             result.tool_calls = self.get_tool_calls()
             return result
 
-    async def _train_baselines(self, result: EngineerResult, dc: DataContext) -> None:
-        response = await self.call_mcp_tool("get_baselines", {"task_type": dc.task_type})
-        names = response.get("baselines", []) if isinstance(response, dict) else []
-
-        for name in names:
-            baseline = await self.call_mcp_tool(
-                "train_baseline",
-                {
-                    "csv_path": dc.csv_path,
-                    "target_column": dc.target_column,
-                    "baseline_name": name,
-                    "task_type": dc.task_type,
-                },
-            )
-            if isinstance(baseline, dict):
-                result.baseline_results.append(
-                    BaselineResult(
-                        name=baseline.get("name", name),
-                        score=float(baseline.get("score") or 0),
-                        metrics=baseline.get("metrics", {}) or {},
-                        error=baseline.get("error"),
-                        target_info=baseline.get("target_info", {}) or {},
-                    )
-                )
-                if not result.target_info and baseline.get("target_info"):
-                    result.target_info = baseline["target_info"]
-
     async def _train_graph(self, graph_json: str, dc: DataContext) -> dict:
         if dc.task_type in ("classification", "ts_classification"):
             trained = await self._train_without_tuning(graph_json, dc)
             trained.setdefault("training_notes", []).append(
                 "Fedot hyperparameter tuning was skipped for classification because Fedot.Industrial 0.5 "
                 "prints internal ROC-AUC shape tracebacks for binary probability matrices during tuning. "
-                "The graph was trained as-is and scored with external sklearn metrics."
-            )
-            trained.setdefault("diagnostics", []).append(
-                {
-                    "agent": "Engineer",
-                    "kind": "tuning_skipped",
-                    "summary": "Classification tuning skipped to avoid noisy Fedot ROC-AUC metric tracebacks.",
-                    "technical_message": (
-                        "Fedot tuner can call roc_auc_score with y_score shaped (n_samples, 2). "
-                        "The exception is internal to tuner metric evaluation and does not mean the final graph cannot train."
-                    ),
-                    "recommendations": [
-                        "Compare the graph against baselines first.",
-                        "Use manual model replacement from Critic feedback instead of automatic tuner for classification.",
-                    ],
-                    "recoverable": True,
-                }
+                "The graph was trained as-is and scored with external sklearn metrics. To improve it, use "
+                "manual graph mutations or explicit node parameters instead of Fedot's classification tuner."
             )
             return trained
 
