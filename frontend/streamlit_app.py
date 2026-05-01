@@ -22,6 +22,7 @@ DEFAULT_METRICS_BY_TASK = {
     "ts_regression": ["r2", "rmse", "mae"],
     "ts_forecasting": ["rmse", "mae", "mape", "smape"],
 }
+DEFAULT_M4_GROUPS = ["Daily", "Weekly", "Monthly", "Quarterly", "Yearly"]
 METRIC_METADATA_KEYS = {
     "error",
     "primary_metric",
@@ -60,7 +61,14 @@ def load_tools() -> Dict[str, Any]:
 
 def post_json(path: str, payload: Dict[str, Any], timeout: int = 120) -> Dict[str, Any]:
     response = requests.post(f"{BACKEND_URL}{path}", json=payload, timeout=timeout)
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        try:
+            detail = response.json().get("detail", response.text)
+        except Exception:
+            detail = response.text
+        raise RuntimeError(f"{response.status_code}: {detail}") from exc
     return response.json()
 
 
@@ -156,7 +164,7 @@ def root_node_id(graph: Dict[str, Any]) -> str:
 
 def require_dataset() -> bool:
     if not st.session_state.get("csv_path") or "df" not in st.session_state:
-        st.info("Upload a CSV file to start.")
+        st.info("Upload a CSV file to start, or use the Benchmarks tab to run M4 without uploading a dataset.")
         return False
     return True
 
@@ -1023,6 +1031,162 @@ def render_evaluation_history(current_result: Dict[str, Any]) -> None:
             )
 
 
+def m4_default_graph(config: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "task_type": "ts_classification",
+        "nodes": config.get("default_graphs", {}).get(
+            "ts_classification",
+            [
+                {"id": "feat", "operation": "quantile_extractor", "params": {}, "inputs": []},
+                {"id": "model", "operation": "industrial_stat_clf", "params": {}, "inputs": ["feat"]},
+            ],
+        ),
+    }
+
+
+def m4_graph_for_run(config: Dict[str, Any], source: str) -> Dict[str, Any]:
+    approved = st.session_state.get("approved_graph") or {}
+    if source == "Approved ts_classification graph" and approved.get("task_type") == "ts_classification":
+        return approved
+    return m4_default_graph(config)
+
+
+def render_m4_benchmark_result(result: Dict[str, Any]) -> None:
+    if not result:
+        return
+
+    if result.get("error"):
+        st.error(result["error"])
+        render_diagnostics(result.get("diagnostics", []) or [], "Benchmark diagnostics", use_expander=False)
+        return
+
+    st.markdown("#### M4 Benchmark Result")
+    metrics = result.get("test_metrics", {}) or result.get("metrics", {}) or {}
+    train_metrics = result.get("train_metrics", {}) or {}
+    primary_metric = metrics.get("primary_metric") or "score"
+    primary_value = metrics.get("primary_metric_value", result.get("score", 0))
+    train_value = train_metrics.get("primary_metric_value", "")
+    dataset = result.get("dataset", {}) or {}
+
+    cols = st.columns(4)
+    cols[0].metric(f"Test {primary_metric}", format_number(primary_value))
+    cols[1].metric(f"Train {primary_metric}", format_number(train_value))
+    cols[2].metric("Groups", len(dataset.get("groups", []) or []))
+    cols[3].metric("Window", dataset.get("window_length", ""))
+
+    render_graph(result.get("graph", {}), show_details=False)
+    render_split_info(result.get("split_info", {}) or {})
+
+    train_col, test_col = st.columns(2)
+    with train_col:
+        render_metric_table("Train metrics", train_metrics)
+    with test_col:
+        render_metric_table("Test metrics (hold-out)", metrics)
+
+    if result.get("class_report"):
+        st.write("Per-group test metrics")
+        st.dataframe(pd.DataFrame(result["class_report"]), use_container_width=True, hide_index=True)
+
+    if result.get("group_counts"):
+        st.write("Group split")
+        st.dataframe(pd.DataFrame(result["group_counts"]), use_container_width=True, hide_index=True)
+
+    source_files = dataset.get("source_files", []) or []
+    if source_files:
+        with st.expander("M4 source files"):
+            st.dataframe(pd.DataFrame(source_files), use_container_width=True, hide_index=True)
+
+
+def benchmarks_tab(config: Dict[str, Any]) -> None:
+    st.subheader("Benchmarks")
+    bench_config = (config.get("benchmarks", {}) or {}).get("m4_classification", {})
+    groups = bench_config.get("groups") or DEFAULT_M4_GROUPS
+    metric_options = config.get("metrics_by_task", {}).get("ts_classification") or DEFAULT_METRICS_BY_TASK["ts_classification"]
+
+    st.write("M4 frequency-group classification")
+    st.caption(
+        "Uses real M4 train CSV files downloaded through datasetsforecast. "
+        "Each time series is one sample; the target class is its frequency group."
+    )
+
+    current_approved = st.session_state.get("approved_graph") or {}
+    graph_sources = ["Default ts_classification graph"]
+    if current_approved.get("task_type") == "ts_classification":
+        graph_sources.append("Approved ts_classification graph")
+
+    settings_col, graph_col = st.columns([1, 1])
+    with settings_col:
+        selected_groups = st.multiselect(
+            "M4 groups",
+            groups,
+            default=groups,
+            help="At least two groups are recommended because the benchmark is classification by frequency group.",
+        )
+        n_per_group = st.number_input(
+            "Series per group",
+            min_value=10,
+            max_value=1000,
+            value=int(bench_config.get("default_n_per_group", 100)),
+            step=10,
+        )
+        window_length = st.number_input(
+            "Window length",
+            min_value=8,
+            max_value=500,
+            value=int(bench_config.get("default_window_length", 50)),
+            step=5,
+        )
+        test_size = st.slider(
+            "M4 test size",
+            min_value=0.05,
+            max_value=0.5,
+            value=float(st.session_state.get("m4_test_size", 0.3)),
+            step=0.05,
+            key="m4_test_size",
+        )
+        metric = st.selectbox(
+            "M4 primary metric",
+            metric_options,
+            index=metric_options.index("f1") if "f1" in metric_options else 0,
+        )
+        standardize = st.checkbox("Standardize each series", value=True)
+        graph_source = st.selectbox("Benchmark graph", graph_sources)
+
+    graph = m4_graph_for_run(config, graph_source)
+    with graph_col:
+        st.write("Graph used for M4")
+        render_graph(graph, show_details=False)
+        st.dataframe(pd.DataFrame(graph_rows(graph)), use_container_width=True, hide_index=True)
+
+    if len(selected_groups or []) < 2:
+        st.warning("Select at least two M4 groups for a classification benchmark.")
+
+    if st.button(
+        "Run M4 Benchmark",
+        type="primary",
+        use_container_width=True,
+        key="run_m4_benchmark",
+        disabled=len(selected_groups or []) < 2,
+    ):
+        payload = {
+            "graph": graph,
+            "groups": selected_groups or groups,
+            "n_per_group": int(n_per_group),
+            "window_length": int(window_length),
+            "test_size": float(test_size),
+            "primary_metric": metric,
+            "standardize": bool(standardize),
+        }
+        try:
+            with st.spinner("Downloading/loading M4 and running the benchmark..."):
+                st.session_state.m4_benchmark_result = post_json("/benchmarks/m4", payload, timeout=3600)
+            st.success("M4 benchmark completed.")
+        except Exception as exc:
+            st.error(f"M4 benchmark failed: {exc}")
+
+    render_m4_benchmark_result(st.session_state.get("m4_benchmark_result", {}) or {})
+
+
 def results_tab() -> None:
     st.subheader("Evaluation Result")
     result = st.session_state.get("result")
@@ -1120,18 +1284,20 @@ def main() -> None:
     sidebar(config)
     tools = load_tools()
 
-    tabs = st.tabs(["Data", "Architect", "Graph Editor", "Feedback", "Report", "MCP Tools"])
+    tabs = st.tabs(["Data", "Benchmarks", "Architect", "Graph Editor", "Feedback", "Report", "MCP Tools"])
     with tabs[0]:
         data_tab()
     with tabs[1]:
-        architect_tab(config)
+        benchmarks_tab(config)
     with tabs[2]:
-        graph_editor_tab(config)
+        architect_tab(config)
     with tabs[3]:
-        results_tab()
+        graph_editor_tab(config)
     with tabs[4]:
-        report_tab()
+        results_tab()
     with tabs[5]:
+        report_tab()
+    with tabs[6]:
         tools_tab(tools)
 
 

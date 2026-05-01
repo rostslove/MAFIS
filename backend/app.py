@@ -3,6 +3,7 @@ import logging
 import os
 from typing import Any, Dict
 
+import anyio
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
@@ -27,6 +28,7 @@ from orchestrator import (
     run_orchestration_stream,
     tune_approved_graph,
 )
+from m4_benchmark import M4_GROUPS, run_m4_classification_benchmark
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -90,6 +92,16 @@ async def get_config(request):
         "openrouter_configured": "openrouter.ai" in LLM_BASE_URL and bool(os.getenv("OPENROUTER_API_KEY")),
         "fedot_ind_version": FEDOT_IND_VERSION,
         "fedot_industrial_source": FEDOT_INDUSTRIAL_SOURCE,
+        "benchmarks": {
+            "m4_classification": {
+                "name": "M4 frequency-group classification",
+                "task_type": "ts_classification",
+                "groups": list(M4_GROUPS),
+                "default_primary_metric": "f1",
+                "default_window_length": 50,
+                "default_n_per_group": 100,
+            }
+        },
     })
 
 
@@ -200,6 +212,27 @@ async def engineer_tune(request):
         return _error(str(exc), 500)
 
 
+async def benchmark_m4(request):
+    payload = await _json_body(request)
+    try:
+        result = await anyio.to_thread.run_sync(
+            lambda: run_m4_classification_benchmark(
+                graph=payload.get("graph"),
+                n_per_group=int(payload.get("n_per_group", 100) or 100),
+                window_length=int(payload.get("window_length", 50) or 50),
+                test_size=_payload_test_size(payload),
+                primary_metric=payload.get("primary_metric") or "f1",
+                random_state=int(payload.get("random_state", 42) or 42),
+                standardize=bool(payload.get("standardize", True)),
+                groups=payload.get("groups") or None,
+            )
+        )
+        return JSONResponse(result)
+    except Exception as exc:
+        logger.exception("M4 benchmark failed")
+        return _error(str(exc), 500)
+
+
 async def orchestrate_stream(request):
     payload = await _json_body(request)
 
@@ -242,6 +275,7 @@ routes = [
     Route("/orchestrate", orchestrate, methods=["POST"]),
     Route("/orchestrate/stream", orchestrate_stream, methods=["POST"]),
     Route("/engineer/tune", engineer_tune, methods=["POST"]),
+    Route("/benchmarks/m4", benchmark_m4, methods=["POST"]),
 ]
 
 app = Starlette(debug=False, routes=routes)
