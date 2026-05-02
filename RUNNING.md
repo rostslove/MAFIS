@@ -1,4 +1,4 @@
-# Running GraphAutoML with Fedot.Industrial 0.5.0
+# Running MultiAgentFedot.IndustrialSystem (MAFIS) with Fedot.Industrial 0.5.0
 
 `fedot-ind==0.5.0` is not installed from PyPI in this project. Use a local checkout of `Fedot.Industrial` and its Poetry environment.
 

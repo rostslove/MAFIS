@@ -19,7 +19,7 @@ class Critic(BaseAgent):
         "explain_graph",
     ]
 
-    SYSTEM_PROMPT = """You are an ML Critic for GraphAutoML.
+    SYSTEM_PROMPT = """You are an ML Critic for MultiAgentFedot.IndustrialSystem (MAFIS).
 You inspect a trained pipeline graph, data profile, cross-validation, and node importance.
 Suggest graph mutations only in this JSON shape:
 {
@@ -29,7 +29,9 @@ Suggest graph mutations only in this JSON shape:
   "suggested_mutations": [
     {"type": "replace", "node_id": "model", "new_operation": "rf"},
     {"type": "add", "node": {"id": "scale2", "operation": "scaling", "params": {}, "inputs": []}, "rewire_input_of": "model"},
-    {"type": "set_params", "node_id": "model", "params": {"n_estimators": 200}}
+    {"type": "set_params", "node_id": "model", "params": {"n_estimators": 200}},
+    {"type": "set_strategy", "strategy": {"name": "federated_automl", "params": {"timeout": 10, "n_splits": 5}}},
+    {"type": "clear_strategy"}
   ],
   "should_stop": false
 }
@@ -302,8 +304,43 @@ Return JSON only."""
                 }
             )
 
-        mutations = self._dedupe_mutations(mutations, current_root, dc.iteration_history)
+        if self._should_try_federated_strategy(graph, dc, engineer, unstable):
+            mutations.append(
+                {
+                    "type": "set_strategy",
+                    "strategy": {
+                        "name": "federated_automl",
+                        "params": {"timeout": 10, "n_splits": 5},
+                    },
+                }
+            )
+
+        mutations = self._dedupe_mutations(
+            mutations,
+            current_root,
+            graph.get("training_strategy") or {},
+            dc.iteration_history,
+        )
         return mutations[:3]
+
+    @staticmethod
+    def _should_try_federated_strategy(
+        graph: Dict[str, Any],
+        dc: DataContext,
+        engineer: EngineerResult,
+        unstable: bool,
+    ) -> bool:
+        if graph.get("training_strategy"):
+            return False
+        if dc.task_type not in ("classification", "regression", "ts_classification", "ts_regression"):
+            return False
+        try:
+            n_samples = int(dc.profile.get("n_samples") or 0)
+        except (TypeError, ValueError):
+            n_samples = 0
+        large_enough = n_samples >= 1000
+        quality_gap = engineer.graph_score < Critic._target_quality_floor(dc.task_type, dc.primary_metric)
+        return large_enough and (quality_gap or unstable or dc.task_type.startswith("ts_"))
 
     @staticmethod
     def _train_test_gap(engineer: EngineerResult) -> Optional[float]:
@@ -318,6 +355,7 @@ Return JSON only."""
     def _dedupe_mutations(
         mutations: List[Dict[str, Any]],
         current_root: Dict[str, Any],
+        current_strategy: Dict[str, Any],
         history: List[Any],
     ) -> List[Dict[str, Any]]:
         """Drop set_params whose params are already on the node and replaces that
@@ -325,10 +363,15 @@ Return JSON only."""
         current_params = current_root.get("params", {}) or {}
         current_op = current_root.get("operation", "")
         tried_ops = {current_op}
+        tried_strategies = {current_strategy.get("name")} if current_strategy.get("name") else set()
         for record in history or []:
-            for node in (getattr(record, "graph", {}) or {}).get("nodes", []):
+            record_graph = getattr(record, "graph", {}) or {}
+            for node in record_graph.get("nodes", []):
                 if node.get("id") == current_root.get("id"):
                     tried_ops.add(node.get("operation", ""))
+            strategy = record_graph.get("training_strategy") or {}
+            if strategy.get("name"):
+                tried_strategies.add(strategy.get("name"))
 
         cleaned: List[Dict[str, Any]] = []
         for mutation in mutations:
@@ -341,6 +384,13 @@ Return JSON only."""
                 mutation = {**mutation, "params": fresh}
             elif kind == "replace" and mutation.get("node_id") == current_root.get("id"):
                 if mutation.get("new_operation") in tried_ops:
+                    continue
+            elif kind == "set_strategy":
+                strategy = mutation.get("strategy") or {}
+                name = strategy.get("name") or strategy.get("strategy")
+                if not name:
+                    continue
+                if name in tried_strategies:
                     continue
             cleaned.append(mutation)
         return cleaned
@@ -385,6 +435,13 @@ Return JSON only."""
                 plan.append(f"Architect can draft a new graph by adding '{node.get('operation')}' before the model.")
             elif mutation.get("type") == "set_params":
                 plan.append(f"Architect can draft a new graph by updating parameters of node '{mutation.get('node_id')}'.")
+            elif mutation.get("type") == "set_strategy":
+                strategy = mutation.get("strategy", {}) or {}
+                plan.append(
+                    f"Architect can draft a run using the '{strategy.get('name')}' Fedot.Industrial strategy."
+                )
+            elif mutation.get("type") == "clear_strategy":
+                plan.append("Architect can return to direct graph execution without a training strategy.")
 
         return self._unique_strings(plan)[:6]
 

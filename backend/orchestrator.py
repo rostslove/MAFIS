@@ -593,7 +593,9 @@ def _engineer_summary(engineer_result: EngineerResult) -> str:
         value_text = f"{float(value):.4f}"
     except (TypeError, ValueError):
         value_text = str(value)
-    return f"{metric}: {value_text}; ranking score: {engineer_result.graph_score:.4f}"
+    strategy = engineer_result.training_strategy.get("name") if engineer_result.training_strategy else ""
+    prefix = f"{strategy}; " if strategy else ""
+    return f"{prefix}{metric}: {value_text}; ranking score: {engineer_result.graph_score:.4f}"
 
 
 def _create_summary(all_results, task_type):

@@ -50,7 +50,7 @@ def get_llm_client() -> OpenAI:
             base_url=LLM_BASE_URL,
             default_headers={
                 "HTTP-Referer": "http://localhost",
-                "X-Title": "GraphAutoML Agent",
+                "X-Title": "MAFIS Agent",
             },
         )
     return _client

@@ -18,6 +18,7 @@ from graph_engine import (
     OPERATION_DESCRIPTIONS,
     SUPPORTED_TASKS,
     get_operation_catalog,
+    get_training_strategies,
     get_training_strategy_hints,
 )
 from orchestrator import (
@@ -48,7 +49,7 @@ TOOL_DESCRIPTIONS = {
     "mutate_graph": "Apply add/remove/replace/set_params/connect mutations to a graph",
     "visualize_graph": "Render graph JSON to Mermaid markup",
     "tune_graph_hyperparameters": "Tune node hyperparameters without changing graph structure",
-    "train_graph": "Fit and score a graph exactly as proposed",
+    "train_graph": "Fit and score a graph exactly as proposed, using training_strategy when selected",
     "validate_graph": "Cross-validate a graph",
     "get_node_importance": "Estimate node contribution by ablation",
     "explain_graph": "Explain the last trained graph if model internals expose importances",
@@ -69,7 +70,7 @@ def _error(message: str, status_code: int = 400) -> JSONResponse:
 
 
 async def health(request):
-    return JSONResponse({"status": "healthy", "service": "graph-automl-mcp"})
+    return JSONResponse({"status": "healthy", "service": "MAFIS"})
 
 
 async def get_config(request):
@@ -81,11 +82,14 @@ async def get_config(request):
         "llm_base_url": LLM_BASE_URL,
         "protocol": "MCP",
         "transport": "local-adapter",
+        "product_name": "MultiAgentFedot.IndustrialSystem",
+        "short_name": "MAFIS",
         "supported_tasks": SUPPORTED_TASKS,
         "metrics_by_task": METRICS_BY_TASK,
         "operations": OPERATIONS,
         "operation_catalog": {task: get_operation_catalog(task) for task in SUPPORTED_TASKS},
         "operation_descriptions": OPERATION_DESCRIPTIONS,
+        "training_strategies": {task: get_training_strategies(task) for task in SUPPORTED_TASKS},
         "training_strategy_hints": {task: get_training_strategy_hints(task) for task in SUPPORTED_TASKS},
         "default_graphs": DEFAULT_GRAPHS,
         "llm_configured": bool(os.getenv("LLM_API_KEY") or os.getenv("OPENROUTER_API_KEY") or LLM_BASE_URL),

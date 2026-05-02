@@ -77,6 +77,7 @@ class EngineerResult:
     train_metrics: Dict[str, Any] = field(default_factory=dict)
     test_metrics: Dict[str, Any] = field(default_factory=dict)
     split_info: Dict[str, Any] = field(default_factory=dict)
+    training_strategy: Dict[str, Any] = field(default_factory=dict)
     tuned_nodes: List[Dict[str, Any]] = field(default_factory=list)
     graph_error: str = ""
     target_info: Dict[str, Any] = field(default_factory=dict)
@@ -91,6 +92,7 @@ class EngineerResult:
             "train_metrics": self.train_metrics,
             "test_metrics": self.test_metrics,
             "split_info": self.split_info,
+            "training_strategy": self.training_strategy,
             "tuned_nodes": self.tuned_nodes,
             "graph_error": self.graph_error,
             "target_info": self.target_info,

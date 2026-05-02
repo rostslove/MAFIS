@@ -11,7 +11,10 @@ import requests
 import streamlit as st
 
 
-st.set_page_config(page_title="GraphAutoML", layout="wide")
+APP_NAME = "MultiAgentFedot.IndustrialSystem"
+APP_SHORT_NAME = "MAFIS"
+
+st.set_page_config(page_title=APP_SHORT_NAME, layout="wide")
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8001")
 TASK_TYPES = ["classification", "regression", "ts_classification", "ts_regression", "ts_forecasting"]
@@ -81,6 +84,13 @@ def post_json(path: str, payload: Dict[str, Any], timeout: int = 120) -> Dict[st
 def graph_to_dot(graph: Dict[str, Any]) -> str:
     nodes = graph.get("nodes", [])
     lines = ["digraph G {", "rankdir=LR;", 'node [shape=box, style="rounded,filled", fillcolor="#f7f7f7"];']
+    strategy = graph.get("training_strategy") or {}
+    if strategy:
+        strategy_name = strategy.get("name", "")
+        lines.append(
+            '"training_strategy" '
+            f'[label="training strategy\\n{strategy_name}", fillcolor="#eef6ff", style="rounded,filled,dashed"];'
+        )
     for node in nodes:
         node_id = node.get("id", "")
         label = f"{node_id}\\n{node.get('operation', '')}"
@@ -88,6 +98,10 @@ def graph_to_dot(graph: Dict[str, Any]) -> str:
     for node in nodes:
         for source in node.get("inputs", []):
             lines.append(f'"{source}" -> "{node.get("id", "")}";')
+    if strategy and nodes:
+        raw_nodes = [node for node in nodes if not node.get("inputs")]
+        for node in raw_nodes or nodes[:1]:
+            lines.append(f'"training_strategy" -> "{node.get("id", "")}" [style=dashed];')
     lines.append("}")
     return "\n".join(lines)
 
@@ -180,6 +194,7 @@ def render_graph(graph: Dict[str, Any], show_details: bool = True) -> None:
     if not graph:
         st.info("No graph proposed yet.")
         return
+    render_training_strategy(graph)
     st.graphviz_chart(graph_to_dot(graph), use_container_width=True)
 
 
@@ -265,12 +280,14 @@ def latest_iteration(result: Dict[str, Any]) -> Dict[str, Any]:
 def result_label(result: Dict[str, Any]) -> str:
     item = latest_iteration(result)
     graph = item.get("architect", {}).get("graph", {}) if item else {}
+    strategy = graph.get("training_strategy") or {}
     rows = graph_rows(graph) if graph else []
     if not rows:
         return "evaluation"
     model = next((row for row in rows if row["role"] == "model"), rows[-1])
     params = "" if model["params"] == "-" else f" ({model['params']})"
-    return f"{model['operation']}{params}"
+    prefix = f"{strategy.get('name')} + " if strategy else ""
+    return f"{prefix}{model['operation']}{params}"
 
 
 def result_metric_value(result: Dict[str, Any]) -> tuple[str, Any]:
@@ -352,6 +369,30 @@ def graph_rows(graph: Dict[str, Any]) -> List[Dict[str, str]]:
     return rows
 
 
+def strategy_rows(config: Dict[str, Any], task_type: str) -> List[Dict[str, str]]:
+    strategies = config.get("training_strategies", {}).get(task_type, []) or []
+    return [
+        {
+            "strategy": item.get("name", ""),
+            "label": item.get("label", ""),
+            "description": item.get("description", ""),
+            "default params": format_params(item.get("default_params", {}) or {}),
+        }
+        for item in strategies
+    ]
+
+
+def render_training_strategy(graph: Dict[str, Any]) -> None:
+    strategy = (graph or {}).get("training_strategy") or {}
+    if not strategy:
+        st.caption("Training strategy: direct graph execution")
+        return
+    params = strategy.get("params", {}) or {}
+    st.caption(f"Training strategy: {strategy.get('name', '')}")
+    if params:
+        st.code(json.dumps(params, ensure_ascii=False, indent=2), language="json")
+
+
 def mutation_rows(mutations: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     rows = []
     for mutation in mutations:
@@ -377,6 +418,21 @@ def mutation_rows(mutations: List[Dict[str, Any]]) -> List[Dict[str, str]]:
                 "node": node.get("id", ""),
                 "target": node.get("operation", ""),
                 "details": f"before {mutation.get('rewire_input_of', '')}".strip(),
+            })
+        elif kind == "set_strategy":
+            strategy = mutation.get("strategy", {}) or {}
+            rows.append({
+                "action": "set strategy",
+                "node": "training_strategy",
+                "target": strategy.get("name", ""),
+                "details": format_params(strategy.get("params", {}) or {}),
+            })
+        elif kind == "clear_strategy":
+            rows.append({
+                "action": "clear strategy",
+                "node": "training_strategy",
+                "target": "direct graph",
+                "details": "",
             })
         else:
             rows.append({
@@ -563,6 +619,10 @@ def architect_tab(config: Dict[str, Any]) -> None:
     with col_left:
         st.write("Available atomic operations")
         render_operation_catalog(config, task_type, "architect")
+        strategy_catalog_rows = strategy_rows(config, task_type)
+        if strategy_catalog_rows:
+            st.write("Available training strategies")
+            st.dataframe(pd.DataFrame(strategy_catalog_rows), use_container_width=True, hide_index=True)
 
         message = st.text_area(
             "Request to Architect",
@@ -664,6 +724,35 @@ def graph_editor_tab(config: Dict[str, Any]) -> None:
                 st.write(st.session_state.architect_reasoning)
 
     with edit_tab:
+        st.write("Training Strategy")
+        available_strategies = config.get("training_strategies", {}).get(task_type, []) or []
+        current_strategy = graph.get("training_strategy") or {}
+        strategy_names = ["direct graph"] + [item.get("name", "") for item in available_strategies]
+        current_name = current_strategy.get("name") or "direct graph"
+        current_index = strategy_names.index(current_name) if current_name in strategy_names else 0
+        with st.form("training_strategy_form"):
+            selected_strategy = st.selectbox("Execution mode", strategy_names, index=current_index)
+            selected_spec = next((item for item in available_strategies if item.get("name") == selected_strategy), {})
+            default_params = selected_spec.get("default_params", {}) or {}
+            shown_params = current_strategy.get("params", {}) if selected_strategy == current_name else default_params
+            params_text = st.text_area(
+                "Strategy params",
+                value=json.dumps(shown_params or {}, ensure_ascii=False, indent=2),
+                height=110,
+                disabled=selected_strategy == "direct graph",
+            )
+            strategy_submitted = st.form_submit_button("Apply Training Strategy")
+            if strategy_submitted:
+                if selected_strategy == "direct graph":
+                    mutate_graph({"type": "clear_strategy"})
+                else:
+                    try:
+                        params = json.loads(params_text or "{}")
+                        mutate_graph({"type": "set_strategy", "strategy": {"name": selected_strategy, "params": params}})
+                    except json.JSONDecodeError as exc:
+                        st.error(f"Invalid strategy params: {exc}")
+
+        st.divider()
         model_col, params_col = st.columns([1, 1])
         with model_col:
             st.write("Model")
@@ -733,6 +822,10 @@ def graph_editor_tab(config: Dict[str, Any]) -> None:
 
     with operations_tab:
         render_operation_catalog(config, task_type, "editor")
+        strategy_catalog_rows = strategy_rows(config, task_type)
+        if strategy_catalog_rows:
+            st.write("Training strategies")
+            st.dataframe(pd.DataFrame(strategy_catalog_rows), use_container_width=True, hide_index=True)
         strategy_hints = config.get("training_strategy_hints", {}).get(task_type, []) or []
         if strategy_hints:
             st.write("Training strategy hints")
@@ -770,7 +863,7 @@ def evaluation_panel() -> None:
         try:
             stream_run(payload)
             if st.session_state.get("result"):
-                st.success("GraphAutoML run completed.")
+                st.success("MAFIS run completed.")
         except Exception as exc:
             st.error(f"Run failed: {exc}")
 
@@ -805,6 +898,19 @@ def render_engineer_report(engineer: Dict[str, Any]) -> None:
 
     if engineer.get("graph_error"):
         st.error(engineer["graph_error"])
+
+    strategy = engineer.get("training_strategy", {}) or {}
+    if strategy:
+        st.write("Training strategy execution")
+        strategy_cols = st.columns(4)
+        strategy_cols[0].metric("Strategy", strategy.get("name", ""))
+        strategy_cols[1].metric("Branches", strategy.get("n_splits", ""))
+        strategy_cols[2].metric("Batch size", strategy.get("batch_size", ""))
+        strategy_cols[3].metric("Head", strategy.get("head", ""))
+        params = strategy.get("params", {}) or {}
+        if params:
+            with st.expander("Strategy params"):
+                st.code(json.dumps(params, ensure_ascii=False, indent=2), language="json")
 
     render_split_info(engineer.get("split_info", {}) or {})
 
@@ -932,6 +1038,7 @@ def request_engineer_tuning(iteration: Dict[str, Any], iterations: int) -> Dict[
         "train_metrics": result.get("train_metrics", {}) or {},
         "test_metrics": result.get("test_metrics", {}) or metrics,
         "split_info": result.get("split_info", {}) or {},
+        "training_strategy": result.get("training_strategy", {}) or previous.get("training_strategy", {}),
         "tuned_nodes": result.get("tuned_nodes", []) or [],
         "graph_error": result.get("error", "") or "",
         "target_info": result.get("target_info", {}) or previous.get("target_info", {}),
@@ -1241,7 +1348,7 @@ def report_tab() -> None:
         return
 
     report = result.get("report", {})
-    st.markdown(f"### {report.get('title', 'GraphAutoML report')}")
+    st.markdown(f"### {report.get('title', 'MAFIS report')}")
     st.write(report.get("summary", ""))
     if report.get("methodology"):
         st.write("Methodology")
@@ -1266,8 +1373,8 @@ def tools_tab(tools: Dict[str, Any]) -> None:
 
 
 def main() -> None:
-    st.title("GraphAutoML")
-    st.caption("LLM agents compose, tune, validate and report Fedot.Industrial pipeline graphs through MCP tools.")
+    st.title(APP_SHORT_NAME)
+    st.caption(f"{APP_NAME}: LLM agents compose, tune, validate and report Fedot.Industrial pipeline graphs and strategies through MCP tools.")
     config = load_config()
     sidebar(config)
     tools = load_tools()

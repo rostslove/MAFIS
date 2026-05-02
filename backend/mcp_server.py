@@ -1,5 +1,5 @@
 """
-MCP server hosting all tools for the GraphAutoML multi-agent system.
+MCP server hosting all tools for the MAFIS multi-agent system.
 
 Tools call Fedot.Industrial directly (no HTTP proxy). The registry is loaded
 in-process by mcp_client.py to avoid the Pydantic v2 dependency of the
@@ -20,13 +20,15 @@ if _backend_dir not in sys.path:
 
 import numpy as np
 import pandas as pd
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 
 from data_profiler import DataProfiler
 from graph_engine import (
     OPERATIONS, METRICS_BY_TASK, SUPPORTED_TASKS, DEFAULT_GRAPHS,
-    PipelineGraph, compute_metrics, diagnose_runtime_error, get_operation_catalog, get_training_strategy_hints, is_ts_task,
-    load_input_data, split_input_data,
+    PipelineGraph, compute_metrics, diagnose_runtime_error, get_operation_catalog, get_training_strategies,
+    get_training_strategy_hints, is_ts_task,
+    input_sample_count, load_input_data, slice_input_data, split_input_data,
 )
 from path_utils import normalize_csv_path
 
@@ -101,7 +103,7 @@ class LocalMCPRegistry:
         )
 
 
-mcp = LocalMCPRegistry("GraphAutoMLTools")
+mcp = LocalMCPRegistry("MAFISTools")
 
 
 # ============== Trained-model store (single-process) ==============
@@ -123,6 +125,160 @@ def _predict_pipeline(pipeline, data, task_type: str) -> np.ndarray:
         except Exception:
             pass
     return np.asarray(pipeline.predict(data).predict)
+
+
+def _task_problem(task_type: str) -> str:
+    if task_type in ("classification", "ts_classification"):
+        return "classification"
+    if task_type in ("regression", "ts_regression"):
+        return "regression"
+    return task_type
+
+
+def _strategy_data_type(task_type: str) -> str:
+    return "time_series" if task_type in ("ts_classification", "ts_regression") else "table"
+
+
+def _load_strategy_arrays(csv_path: str, target_column: str, task_type: str) -> tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    csv_path = normalize_csv_path(csv_path)
+    df = pd.read_csv(csv_path)
+    if target_column not in df.columns:
+        raise ValueError(f"Target column '{target_column}' not in CSV")
+
+    features_df = df.drop(columns=[target_column])
+    encoded_df = pd.get_dummies(features_df, dummy_na=True)
+    encoded_df = encoded_df.apply(pd.to_numeric, errors="coerce").fillna(0)
+    if encoded_df.shape[1] == 0:
+        raise ValueError(
+            "No feature columns found after removing the target column. "
+            "Choose another target or upload a dataset with feature columns."
+        )
+
+    target_info = _target_info(csv_path, target_column, task_type)
+    X = encoded_df.values.astype(float)
+    y = df[target_column].values
+
+    if task_type in ("classification", "ts_classification"):
+        encoder = LabelEncoder()
+        y = encoder.fit_transform(pd.Series(y).astype(str).values)
+        target_info["fedot_receives_raw_target"] = False
+        target_info["reference_encoded"] = True
+        target_info["reference_encoding"] = {str(label): int(code) for code, label in enumerate(encoder.classes_)}
+    else:
+        try:
+            y = y.astype(float)
+        except ValueError as exc:
+            raise ValueError(
+                "Regression target contains non-numeric values. "
+                "Choose classification or convert the target to numbers."
+            ) from exc
+    return X, np.asarray(y), target_info
+
+
+def _split_strategy_arrays(X: np.ndarray, y: np.ndarray, task_type: str, test_size: float):
+    stratify = None
+    if task_type in ("classification", "ts_classification"):
+        labels, counts = np.unique(y, return_counts=True)
+        if len(labels) > 1 and int(counts.min()) >= 2:
+            stratify = y
+    return train_test_split(X, y, test_size=test_size, random_state=42, stratify=stratify)
+
+
+def _make_strategy_input(features: np.ndarray, target: np.ndarray, task_type: str):
+    from fedot.core.data.data import InputData
+    from fedot.core.repository.dataset_types import DataTypesEnum
+    from fedot.core.repository.tasks import Task, TaskTypesEnum
+
+    problem = _task_problem(task_type)
+    fedot_task = Task(TaskTypesEnum.classification if problem == "classification" else TaskTypesEnum.regression)
+    X = np.asarray(features, dtype=float)
+    # RAFEnsembler operates on sample-first tensors and later creates image-like
+    # data sources for each worker branch. Keeping a singleton channel works for
+    # both tabular rows and fixed-window time-series rows.
+    if X.ndim == 2:
+        X = X.reshape(X.shape[0], 1, X.shape[1])
+    y = np.asarray(target)
+    if problem == "classification":
+        y = y.reshape(-1, 1)
+    else:
+        y = y.astype(float).reshape(-1)
+    return InputData(
+        idx=np.arange(X.shape[0]),
+        features=X,
+        target=y,
+        task=fedot_task,
+        data_type=DataTypesEnum.image,
+    )
+
+
+def _train_strategy_graph(
+    graph: PipelineGraph,
+    csv_path: str,
+    target_column: str,
+    primary_metric: Optional[str],
+    test_size: float,
+) -> Dict[str, Any]:
+    if not graph.training_strategy:
+        raise ValueError("Graph has no training_strategy")
+    if graph.training_strategy.get("name") != "federated_automl":
+        raise ValueError(f"Unsupported training strategy: {graph.training_strategy.get('name')}")
+    if graph.task_type == "ts_forecasting":
+        raise ValueError("federated_automl is not exposed for ts_forecasting")
+
+    from fedot_ind.core.ensemble.random_automl_forest import RAFEnsembler
+
+    ts = min(max(float(test_size) if test_size is not None else 0.2, 0.05), 0.5)
+    X, y, target_info = _load_strategy_arrays(csv_path, target_column, graph.task_type)
+    X_train, X_test, y_train, y_test = _split_strategy_arrays(X, y, graph.task_type, ts)
+    train = _make_strategy_input(X_train, y_train, graph.task_type)
+    test = _make_strategy_input(X_test, y_test, graph.task_type)
+
+    strategy = graph.training_strategy
+    params = dict(strategy.get("params", {}) or {})
+    problem = _task_problem(graph.task_type)
+    params.update({
+        "problem": problem,
+        "data_type": params.get("data_type") or _strategy_data_type(graph.task_type),
+        "timeout": float(params.get("timeout", 10) or 10),
+        "n_jobs": int(params.get("n_jobs", 1) or 1),
+    })
+    if primary_metric:
+        params["metric"] = primary_metric
+
+    n_train = int(train.features.shape[0])
+    requested_splits = int(params.pop("n_splits", 5) or 5)
+    n_splits = max(2, min(requested_splits, n_train)) if n_train >= 2 else 1
+    batch_size = max(1, int(np.ceil(n_train / n_splits)))
+
+    solver = RAFEnsembler(composing_params=dict(params), n_splits=n_splits, batch_size=batch_size)
+    solver.fit(train)
+    train_preds = np.asarray(solver.predict(train, "labels")).reshape(-1)
+    test_preds = np.asarray(solver.predict(test, "labels")).reshape(-1)
+    train_metrics = compute_metrics(graph.task_type, y_train, train_preds, primary_metric)
+    test_metrics = compute_metrics(graph.task_type, y_test, test_preds, primary_metric)
+
+    _store_run(solver, graph, train, test_preds)
+    return {
+        "score": test_metrics["primary_score"],
+        "metrics": test_metrics,
+        "train_metrics": train_metrics,
+        "test_metrics": test_metrics,
+        "split_info": {"test_size": ts, "n_train": len(y_train), "n_test": len(y_test)},
+        "graph": graph.to_dict(),
+        "training_strategy": {
+            "name": strategy.get("name"),
+            "params": params,
+            "n_splits": n_splits,
+            "batch_size": batch_size,
+            "head": "xgboost" if problem == "classification" else "treg",
+        },
+        "target_info": target_info,
+        "training_notes": [
+            "Fedot.Industrial federated_automl strategy was used instead of direct graph execution.",
+            "The displayed graph is the approved architecture contract; RAFEnsembler internally trains AutoML branches on worker folds and joins them with a head model.",
+            f"Strategy split: {n_splits} branch models, batch_size={batch_size}, head={'xgboost' if problem == 'classification' else 'treg'}.",
+        ],
+    }
 
 
 def _target_info(csv_path: str, target_column: str, task_type: str) -> Dict[str, Any]:
@@ -198,6 +354,7 @@ def get_available_operations(task_type: str) -> str:
         "models": ops["models"],
         "catalog": get_operation_catalog(task_type),
         "metrics": METRICS_BY_TASK.get(task_type, []),
+        "training_strategies_catalog": get_training_strategies(task_type),
         "training_strategies": get_training_strategy_hints(task_type),
         "default_graph": DEFAULT_GRAPHS.get(task_type, []),
     })
@@ -279,6 +436,9 @@ def train_graph(
         ts = float(test_size) if test_size is not None else 0.2
         ts = min(max(ts, 0.05), 0.5)
 
+        if graph.uses_training_strategy():
+            return json.dumps(_train_strategy_graph(graph, csv_path, target_column, primary_metric, ts))
+
         input_data = load_input_data(csv_path, target_column, graph.task_type, forecast_length)
         train, val = split_input_data(input_data, test_size=ts)
 
@@ -305,12 +465,12 @@ def train_graph(
             "test_metrics": test_metrics,
             "split_info": {
                 "test_size": ts,
-                "n_train": len(train.features),
-                "n_test": len(val.features),
+                "n_train": input_sample_count(train),
+                "n_test": input_sample_count(val),
             },
             "graph": graph.to_dict(),
-            "n_train": len(train.features),
-            "n_val": len(val.features),
+            "n_train": input_sample_count(train),
+            "n_val": input_sample_count(val),
             "target_info": target_info,
             "training_notes": training_notes,
         })
@@ -338,6 +498,20 @@ def tune_graph_hyperparameters(
         ok, msg = graph.validate()
         if not ok:
             return json.dumps(_invalid_graph_payload(msg, graph))
+
+        if graph.uses_training_strategy():
+            payload = _train_strategy_graph(graph, csv_path, target_column, primary_metric, test_size)
+            payload.setdefault("diagnostics", []).append({
+                "agent": "Engineer",
+                "kind": "strategy_tuning_not_applicable",
+                "summary": "The selected training strategy owns AutoML branch search; node-level PipelineTuner was not applied.",
+                "technical_message": "federated_automl is executed through RAFEnsembler rather than a single PipelineGraph object.",
+                "recommendations": [
+                    "Tune strategy params such as timeout or n_splits, or switch back to direct graph execution for node-level tuning."
+                ],
+                "recoverable": True,
+            })
+            return json.dumps(payload)
 
         if graph.task_type in ("classification", "ts_classification"):
             diagnostic = {
@@ -409,8 +583,8 @@ def tune_graph_hyperparameters(
             "test_metrics": test_metrics,
             "split_info": {
                 "test_size": ts,
-                "n_train": len(train.features),
-                "n_test": len(val.features),
+                "n_train": input_sample_count(train),
+                "n_test": input_sample_count(val),
             },
             "graph": graph.to_dict(),
             "tuned_nodes": tuned_nodes,
@@ -440,10 +614,28 @@ def validate_graph(
             payload = _invalid_graph_payload(msg, graph)
             return json.dumps({"error": payload["error"], "diagnostics": payload["diagnostics"], "recommendations": payload["recommendations"]})
 
+        if graph.uses_training_strategy():
+            return json.dumps({
+                "skipped": "Cross-validation for training strategies is skipped to avoid repeatedly running nested AutoML ensembles.",
+                "primary_metric": primary_metric,
+                "primary_score_direction": "higher_is_better",
+                "diagnostics": [{
+                    "agent": "Critic",
+                    "kind": "strategy_cv_skipped",
+                    "summary": "Strategy graph cross-validation was skipped because federated_automl already trains multiple AutoML branches.",
+                    "technical_message": "validate_graph avoids repeating RAFEnsembler for every CV fold.",
+                    "recommendations": [
+                        "Compare this strategy run against previous hold-out evaluations in Evaluation History.",
+                        "Use a smaller n_splits or lower timeout before enabling repeated validation."
+                    ],
+                    "recoverable": True,
+                }],
+            })
+
         input_data = load_input_data(csv_path, target_column, graph.task_type, forecast_length)
 
         # Simple CV: rotate validation cuts
-        n = len(input_data.features)
+        n = input_sample_count(input_data)
         scores: List[float] = []
         for fold in range(cv_folds):
             offset = fold / cv_folds
@@ -452,15 +644,8 @@ def validate_graph(
             mask = np.ones(n, dtype=bool)
             mask[cut_lo:cut_hi] = False
 
-            from fedot.core.data.data import InputData
-            train = InputData(
-                idx=np.arange(mask.sum()), features=input_data.features[mask],
-                target=input_data.target[mask], task=input_data.task, data_type=input_data.data_type,
-            )
-            val = InputData(
-                idx=np.arange((~mask).sum()), features=input_data.features[~mask],
-                target=input_data.target[~mask], task=input_data.task, data_type=input_data.data_type,
-            )
+            train = slice_input_data(input_data, np.flatnonzero(mask))
+            val = slice_input_data(input_data, np.flatnonzero(~mask))
 
             pipeline = graph.to_fedot_pipeline()
             pipeline.fit(train)
@@ -498,6 +683,18 @@ def get_node_importance(
     try:
         csv_path = normalize_csv_path(csv_path)
         graph = PipelineGraph.from_dict(json.loads(graph_json))
+        if graph.uses_training_strategy():
+            return json.dumps({
+                "skipped": "Node ablation is unavailable for strategy graphs.",
+                "node_importance": {},
+                "diagnostics": [{
+                    "agent": "Critic",
+                    "kind": "strategy_node_importance_skipped",
+                    "summary": "Strategy internals are generated by Fedot.Industrial, so node ablation on the display graph would be misleading.",
+                    "recommendations": ["Use train/test metrics and history comparison to judge the strategy run."],
+                    "recoverable": True,
+                }],
+            })
         input_data = load_input_data(csv_path, target_column, graph.task_type, forecast_length)
         train, val = split_input_data(input_data)
 

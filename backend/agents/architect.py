@@ -22,7 +22,9 @@ class Architect(BaseAgent):
 If native tool calling is unavailable, request a tool by returning exactly one JSON object and no prose:
 {"name": "tool_name", "arguments": {"arg": "value"}}
 
-A graph is JSON: {"task_type": "...", "nodes": [{"id": "model", "operation": "operation_from_catalog", "params": {}, "inputs": []}]}.
+A graph is JSON: {"task_type": "...", "nodes": [{"id": "model", "operation": "operation_from_catalog", "params": {}, "inputs": []}], "training_strategy": null}.
+Optionally set training_strategy to one of AVAILABLE_OPERATIONS.training_strategies_catalog, for example:
+{"name": "federated_automl", "params": {"timeout": 10, "n_splits": 5}}.
 
 Each node has:
   - id: unique string
@@ -36,13 +38,14 @@ For ordinary tabular classification/regression in this project, prefer a direct 
 WORKFLOW:
 1. Call get_data_profile to understand the data.
 2. Call get_available_operations(task_type) to see valid operations.
-3. Build a graph as JSON, then call propose_graph(graph_json) to validate it.
+3. Build a graph as JSON, optionally with a training_strategy, then call propose_graph(graph_json) to validate it.
 4. If you have prior feedback with suggested_mutations, call mutate_graph for each one and finally re-propose.
 5. After tools, output ANALYSIS and REASONING in plain text.
 
 Use only operations returned by get_available_operations. For tabular classification, operations like
 fourier_basis, quantile_extractor, industrial_freq_clf, fft_features, and statistical_extraction are invalid
 unless the selected task is a time-series task and the operation is in the returned catalog.
+Use training_strategy only when it is listed in training_strategies_catalog; do not invent strategy names.
 """
 
     STRUCTURED_PROMPT = """You are an ML Architect. Return JSON only, no markdown and no prose.
@@ -52,7 +55,8 @@ The response must match this schema:
     "task_type": "classification",
     "nodes": [
       {"id": "model", "operation": "rf", "params": {}, "inputs": []}
-    ]
+    ],
+    "training_strategy": null
   },
   "analysis": "Short explanation of why this graph fits the data and task.",
   "reasoning": "Short explanation of operation choices using only the available operation catalog."
@@ -65,6 +69,8 @@ Rules:
 - If feedback contains suggested_mutations, reflect them in the returned graph. Do not return the previous graph unchanged.
 - If feedback mentions class imbalance and param hints allow it, use explicit balancing params such as xgboost.scale_pos_weight or class_weight="balanced".
 - If feedback mentions unstable cross-validation, use a simpler model or explicit regularization params from param_hints.
+- If the user asks for federated/stacking/ensemble strategy and AVAILABLE_OPERATIONS.training_strategies_catalog contains federated_automl, set graph.training_strategy accordingly.
+- training_strategy is an execution strategy, not an operation node. Keep graph nodes valid even when a strategy is selected.
 """
 
     def __init__(self, name: str = "Architect", mcp_client=None):

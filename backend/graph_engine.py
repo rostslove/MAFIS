@@ -254,6 +254,14 @@ OPERATION_PARAM_HINTS: Dict[str, List[Dict[str, Any]]] = {
 TRAINING_STRATEGY_HINTS: Dict[str, List[Dict[str, Any]]] = {
     "classification": [
         {
+            "name": "federated_automl",
+            "description": (
+                "Fedot.Industrial strategy for larger datasets: split samples into worker folds, "
+                "fit one AutoML branch per fold, then connect branch predictions into a head model."
+            ),
+            "fedot_industrial_reference": "examples/automl_example/custom_strategy/big_data/federated_automl_example.py",
+        },
+        {
             "name": "imbalance_aware_quality",
             "description": "For imbalanced classification, judge revisions by F1/precision as well as accuracy.",
             "fedot_industrial_reference": "Custom ApiTemplate examples use learning_config.optimisation_loss.quality_loss='f1'.",
@@ -271,8 +279,36 @@ TRAINING_STRATEGY_HINTS: Dict[str, List[Dict[str, Any]]] = {
     ],
     "regression": [
         {
+            "name": "federated_automl",
+            "description": (
+                "Fedot.Industrial strategy for larger datasets: split samples into worker folds, "
+                "fit one AutoML branch per fold, then connect branch predictions into a regression head."
+            ),
+            "fedot_industrial_reference": "fedot_ind.core.ensemble.random_automl_forest.RAFEnsembler",
+        },
+        {
             "name": "manual_params_or_tuner",
             "description": "Regression graphs may be tuned by Fedot PipelineTuner; Critic can still propose explicit regularization params.",
+        },
+    ],
+    "ts_classification": [
+        {
+            "name": "federated_automl",
+            "description": (
+                "Fedot.Industrial strategy for large fixed-window time-series classification: "
+                "branch AutoML models are trained on sample folds and joined through a classification head."
+            ),
+            "fedot_industrial_reference": "examples/automl_example/custom_strategy/big_data/federated_automl_example.py",
+        },
+    ],
+    "ts_regression": [
+        {
+            "name": "federated_automl",
+            "description": (
+                "Fedot.Industrial strategy for large fixed-window time-series regression: "
+                "branch AutoML models are trained on sample folds and joined through a regression head."
+            ),
+            "fedot_industrial_reference": "fedot_ind.core.ensemble.random_automl_forest.RAFEnsembler",
         },
     ],
 }
@@ -280,6 +316,69 @@ TRAINING_STRATEGY_HINTS: Dict[str, List[Dict[str, Any]]] = {
 
 def get_training_strategy_hints(task_type: str) -> List[Dict[str, Any]]:
     return TRAINING_STRATEGY_HINTS.get(task_type, [])
+
+
+TRAINING_STRATEGIES: Dict[str, List[Dict[str, Any]]] = {
+    "classification": [
+        {
+            "name": "federated_automl",
+            "label": "Federated AutoML ensemble",
+            "description": "Split the training set into worker folds, train one AutoML branch per fold, and join branches with an xgboost head.",
+            "default_params": {"timeout": 10, "data_type": "table", "problem": "classification", "n_jobs": 1},
+        },
+    ],
+    "regression": [
+        {
+            "name": "federated_automl",
+            "label": "Federated AutoML ensemble",
+            "description": "Split the training set into worker folds, train one AutoML branch per fold, and join branches with a tree-regression head.",
+            "default_params": {"timeout": 10, "data_type": "table", "problem": "regression", "n_jobs": 1},
+        },
+    ],
+    "ts_classification": [
+        {
+            "name": "federated_automl",
+            "label": "Federated AutoML TS ensemble",
+            "description": "Train multiple AutoML branches on fixed-window time-series folds and join branch predictions with a classification head.",
+            "default_params": {"timeout": 10, "data_type": "time_series", "problem": "classification", "n_jobs": 1},
+        },
+    ],
+    "ts_regression": [
+        {
+            "name": "federated_automl",
+            "label": "Federated AutoML TS ensemble",
+            "description": "Train multiple AutoML branches on fixed-window time-series folds and join branch predictions with a regression head.",
+            "default_params": {"timeout": 10, "data_type": "time_series", "problem": "regression", "n_jobs": 1},
+        },
+    ],
+}
+
+
+def get_training_strategies(task_type: str) -> List[Dict[str, Any]]:
+    return TRAINING_STRATEGIES.get(task_type, [])
+
+
+def get_training_strategy_spec(task_type: str, name: str) -> Optional[Dict[str, Any]]:
+    return next((item for item in get_training_strategies(task_type) if item.get("name") == name), None)
+
+
+def normalize_training_strategy(task_type: str, strategy: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not strategy:
+        return None
+    if isinstance(strategy, str):
+        strategy = {"name": strategy}
+    if not isinstance(strategy, dict):
+        return None
+
+    name = str(strategy.get("name") or strategy.get("strategy") or "").strip()
+    if not name or name in ("default", "graph", "none"):
+        return None
+    spec = get_training_strategy_spec(task_type, name)
+    params = dict((spec or {}).get("default_params", {}))
+    incoming_params = strategy.get("params") or strategy.get("strategy_params") or {}
+    if isinstance(incoming_params, dict):
+        params.update(incoming_params)
+    return {"name": name, "params": params}
 
 
 def get_operation_catalog(task_type: str) -> Dict[str, List[Dict[str, Any]]]:
@@ -425,9 +524,13 @@ class PipelineGraph:
 
     task_type: str
     nodes: List[GraphNode] = field(default_factory=list)
+    training_strategy: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"task_type": self.task_type, "nodes": [asdict(n) for n in self.nodes]}
+        payload = {"task_type": self.task_type, "nodes": [asdict(n) for n in self.nodes]}
+        if self.training_strategy:
+            payload["training_strategy"] = self.training_strategy
+        return payload
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict())
@@ -435,7 +538,13 @@ class PipelineGraph:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "PipelineGraph":
         nodes = [GraphNode(**n) for n in d.get("nodes", [])]
-        return cls(task_type=d.get("task_type", "classification"), nodes=nodes)
+        task_type = d.get("task_type", "classification")
+        strategy = d.get("training_strategy", d.get("strategy"))
+        return cls(
+            task_type=task_type,
+            nodes=nodes,
+            training_strategy=normalize_training_strategy(task_type, strategy),
+        )
 
     @classmethod
     def default(cls, task_type: str) -> "PipelineGraph":
@@ -446,11 +555,21 @@ class PipelineGraph:
         ops = OPERATIONS.get(self.task_type, {})
         return set(ops.get("preprocessing", []) + ops.get("models", []))
 
+    def uses_training_strategy(self) -> bool:
+        return bool(self.training_strategy and self.training_strategy.get("name"))
+
     def validate(self) -> Tuple[bool, str]:
         if not self.nodes:
             return False, "Graph has no nodes"
         if self.task_type not in OPERATIONS:
             return False, f"Unknown task_type '{self.task_type}'"
+        if self.training_strategy:
+            strategy_name = str(self.training_strategy.get("name") or "")
+            if not get_training_strategy_spec(self.task_type, strategy_name):
+                return False, f"Training strategy '{strategy_name}' not allowed for task '{self.task_type}'"
+            params = self.training_strategy.get("params", {})
+            if params is not None and not isinstance(params, dict):
+                return False, "Training strategy params must be an object"
 
         ids = [n.id for n in self.nodes]
         if len(set(ids)) != len(ids):
@@ -531,6 +650,16 @@ class PipelineGraph:
 
     def to_mermaid(self) -> str:
         lines = ["graph LR"]
+        if self.training_strategy:
+            name = self.training_strategy.get("name", "")
+            params = self.training_strategy.get("params", {}) or {}
+            strategy_label = name
+            if params:
+                p = json.dumps(params)
+                if len(p) > 40:
+                    p = p[:37] + "..."
+                strategy_label = f"{name}<br/>{p}"
+            lines.append(f'    training_strategy["strategy: {strategy_label}"]')
         for n in self.nodes:
             label = n.operation
             if n.params:
@@ -542,6 +671,10 @@ class PipelineGraph:
         for n in self.nodes:
             for inp in n.inputs:
                 lines.append(f"    {inp} --> {n.id}")
+        if self.training_strategy and self.nodes:
+            raw_nodes = [n for n in self.nodes if not n.inputs]
+            for n in raw_nodes or [self.nodes[0]]:
+                lines.append(f"    training_strategy -.-> {n.id}")
         return "\n".join(lines)
 
     def apply_mutation(self, mutation: Dict[str, Any]) -> "PipelineGraph":
@@ -596,10 +729,17 @@ class PipelineGraph:
                 if n.id == nid and new_input not in n.inputs:
                     n.inputs.append(new_input)
 
+        elif op == "set_strategy":
+            strategy = normalize_training_strategy(self.task_type, mutation.get("strategy"))
+            return PipelineGraph(task_type=self.task_type, nodes=nodes, training_strategy=strategy)
+
+        elif op == "clear_strategy":
+            return PipelineGraph(task_type=self.task_type, nodes=nodes, training_strategy=None)
+
         else:
             raise ValueError(f"Unknown mutation type: {op}")
 
-        return PipelineGraph(task_type=self.task_type, nodes=nodes)
+        return PipelineGraph(task_type=self.task_type, nodes=nodes, training_strategy=self.training_strategy)
 
 
 # ============== Data loading ==============
@@ -634,7 +774,7 @@ def load_input_data(
             "No numeric feature columns found after removing the target column. "
             "Encode categorical features or choose another target."
         )
-    X = numeric_df.values
+    X = numeric_df.values.astype(float)
 
     if task_type in ("classification", "ts_classification"):
         task = Task(TaskTypesEnum.classification)
@@ -649,19 +789,61 @@ def load_input_data(
                 ) from exc
         task = Task(TaskTypesEnum.regression)
 
+    if task_type in ("ts_classification", "ts_regression"):
+        return InputData(
+            idx=np.arange(len(X)),
+            # Fedot.Industrial channel-independent TS operations expect
+            # channel-first tensors; one CSV row is one fixed-window series.
+            features=X[np.newaxis, :, :],
+            target=y,
+            task=task,
+            data_type=DataTypesEnum.ts,
+        )
+
     return InputData(
         idx=np.arange(len(X)),
-        features=X.astype(float),
+        features=X,
         target=y,
         task=task,
         data_type=DataTypesEnum.table,
     )
 
 
+def input_sample_count(input_data: InputData) -> int:
+    """Return the supervised sample count for table and channel-first TS data."""
+    features = np.asarray(input_data.features)
+    if input_data.task.task_type == TaskTypesEnum.ts_forecasting:
+        return len(features)
+    if input_data.data_type == DataTypesEnum.ts and features.ndim == 3:
+        return features.shape[1]
+    return len(features)
+
+
+def slice_input_data(input_data: InputData, sample_indices) -> InputData:
+    """Slice InputData by supervised sample indices, preserving TS channel axis."""
+    indices = np.asarray(sample_indices)
+    features = np.asarray(input_data.features)
+    if input_data.data_type == DataTypesEnum.ts and features.ndim == 3 and input_data.task.task_type != TaskTypesEnum.ts_forecasting:
+        sliced_features = features[:, indices, :]
+    else:
+        sliced_features = features[indices]
+    return InputData(
+        idx=np.arange(len(indices)),
+        features=sliced_features,
+        target=np.asarray(input_data.target)[indices],
+        task=input_data.task,
+        data_type=input_data.data_type,
+        supplementary_data=input_data.supplementary_data,
+    )
+
+
 def split_input_data(input_data: InputData, test_size: float = 0.2) -> Tuple[InputData, InputData]:
     """Train/val split for InputData."""
-    n = len(input_data.features)
+    n = input_sample_count(input_data)
+    if n < 2:
+        raise ValueError("At least two samples are required for a train/test split.")
     cut = int(n * (1 - test_size))
+    cut = min(max(cut, 1), n - 1)
 
     if input_data.task.task_type == TaskTypesEnum.ts_forecasting:
         train = InputData(
@@ -677,15 +859,7 @@ def split_input_data(input_data: InputData, test_size: float = 0.2) -> Tuple[Inp
     rng = np.random.default_rng(42)
     perm = rng.permutation(n)
     train_idx, val_idx = perm[:cut], perm[cut:]
-    train = InputData(
-        idx=np.arange(len(train_idx)), features=input_data.features[train_idx],
-        target=input_data.target[train_idx], task=input_data.task, data_type=input_data.data_type,
-    )
-    val = InputData(
-        idx=np.arange(len(val_idx)), features=input_data.features[val_idx],
-        target=input_data.target[val_idx], task=input_data.task, data_type=input_data.data_type,
-    )
-    return train, val
+    return slice_input_data(input_data, train_idx), slice_input_data(input_data, val_idx)
 
 
 # ============== Metrics ==============

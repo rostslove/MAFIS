@@ -39,6 +39,7 @@ Do not change graph structure; only node parameters may be tuned."""
                 result.train_metrics = graph_run.get("train_metrics", {}) or {}
                 result.test_metrics = graph_run.get("test_metrics", {}) or {}
                 result.split_info = graph_run.get("split_info", {}) or {}
+                result.training_strategy = graph_run.get("training_strategy", {}) or {}
                 result.tuned_nodes = graph_run.get("tuned_nodes", []) or []
                 result.graph_error = graph_run.get("error", "") or ""
                 result.target_info = graph_run.get("target_info", {}) or result.target_info
@@ -48,7 +49,7 @@ Do not change graph structure; only node parameters may be tuned."""
                 if result.graph_error:
                     result.graph_metrics["error"] = result.graph_error
 
-            if result.target_info.get("reference_encoded"):
+            if result.target_info.get("fedot_receives_raw_target") and result.target_info.get("reference_encoded"):
                 result.training_notes.append(
                     "Fedot graph used the raw target values. Reference label mapping for readable diagnostics: "
                     f"{result.target_info.get('reference_encoding', {})}"
@@ -81,12 +82,18 @@ Do not change graph structure; only node parameters may be tuned."""
     async def _train_graph(self, graph_json: str, dc: DataContext) -> dict:
         if dc.task_type in ("classification", "ts_classification"):
             trained = await self._train_without_tuning(graph_json, dc)
-            trained.setdefault("training_notes", []).append(
-                "Fedot hyperparameter tuning was skipped for classification because Fedot.Industrial 0.5 "
-                "prints internal ROC-AUC shape tracebacks for binary probability matrices during tuning. "
-                "The graph was trained as-is and scored with external sklearn metrics. To improve it, use "
-                "manual graph mutations or explicit node parameters instead of Fedot's classification tuner."
-            )
+            if trained.get("training_strategy"):
+                trained.setdefault("training_notes", []).append(
+                    "Node-level hyperparameter tuning was skipped because the selected Fedot.Industrial "
+                    "training strategy performs its own branch AutoML search."
+                )
+            else:
+                trained.setdefault("training_notes", []).append(
+                    "Fedot hyperparameter tuning was skipped for classification because Fedot.Industrial 0.5 "
+                    "prints internal ROC-AUC shape tracebacks for binary probability matrices during tuning. "
+                    "The graph was trained as-is and scored with external sklearn metrics. To improve it, use "
+                    "manual graph mutations or explicit node parameters instead of Fedot's classification tuner."
+                )
             return trained
 
         args = {

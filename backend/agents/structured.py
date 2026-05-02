@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 try:
     from pydantic import BaseModel, Field, ValidationError, root_validator, validator
@@ -28,6 +28,7 @@ class GraphNodeObject(BaseModel):
 class GraphObject(BaseModel):
     task_type: str
     nodes: List[GraphNodeObject]
+    training_strategy: Optional[Dict[str, Any]] = None
 
     @validator("task_type")
     def non_empty_task(cls, value: str) -> str:
@@ -98,7 +99,11 @@ def normalize_propose_graph_arguments(args: Dict[str, Any]) -> Dict[str, Any]:
     elif isinstance(graph_json, str):
         args["graph_json"] = GraphObject.parse_raw(graph_json).as_graph_json()
     else:
-        candidate = {"task_type": args.get("task_type"), "nodes": args.get("nodes")}
+        candidate = {
+            "task_type": args.get("task_type"),
+            "nodes": args.get("nodes"),
+            "training_strategy": args.get("training_strategy", args.get("strategy")),
+        }
         args["graph_json"] = GraphObject.parse_obj(candidate).as_graph_json()
     return {"graph_json": args["graph_json"]}
 

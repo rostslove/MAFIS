@@ -112,7 +112,7 @@ class DataProfiler:
             profile["target_stats"] = target_stats
 
             # Check imbalance for classification
-            if inferred_type == "classification" and unique_values < 20:
+            if inferred_type in ("classification", "ts_classification") and unique_values < 20:
                 try:
                     vals, counts = np.unique(y_arr, return_counts=True)
                     ratio = float(counts.min() / counts.max())

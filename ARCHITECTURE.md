@@ -1,6 +1,6 @@
-# GraphAutoML Architecture
+# MultiAgentFedot.IndustrialSystem (MAFIS) Architecture
 
-GraphAutoML is a multi-agent system where LLM agents compose, tune, validate, and explain Fedot.Industrial pipeline graphs through MCP tools.
+MAFIS is a multi-agent system where LLM agents compose, tune, validate, and explain Fedot.Industrial pipeline graphs and training strategies through MCP tools.
 
 The important design choice is that the LLM controls graph structure. Fedot.Industrial is used to materialize and train the graph, and the Engineer may tune node hyperparameters, but structural evolution is performed by the Architect/Critic loop.
 
@@ -135,7 +135,7 @@ The Streamlit app is organized around graph approval:
 2. Ask Architect to propose a graph.
 3. Inspect available operations and graph visualization.
 4. Optionally edit the graph by adding/removing/replacing nodes or setting params.
-5. Approve the graph and run iterative GraphAutoML.
+5. Approve the graph and run MAFIS evaluation.
 6. Review metrics, Critic feedback, and final Scribe report.
 
 ## Main Files

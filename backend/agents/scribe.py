@@ -1,4 +1,4 @@
-"""Scribe: turns a GraphAutoML evaluation into a compact final report."""
+"""Scribe: turns a MAFIS evaluation into a compact final report."""
 
 import logging
 from typing import Any, Dict, List
@@ -16,7 +16,7 @@ class Scribe(BaseAgent):
 
     ALLOWED_TOOLS = ["generate_report"]
 
-    SYSTEM_PROMPT = """You are the Scribe Agent for GraphAutoML.
+    SYSTEM_PROMPT = """You are the Scribe Agent for MultiAgentFedot.IndustrialSystem (MAFIS).
 Write a concise technical report from the approved graph evaluation summary.
 Return JSON only:
 {
@@ -46,7 +46,7 @@ Return JSON only:
             best_score = tool_report.get("best_score", 0)
             n_evaluations = tool_report.get("n_evaluations", tool_report.get("n_iterations", len(all_iterations)))
 
-            report.title = llm_report.get("title") or f"GraphAutoML report: {data_context.task_type}"
+            report.title = llm_report.get("title") or f"MAFIS report: {data_context.task_type}"
             report.summary = llm_report.get("summary") or (
                 f"Completed {n_evaluations} approved graph evaluation(s). Best test score: {best_score:.4f}."
             )
@@ -64,7 +64,7 @@ Return JSON only:
 
         except Exception as exc:
             logger.exception("[Scribe] failed")
-            report.title = "GraphAutoML report"
+            report.title = "MAFIS report"
             report.summary = f"Report generation failed: {exc}"
             report.recommendations = ["Review backend logs and rerun the orchestration"]
             report.tool_calls = self.get_tool_calls()
