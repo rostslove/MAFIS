@@ -43,6 +43,19 @@ class GraphObject(BaseModel):
             raise ValueError("graph must contain at least one node")
         return value
 
+    @validator("training_strategy", pre=True, always=True)
+    def normalize_training_strategy(cls, value: Any) -> Optional[Dict[str, Any]]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            name = value.strip()
+            if not name or name.lower() in {"none", "null", "default", "direct graph", "graph"}:
+                return None
+            return {"name": name, "params": {}}
+        if isinstance(value, dict):
+            return value
+        raise ValueError("training_strategy must be null, a strategy name, or an object")
+
     def as_graph_json(self) -> str:
         return self.json()
 

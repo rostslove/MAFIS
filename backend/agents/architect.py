@@ -23,7 +23,8 @@ If native tool calling is unavailable, request a tool by returning exactly one J
 {"name": "tool_name", "arguments": {"arg": "value"}}
 
 A graph is JSON: {"task_type": "...", "nodes": [{"id": "model", "operation": "operation_from_catalog", "params": {}, "inputs": []}], "training_strategy": null}.
-Optionally set training_strategy to one of AVAILABLE_OPERATIONS.training_strategies_catalog.
+Default to training_strategy=null. Set training_strategy only when the user explicitly asks for a training strategy, the current graph already uses one, or Critic explicitly recommends a strategy mutation.
+When training_strategy is used, it must be an object: {"name": "strategy_name", "params": {}}.
 
 Each node has:
   - id: unique string
@@ -38,14 +39,14 @@ For ordinary tabular classification/regression, prefer a direct model-only graph
 WORKFLOW:
 1. Call get_data_profile to understand the data.
 2. Call get_available_operations(task_type) to see valid operations.
-3. Build a graph as JSON, optionally with a training_strategy, then call propose_graph(graph_json) to validate it.
+3. Build a graph as JSON, using training_strategy only under the strategy policy above, then call propose_graph(graph_json) to validate it.
 4. If you have prior feedback with suggested_mutations, call mutate_graph for each one and finally re-propose.
 5. After tools, output ANALYSIS and REASONING in plain text.
 
 Use only operations returned by get_available_operations. For tabular classification, operations like
 fourier_basis, quantile_extractor, industrial_freq_clf, fft_features, and statistical_extraction are invalid
 unless the selected task is a time-series task and the operation is in the returned catalog.
-Use training_strategy only when it is listed in training_strategies_catalog; do not invent strategy names.
+Use training_strategy only when it is listed in training_strategies_catalog and the strategy policy allows it; do not invent strategy names.
 """
 
     STRUCTURED_PROMPT = """You are an ML Architect. Return JSON only, no markdown and no prose.
@@ -71,7 +72,8 @@ Rules:
 - If feedback contains suggested_mutations, reflect them in the returned graph. Do not return the previous graph unchanged.
 - Param hints describe parameter meanings only; choose parameter values from data profile, diagnostics, and feedback, not from fixed templates.
 - If feedback mentions class imbalance or unstable validation, either change the model or set explicit parameters justified by the current data profile.
-- If the user asks for federated/stacking/ensemble strategy and AVAILABLE_OPERATIONS.training_strategies_catalog contains federated_automl, set graph.training_strategy accordingly.
+- Keep graph.training_strategy null unless the user explicitly asked for a strategy, previous_graph already uses one, or Critic suggested a set_strategy mutation.
+- If strategy use is allowed and AVAILABLE_OPERATIONS.training_strategies_catalog contains the requested strategy, set graph.training_strategy as an object {"name": "...", "params": {}}.
 - training_strategy is an execution strategy, not an operation node. Keep graph nodes valid even when a strategy is selected.
 """
 
@@ -175,6 +177,25 @@ Rules:
             )
             return None, "", "", "", diagnostics
 
+        if proposal.graph.training_strategy and not self._training_strategy_allowed(prev_feedback, prev_graph):
+            proposal.graph.training_strategy = None
+            diagnostics.append(
+                {
+                    "agent": "Architect",
+                    "kind": "training_strategy_removed",
+                    "summary": "Architect proposed a training strategy without an explicit request or Critic recommendation.",
+                    "technical_message": (
+                        "training_strategy was reset to null. Strategies are execution modes and "
+                        "must be selected by the user, preserved from the previous graph, or recommended by Critic."
+                    ),
+                    "recommendations": [
+                        "Keep graph.training_strategy null unless strategy use is explicitly requested.",
+                        "Use model nodes and node parameters for ordinary graph improvements.",
+                    ],
+                    "recoverable": True,
+                }
+            )
+
         proposed = await self.call_mcp_tool("propose_graph", {"graph_json": proposal.graph.as_graph_json()})
         if isinstance(proposed, dict) and proposed.get("valid") and proposed.get("graph"):
             return (
@@ -276,6 +297,7 @@ Rules:
         return msg
 
     def _build_structured_prompt(self, dc: DataContext, profile, operations, prev_fb, prev_graph) -> str:
+        strategy_allowed = self._training_strategy_allowed(prev_fb, prev_graph)
         payload = {
             "task": dc.task_type,
             "is_time_series": dc.is_time_series,
@@ -286,6 +308,15 @@ Rules:
             "available_operations": operations,
             "previous_graph": prev_graph,
             "feedback": None,
+            "training_strategy_policy": {
+                "default": "null",
+                "allowed_now": strategy_allowed,
+                "rule": (
+                    "Use a training strategy only if the user explicitly asked for it, "
+                    "previous_graph already has one, or Critic suggested set_strategy."
+                ),
+                "schema": {"name": "strategy_name", "params": {}},
+            },
         }
         if prev_fb:
             payload["feedback"] = {
@@ -300,9 +331,32 @@ Rules:
             "Use available_operations.catalog[].param_hints only as neutral parameter descriptions.\n"
             "Use available_operations.training_strategies_catalog for selectable execution strategies; "
             "available_operations.training_strategies is the upstream reference list.\n"
+            "Respect training_strategy_policy: keep graph.training_strategy null when allowed_now=false.\n"
             "Return only the GraphProposal JSON object.\n"
             f"{json.dumps(payload, ensure_ascii=False)}"
         )
+
+    @staticmethod
+    def _training_strategy_allowed(prev_fb, prev_graph) -> bool:
+        if isinstance(prev_graph, dict) and prev_graph.get("training_strategy"):
+            return True
+        if not prev_fb:
+            return False
+        mutations = getattr(prev_fb, "suggested_mutations", []) or []
+        if any((m or {}).get("type") == "set_strategy" for m in mutations if isinstance(m, dict)):
+            return True
+        text_parts = [
+            getattr(prev_fb, "winner", ""),
+            getattr(prev_fb, "assessment", ""),
+            " ".join(str(item) for item in (getattr(prev_fb, "weaknesses", []) or [])),
+            " ".join(str(item) for item in (getattr(prev_fb, "improvement_plan", []) or [])),
+        ]
+        text = " ".join(text_parts).lower()
+        strategy_markers = (
+            "training_strategy", "strategy", "federated", "stacking", "stacked", "ensemble",
+            "стратег", "федерат", "стекинг", "стэкинг", "ансамб",
+        )
+        return any(marker in text for marker in strategy_markers)
 
     @staticmethod
     def _fallback_analysis(task_type: str, reused_previous: bool) -> str:
