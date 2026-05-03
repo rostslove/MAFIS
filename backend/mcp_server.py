@@ -148,9 +148,11 @@ def _default_strategy_operations(problem: str, data_type: str) -> List[str]:
     if not _is_table_strategy(data_type):
         return []
     if problem == "classification":
-        return ["rf", "xgboost", "logit", "dt", "lgbm"]
+        preferred = ["rf", "xgboost", "logit", "dt", "lgbm", "catboost"]
+        return [operation for operation in preferred if operation in OPERATIONS.get("classification", {}).get("models", [])]
     if problem == "regression":
-        return ["treg", "xgbreg", "ridge", "lasso", "dtreg", "lgbmreg", "sgdr"]
+        preferred = ["treg", "xgbreg", "ridge", "lasso", "dtreg", "lgbmreg", "sgdr", "catboostreg"]
+        return [operation for operation in preferred if operation in OPERATIONS.get("regression", {}).get("models", [])]
     return []
 
 

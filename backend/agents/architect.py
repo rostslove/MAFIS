@@ -23,8 +23,7 @@ If native tool calling is unavailable, request a tool by returning exactly one J
 {"name": "tool_name", "arguments": {"arg": "value"}}
 
 A graph is JSON: {"task_type": "...", "nodes": [{"id": "model", "operation": "operation_from_catalog", "params": {}, "inputs": []}], "training_strategy": null}.
-Optionally set training_strategy to one of AVAILABLE_OPERATIONS.training_strategies_catalog, for example:
-{"name": "federated_automl", "params": {"timeout": 10, "n_splits": 5}}.
+Optionally set training_strategy to one of AVAILABLE_OPERATIONS.training_strategies_catalog.
 
 Each node has:
   - id: unique string
@@ -33,7 +32,7 @@ Each node has:
   - inputs: list of upstream node IDs (empty = consumes raw data)
 
 The graph must be a DAG with exactly ONE root (node nobody else inputs from). The root is the model.
-For ordinary tabular classification/regression in this project, prefer a direct model-only graph unless the available operations explicitly list preprocessing for that task. Do not invent preprocessing operations.
+For ordinary tabular classification/regression, prefer a direct model-only graph by default. Add preprocessing only when it is returned by the catalog and the current data profile or feedback justifies it.
 
 WORKFLOW:
 1. Call get_data_profile to understand the data.
@@ -63,12 +62,12 @@ The response must match this schema:
 }
 Rules:
 - Use only operations listed in AVAILABLE_OPERATIONS.
-- If AVAILABLE_OPERATIONS.preprocessing is empty, do not add preprocessing nodes.
+- Add preprocessing nodes only when AVAILABLE_OPERATIONS.preprocessing contains the operation and the data profile or feedback justifies that extra step.
 - The graph must have exactly one root model node.
-- For ordinary tabular classification/regression, prefer one direct model node unless feedback explicitly asks for another valid model or explicit model parameters.
+- For ordinary tabular classification/regression, prefer one direct model node unless the data profile or feedback justifies another valid model, explicit model parameters, or a valid preprocessing step.
 - If feedback contains suggested_mutations, reflect them in the returned graph. Do not return the previous graph unchanged.
-- If feedback mentions class imbalance and param hints allow it, use explicit balancing params such as xgboost.scale_pos_weight or class_weight="balanced".
-- If feedback mentions unstable cross-validation, use a simpler model or explicit regularization params from param_hints.
+- Param hints describe parameter meanings only; choose parameter values from data profile, diagnostics, and feedback, not from fixed templates.
+- If feedback mentions class imbalance or unstable validation, either change the model or set explicit parameters justified by the current data profile.
 - If the user asks for federated/stacking/ensemble strategy and AVAILABLE_OPERATIONS.training_strategies_catalog contains federated_automl, set graph.training_strategy accordingly.
 - training_strategy is an execution strategy, not an operation node. Keep graph nodes valid even when a strategy is selected.
 """
@@ -291,8 +290,9 @@ Rules:
             }
         return (
             "Create one valid graph proposal for this payload.\n"
-            "Use available_operations.catalog[].param_hints when setting params.\n"
-            "Use available_operations.training_strategies as training guidance, but encode the actionable change in graph nodes/params.\n"
+            "Use available_operations.catalog[].param_hints only as neutral parameter descriptions.\n"
+            "Use available_operations.training_strategies_catalog for selectable execution strategies; "
+            "available_operations.training_strategies is the upstream reference list.\n"
             "Return only the GraphProposal JSON object.\n"
             f"{json.dumps(payload, ensure_ascii=False)}"
         )

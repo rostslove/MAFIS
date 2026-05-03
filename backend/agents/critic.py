@@ -173,7 +173,7 @@ Return JSON only."""
     @staticmethod
     def _build_assessment(engineer: EngineerResult, validation: Dict[str, Any], dc: DataContext) -> str:
         if engineer.graph_error:
-            return f"Graph failed during training: {engineer.graph_error[:220]}."
+            return "Graph failed before scoring; Critic is focusing on recovery mutations from runtime diagnostics."
         cv = ""
         if isinstance(validation, dict) and "score_mean" in validation:
             cv = f", CV mean {validation.get('score_mean', 0):.4f} +/- {validation.get('score_std', 0):.4f}"
@@ -210,8 +210,7 @@ Return JSON only."""
     def _weaknesses(engineer: EngineerResult, validation: Dict[str, Any], dc: DataContext) -> List[str]:
         weaknesses = []
         if engineer.graph_error:
-            weaknesses.append("The graph could not be trained")
-            weaknesses.extend(Critic._diagnostic_recommendations(engineer.diagnostics))
+            weaknesses.append("The graph could not be trained with the current runtime parameters")
             return weaknesses
         if engineer.graph_score <= 0:
             weaknesses.append("The test graph score is zero or unavailable")
@@ -246,6 +245,27 @@ Return JSON only."""
         current_root = next((n for n in nodes if n.get("id") == root_id), {})
         current_operation = current_root.get("operation", "")
         existing_ops = {n.get("operation") for n in nodes}
+        from graph_engine import OPERATIONS
+
+        allowed_preprocessing = set(
+            OPERATIONS.get(dc.task_type, {}).get("preprocessing", [])
+        )
+
+        if engineer.graph_error:
+            runtime_mutations = self._dedupe_mutations(
+                mutations,
+                current_root,
+                graph.get("training_strategy") or {},
+                dc.iteration_history,
+            )
+            if runtime_mutations:
+                return runtime_mutations[:2]
+            candidate = self._next_model_candidate(
+                dc.task_type, current_operation, history=dc.iteration_history
+            )
+            if candidate:
+                return [{"type": "replace", "node_id": root_id, "new_operation": candidate}]
+            return []
 
         score_floor = self._target_quality_floor(dc.task_type, dc.primary_metric)
         f1 = engineer.graph_metrics.get("f1")
@@ -277,6 +297,7 @@ Return JSON only."""
         if (
             feature_stats.get("mean_std_ratio", 0) > 3
             and "scaling" not in existing_ops
+            and "scaling" in allowed_preprocessing
             and not dc.task_type.startswith("ts_")
         ):
             mutations.append({
@@ -287,6 +308,7 @@ Return JSON only."""
         if (
             dc.profile.get("issues") and "high_dimensionality" in " ".join(dc.profile.get("issues", []))
             and "pca" not in existing_ops
+            and "pca" in allowed_preprocessing
             and not dc.task_type.startswith("ts_")
         ):
             mutations.append({

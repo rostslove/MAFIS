@@ -233,6 +233,62 @@ def render_diagnostics(diagnostics: List[Dict[str, Any]], title: str = "Diagnost
                 st.code(str(item["technical_message"])[:4000])
 
 
+def unique_text(items: List[str]) -> List[str]:
+    unique: List[str] = []
+    for item in items:
+        text = str(item or "").strip()
+        if text and text not in unique:
+            unique.append(text)
+    return unique
+
+
+def runtime_failure_details(engineer: Dict[str, Any], critic: Dict[str, Any]) -> Dict[str, Any]:
+    error = str(engineer.get("graph_error") or "").strip()
+    if not error:
+        return {}
+
+    diagnostics = []
+    diagnostics.extend(engineer.get("diagnostics", []) or [])
+    diagnostics.extend(critic.get("diagnostics", []) or [])
+    selected = {}
+    for diagnostic in diagnostics:
+        if not isinstance(diagnostic, dict):
+            continue
+        kind = str(diagnostic.get("kind") or "")
+        technical = str(diagnostic.get("technical_message") or "")
+        if technical == error or kind.endswith("_error") or kind == "runtime_error":
+            selected = diagnostic
+            break
+    if not selected and diagnostics:
+        selected = next((d for d in diagnostics if isinstance(d, dict)), {})
+
+    summary = str(selected.get("summary") or "").strip()
+    technical = str(selected.get("technical_message") or error).strip()
+    if not summary or summary == technical:
+        summary = "Training failed before metrics were produced."
+    recommendations = unique_text(selected.get("recommendations", []) or [])
+    return {"summary": summary, "technical": technical, "recommendations": recommendations}
+
+
+def render_runtime_failure_once(iteration: Dict[str, Any]) -> bool:
+    engineer = iteration.get("engineer", {}) or {}
+    critic = iteration.get("critic", {}) or {}
+    details = runtime_failure_details(engineer, critic)
+    if not details:
+        return False
+
+    st.error(details["summary"])
+    recommendations = details.get("recommendations", []) or []
+    if recommendations:
+        st.write("Recovery suggestions")
+        for recommendation in recommendations[:4]:
+            st.write(f"- {recommendation}")
+    if details.get("technical"):
+        with st.expander("Technical details", expanded=False):
+            st.code(details["technical"][:4000])
+    return True
+
+
 def operation_rows(config: Dict[str, Any], task_type: str) -> List[Dict[str, str]]:
     catalog = config.get("operation_catalog", {}).get(task_type, {})
     if catalog:
@@ -244,6 +300,9 @@ def operation_rows(config: Dict[str, Any], task_type: str) -> List[Dict[str, str
                     "group": group,
                     "operation": item.get("operation", ""),
                     "description": item.get("description", ""),
+                    "source": item.get("source", ""),
+                    "meta": item.get("fedot_industrial_meta", ""),
+                    "tags": ", ".join(item.get("tags", []) or []),
                     "params": ", ".join(hint.get("name", "") for hint in param_hints) or "-",
                 })
         return rows
@@ -387,6 +446,7 @@ def strategy_rows(config: Dict[str, Any], task_type: str) -> List[Dict[str, str]
             "strategy": item.get("name", ""),
             "label": item.get("label", ""),
             "description": item.get("description", ""),
+            "source": item.get("fedot_industrial_reference", ""),
             "default params": format_params(item.get("default_params", {}) or {}),
         }
         for item in strategies
@@ -934,7 +994,12 @@ def evaluation_panel() -> None:
             st.error(f"Run failed: {exc}")
 
 
-def render_engineer_report(engineer: Dict[str, Any]) -> None:
+def render_engineer_report(
+    engineer: Dict[str, Any],
+    show_failure_details: bool = True,
+    show_training_notes: bool = True,
+    show_diagnostics: bool = True,
+) -> None:
     st.markdown("#### Engineer Report")
     target_info = engineer.get("target_info", {}) or {}
     if target_info:
@@ -957,12 +1022,12 @@ def render_engineer_report(engineer: Dict[str, Any]) -> None:
             st.caption("Target sample: " + ", ".join(target_info["sample_values"][:8]))
 
     notes = engineer.get("training_notes", []) or []
-    if notes:
+    if notes and show_training_notes:
         st.write("Training notes")
         for note in notes:
             st.write(f"- {note}")
 
-    if engineer.get("graph_error"):
+    if engineer.get("graph_error") and show_failure_details:
         st.error(engineer["graph_error"])
 
     strategy = engineer.get("training_strategy", {}) or {}
@@ -982,7 +1047,9 @@ def render_engineer_report(engineer: Dict[str, Any]) -> None:
 
     train_metrics = engineer.get("train_metrics", {}) or {}
     test_metrics = engineer.get("test_metrics", {}) or {}
-    if train_metrics or test_metrics:
+    if engineer.get("graph_error"):
+        st.caption("Train/test metrics are unavailable because the graph did not finish training.")
+    elif train_metrics or test_metrics:
         train_col, test_col = st.columns(2)
         with train_col:
             render_metric_table("Train metrics", train_metrics)
@@ -1006,27 +1073,31 @@ def render_engineer_report(engineer: Dict[str, Any]) -> None:
         ]
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-    render_diagnostics(engineer.get("diagnostics", []), "Engineer diagnostics", use_expander=False)
+    if show_diagnostics:
+        render_diagnostics(engineer.get("diagnostics", []), "Engineer diagnostics", use_expander=False)
 
 
-def render_critic_feedback(critic: Dict[str, Any]) -> None:
-    st.markdown("#### Critic Feedback")
-    st.write(critic.get("assessment", "No critic assessment."))
+def render_critic_feedback(critic: Dict[str, Any], compact_runtime_error: bool = False) -> None:
+    st.markdown("#### Critic Recovery" if compact_runtime_error else "#### Critic Feedback")
+    if compact_runtime_error:
+        st.caption("Critic is focused on concrete recovery mutations because Engineer did not produce metrics.")
+    else:
+        st.write(critic.get("assessment", "No critic assessment."))
 
     cols = st.columns(2)
     cols[0].metric("Decision", critic.get("winner", ""))
     cols[1].metric("Suggested changes", len(critic.get("suggested_mutations", []) or []))
 
-    if critic.get("strengths"):
+    if critic.get("strengths") and not compact_runtime_error:
         st.write("What works")
         for item in critic["strengths"]:
             st.write(f"- {item}")
-    if critic.get("weaknesses"):
+    if critic.get("weaknesses") and not compact_runtime_error:
         st.write("What should improve")
         for item in critic["weaknesses"]:
             st.write(f"- {item}")
     if critic.get("improvement_plan"):
-        st.write("Improvement plan")
+        st.write("Recovery plan" if compact_runtime_error else "Improvement plan")
         for item in critic["improvement_plan"]:
             st.write(f"- {item}")
     if critic.get("suggested_mutations"):
@@ -1043,7 +1114,8 @@ def render_critic_feedback(critic: Dict[str, Any]) -> None:
                 label += f" - {row['details']}"
             st.checkbox(label, value=(idx == 0), key=f"critic_mut_{idx}")
 
-    render_diagnostics(critic.get("diagnostics", []), "Critic diagnostics", use_expander=False)
+    if not compact_runtime_error:
+        render_diagnostics(critic.get("diagnostics", []), "Critic diagnostics", use_expander=False)
 
 
 def selected_critic_mutations(critic: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1368,26 +1440,34 @@ def results_tab() -> None:
 
     engineer = item.get("engineer", {})
     critic = item.get("critic", {})
+    has_runtime_failure = bool(engineer.get("graph_error"))
 
     metrics = engineer.get("test_metrics", {}) or engineer.get("graph_metrics", {}) or {}
     primary_metric = metrics.get("primary_metric") or result.get("primary_metric") or "score"
     primary_value = metrics.get("primary_metric_value", engineer.get("graph_score", 0))
 
     col1, col2, col3 = st.columns(3)
-    col1.metric(f"Test {primary_metric}", format_number(primary_value))
+    col1.metric(f"Test {primary_metric}", "n/a" if has_runtime_failure else format_number(primary_value))
     col2.metric("Critic decision", critic.get("winner", ""))
     col3.metric("Suggested changes", len(critic.get("suggested_mutations", []) or []))
 
     st.markdown("#### Evaluated Graph")
     render_graph(item.get("architect", {}).get("graph", {}), show_details=False)
 
-    render_engineer_tuning_controls(item)
+    render_runtime_failure_once(item)
+    if not has_runtime_failure:
+        render_engineer_tuning_controls(item)
     engineer = item.get("engineer", {})
-    render_engineer_report(engineer)
+    render_engineer_report(
+        engineer,
+        show_failure_details=not has_runtime_failure,
+        show_training_notes=not has_runtime_failure,
+        show_diagnostics=not has_runtime_failure,
+    )
     render_evaluation_history(result)
     if engineer.get("tuned_nodes"):
         st.info("Critic feedback below is from the last full evaluation. Run Evaluate Approved Graph again to reassess the tuned parameters.")
-    render_critic_feedback(critic)
+    render_critic_feedback(critic, compact_runtime_error=has_runtime_failure)
 
     st.markdown("#### Next Pipeline Decision")
     msg = st.text_area(

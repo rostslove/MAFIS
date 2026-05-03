@@ -59,6 +59,18 @@ except ImportError as exc:
 except Exception as exc:
     logger.warning("Fedot.Industrial repository setup failed: %s", exc)
 
+try:
+    from fedot_ind.core.repository import model_repository as fedot_ind_model_repository
+except Exception as exc:
+    fedot_ind_model_repository = None
+    logger.warning("Fedot.Industrial model repository import failed: %s", exc)
+
+try:
+    from fedot_ind.api.utils.industrial_strategy import IndustrialStrategy
+except Exception as exc:
+    IndustrialStrategy = None
+    logger.warning("Fedot.Industrial strategy import failed: %s", exc)
+
 from fedot.core.data.data import InputData
 from fedot.core.pipelines.pipeline import Pipeline
 from fedot.core.pipelines.node import PipelineNode
@@ -75,14 +87,125 @@ def is_ts_task(task_type: str) -> bool:
     return task_type in TS_TASKS
 
 
-# Atomic operations available per task type. Used for validation and proposal.
-OPERATIONS: Dict[str, Dict[str, List[str]]] = {
+FEDOT_MODEL_REPOSITORY_REFERENCE = "fedot_ind.core.repository.model_repository"
+FEDOT_MODEL_JSON_REFERENCE = "fedot_ind.core.repository.data.industrial_model_repository.json"
+FEDOT_DATA_OPERATION_JSON_REFERENCE = "fedot_ind.core.repository.data.industrial_data_operation_repository.json"
+FEDOT_STRATEGY_REFERENCE = "fedot_ind.api.utils.industrial_strategy.IndustrialStrategy"
+
+
+def _unique(items: List[str]) -> List[str]:
+    seen = set()
+    result = []
+    for item in items:
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result
+
+
+def _repo_dict(name: str) -> Dict[str, Any]:
+    if fedot_ind_model_repository is None:
+        return {}
+    value = getattr(fedot_ind_model_repository, name, {}) or {}
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _repo_keys(name: str) -> List[str]:
+    return list(_repo_dict(name).keys())
+
+
+def _load_fedot_industrial_json(filename: str) -> Dict[str, Any]:
+    if not FEDOT_INDUSTRIAL_SOURCE:
+        return {}
+    path = Path(FEDOT_INDUSTRIAL_SOURCE) / "fedot_ind" / "core" / "repository" / "data" / filename
+    try:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("Failed to read Fedot.Industrial repository JSON %s: %s", path, exc)
+    return {}
+
+
+INDUSTRIAL_MODEL_REPOSITORY_JSON = _load_fedot_industrial_json("industrial_model_repository.json")
+INDUSTRIAL_DATA_OPERATION_REPOSITORY_JSON = _load_fedot_industrial_json(
+    "industrial_data_operation_repository.json"
+)
+
+
+def _json_operations(repository: Dict[str, Any]) -> Dict[str, Any]:
+    operations = repository.get("operations", {})
+    return operations if isinstance(operations, dict) else {}
+
+
+def _json_operation_names_by_meta(repository: Dict[str, Any], metas: set[str]) -> List[str]:
+    names = []
+    for name, spec in _json_operations(repository).items():
+        if isinstance(spec, dict) and spec.get("meta") in metas:
+            names.append(name)
+    return names
+
+
+def _framework_operation_names() -> set[str]:
+    names = set()
+    for repo_name in (
+        "SKLEARN_REG_MODELS",
+        "SKLEARN_CLF_MODELS",
+        "FEDOT_PREPROC_MODEL",
+        "INDUSTRIAL_PREPROC_MODEL",
+        "INDUSTRIAL_CLF_PREPROC_MODEL",
+        "INDUSTRIAL_REG_AUTOML_MODEL",
+        "INDUSTRIAL_CLF_AUTOML_MODEL",
+        "ANOMALY_DETECTION_MODELS",
+        "NEURAL_MODEL",
+        "NEURAL_MODEL_FOR_CLF",
+        "FORECASTING_MODELS",
+        "FORECASTING_PREPROC",
+        "PRIMARY_FORECASTING_MODELS",
+    ):
+        names.update(_repo_keys(repo_name))
+    names.update(_json_operations(INDUSTRIAL_MODEL_REPOSITORY_JSON).keys())
+    names.update(_json_operations(INDUSTRIAL_DATA_OPERATION_REPOSITORY_JSON).keys())
+    return names
+
+
+def _only_framework_ops(names: List[str]) -> List[str]:
+    framework_names = _framework_operation_names()
+    if not framework_names:
+        return _unique(names)
+    return _unique([name for name in names if name in framework_names])
+
+
+def _operation_repository_info(operation: str) -> Dict[str, Any]:
+    for repository, reference in (
+        (INDUSTRIAL_MODEL_REPOSITORY_JSON, FEDOT_MODEL_JSON_REFERENCE),
+        (INDUSTRIAL_DATA_OPERATION_REPOSITORY_JSON, FEDOT_DATA_OPERATION_JSON_REFERENCE),
+    ):
+        operation_spec = _json_operations(repository).get(operation)
+        if not isinstance(operation_spec, dict):
+            continue
+        meta_name = operation_spec.get("meta", "")
+        metadata = repository.get("metadata", {})
+        meta_spec = metadata.get(meta_name, {}) if isinstance(metadata, dict) else {}
+        if not isinstance(meta_spec, dict):
+            meta_spec = {}
+        return {
+            "source": reference,
+            "meta": meta_name,
+            "description": meta_spec.get("description", ""),
+            "tags": operation_spec.get("tags", []),
+            "presets": operation_spec.get("presets", []),
+            "input_type": operation_spec.get("input_type") or meta_spec.get("input_type"),
+            "output_type": operation_spec.get("output_type") or meta_spec.get("output_type"),
+        }
+    if operation in _framework_operation_names():
+        return {"source": FEDOT_MODEL_REPOSITORY_REFERENCE, "meta": "", "description": ""}
+    return {"source": "MAFIS fallback", "meta": "", "description": ""}
+
+
+# Local fallback is used only when Fedot.Industrial repository introspection is unavailable.
+FALLBACK_OPERATIONS: Dict[str, Dict[str, List[str]]] = {
     "classification": {
-        # Fedot.Industrial 0.5 routes common preprocessing operations through
-        # industrial multidimensional strategies. On ordinary tabular CSV data
-        # they can receive 1D column slices and fail inside sklearn. Keep the
-        # default tabular graph model-only; Critic can suggest model changes
-        # after the first approved evaluation.
         "preprocessing": [],
         "models": ["rf", "xgboost", "logit", "knn", "lgbm", "mlp", "dt"],
     },
@@ -122,6 +245,111 @@ OPERATIONS: Dict[str, Dict[str, List[str]]] = {
         ],
     },
 }
+
+
+def _build_framework_operations() -> Dict[str, Dict[str, List[str]]]:
+    if not (_repo_keys("SKLEARN_CLF_MODELS") or _repo_keys("SKLEARN_REG_MODELS")):
+        return FALLBACK_OPERATIONS
+
+    sklearn_class = set(_json_operation_names_by_meta(
+        INDUSTRIAL_MODEL_REPOSITORY_JSON,
+        {"sklearn_class", "custom_class"},
+    ))
+    sklearn_class.update(_repo_keys("SKLEARN_CLF_MODELS"))
+    sklearn_reg = set(_json_operation_names_by_meta(
+        INDUSTRIAL_MODEL_REPOSITORY_JSON,
+        {"sklearn_regr", "custom_regr"},
+    ))
+    sklearn_reg.update(_repo_keys("SKLEARN_REG_MODELS"))
+
+    tabular_class_excluded = {
+        "one_class_svm",
+        "pdl_clf",
+        "industrial_stat_clf",
+        "industrial_freq_clf",
+        "industrial_manifold_clf",
+    }
+    tabular_reg_excluded = {
+        "pdl_reg",
+        "industrial_stat_reg",
+        "industrial_freq_reg",
+        "industrial_manifold_reg",
+    }
+
+    tabular_preproc_common = _json_operation_names_by_meta(
+        INDUSTRIAL_DATA_OPERATION_REPOSITORY_JSON,
+        {"custom_preprocessing", "sklearn_categorical", "dimension_transformation"},
+    )
+    class_preproc = tabular_preproc_common + _json_operation_names_by_meta(
+        INDUSTRIAL_DATA_OPERATION_REPOSITORY_JSON,
+        {"classification_preprocessing"},
+    ) + _repo_keys("INDUSTRIAL_CLF_PREPROC_MODEL")
+    reg_preproc = tabular_preproc_common + _json_operation_names_by_meta(
+        INDUSTRIAL_DATA_OPERATION_REPOSITORY_JSON,
+        {"regression_preprocessing"},
+    )
+
+    industrial_preproc = [
+        name
+        for name in _repo_keys("INDUSTRIAL_PREPROC_MODEL")
+        if name not in {"bagging", "isolation_forest_class", "isolation_forest_reg"}
+    ]
+    ts_scalers = [name for name in _repo_keys("FEDOT_PREPROC_MODEL") if name in {"scaling", "normalization"}]
+
+    ts_class_models = _repo_keys("INDUSTRIAL_CLF_AUTOML_MODEL") + _repo_keys("NEURAL_MODEL_FOR_CLF")
+    ts_class_models = [
+        name
+        for name in ts_class_models
+        if name not in {"ensembled_featuresbagging", "pdl_clf", "one_class_svm"}
+    ]
+
+    ts_reg_neural_allow = {
+        "inception_model", "resnet_model", "nbeats_model", "tcn_model", "tst_model", "xcm_model"
+    }
+    ts_reg_models = _repo_keys("INDUSTRIAL_REG_AUTOML_MODEL") + [
+        name for name in _repo_keys("NEURAL_MODEL") if name in ts_reg_neural_allow
+    ]
+    ts_reg_models = [
+        name
+        for name in ts_reg_models
+        if name not in {"ensembled_featuresbagging", "pdl_reg"}
+    ]
+
+    forecasting_models = _repo_keys("FORECASTING_MODELS") + _repo_keys("PRIMARY_FORECASTING_MODELS")
+    forecasting_preproc = _repo_keys("FORECASTING_PREPROC")
+
+    return {
+        "classification": {
+            "preprocessing": _only_framework_ops(class_preproc),
+            "models": _only_framework_ops([
+                name for name in sorted(sklearn_class)
+                if name not in tabular_class_excluded and not name.startswith("industrial_")
+            ]),
+        },
+        "regression": {
+            "preprocessing": _only_framework_ops(reg_preproc),
+            "models": _only_framework_ops([
+                name for name in sorted(sklearn_reg)
+                if name not in tabular_reg_excluded and not name.startswith("industrial_")
+            ]),
+        },
+        "ts_classification": {
+            "preprocessing": _only_framework_ops(ts_scalers + industrial_preproc),
+            "models": _only_framework_ops(ts_class_models),
+        },
+        "ts_regression": {
+            "preprocessing": _only_framework_ops(ts_scalers + industrial_preproc),
+            "models": _only_framework_ops(ts_reg_models),
+        },
+        "ts_forecasting": {
+            "preprocessing": _only_framework_ops(forecasting_preproc + ["eigen_basis"]),
+            "models": _only_framework_ops(forecasting_models),
+        },
+    }
+
+
+# Atomic operations available per task type. Used for validation and proposal.
+OPERATIONS: Dict[str, Dict[str, List[str]]] = _build_framework_operations()
 
 METRICS_BY_TASK: Dict[str, List[str]] = {
     "classification": ["roc_auc", "f1", "accuracy", "precision"],
@@ -205,112 +433,154 @@ OPERATION_DESCRIPTIONS: Dict[str, str] = {
 }
 
 
+def _build_operation_description(operation: str) -> str:
+    repo_info = _operation_repository_info(operation)
+    description = str(repo_info.get("description") or "").strip()
+    tags = repo_info.get("tags") or []
+    presets = repo_info.get("presets") or []
+    details = []
+    if tags:
+        details.append(f"tags: {', '.join(str(tag) for tag in tags[:6])}")
+    if presets:
+        details.append(f"presets: {', '.join(str(preset) for preset in presets[:4])}")
+    if description and details:
+        return f"{description} ({'; '.join(details)})."
+    if description:
+        return description
+    return OPERATION_DESCRIPTIONS.get(operation, "")
+
+
+for _task_ops in OPERATIONS.values():
+    for _operation in _task_ops.get("preprocessing", []) + _task_ops.get("models", []):
+        repo_description = _build_operation_description(_operation)
+        if repo_description:
+            OPERATION_DESCRIPTIONS[_operation] = repo_description
+
+
 OPERATION_PARAM_HINTS: Dict[str, List[Dict[str, Any]]] = {
     "xgboost": [
-        {
-            "name": "scale_pos_weight",
-            "when": "binary class imbalance",
-            "example": "majority_count / minority_count",
-        },
-        {"name": "max_depth", "when": "noticeable CV variance", "example": 3},
-        {"name": "learning_rate", "when": "noticeable CV variance", "example": 0.05},
-        {"name": "n_estimators", "when": "stable boosting with lower learning rate", "example": 200},
+        {"name": "scale_pos_weight", "description": "Multiplier for the positive class contribution in binary boosting."},
+        {"name": "use_eval_set", "description": "Controls whether FEDOT creates an internal validation split for boosting fit calls."},
+        {"name": "early_stopping_rounds", "description": "Number of validation rounds without improvement before stopping; null disables eval-set early stopping."},
+        {"name": "max_depth", "description": "Maximum depth of each boosting tree."},
+        {"name": "learning_rate", "description": "Shrinkage applied to each boosting step."},
+        {"name": "n_estimators", "description": "Number of boosting trees."},
     ],
     "rf": [
-        {"name": "class_weight", "when": "class imbalance", "example": "balanced"},
-        {"name": "max_depth", "when": "overfitting or unstable CV", "example": 8},
-        {"name": "n_estimators", "when": "stabilize ensemble estimate", "example": 300},
+        {"name": "class_weight", "description": "Class weighting policy used by the classifier."},
+        {"name": "max_depth", "description": "Maximum depth of each tree."},
+        {"name": "n_estimators", "description": "Number of trees in the forest."},
     ],
     "logit": [
-        {"name": "class_weight", "when": "class imbalance", "example": "balanced"},
-        {"name": "C", "when": "regularization strength", "example": 0.5},
-        {"name": "max_iter", "when": "safer convergence", "example": 1000},
+        {"name": "class_weight", "description": "Class weighting policy used by the linear classifier."},
+        {"name": "C", "description": "Inverse regularization strength for logistic regression."},
+        {"name": "max_iter", "description": "Maximum number of solver iterations."},
     ],
     "lgbm": [
-        {"name": "class_weight", "when": "class imbalance", "example": "balanced"},
-        {"name": "num_leaves", "when": "regularize leaf-wise growth", "example": 31},
-        {"name": "learning_rate", "when": "noticeable CV variance", "example": 0.05},
-        {"name": "n_estimators", "when": "stable boosting with lower learning rate", "example": 200},
+        {"name": "class_weight", "description": "Class weighting policy used by LightGBM."},
+        {"name": "use_eval_set", "description": "Controls whether FEDOT creates an internal validation split for LightGBM fit calls."},
+        {"name": "early_stopping_rounds", "description": "Number of validation rounds without improvement before stopping; null disables eval-set early stopping."},
+        {"name": "num_leaves", "description": "Maximum number of leaves in each LightGBM tree."},
+        {"name": "learning_rate", "description": "Shrinkage applied to each boosting step."},
+        {"name": "n_estimators", "description": "Number of boosting trees."},
     ],
     "dt": [
-        {"name": "class_weight", "when": "class imbalance", "example": "balanced"},
-        {"name": "max_depth", "when": "avoid overfitting", "example": 6},
+        {"name": "class_weight", "description": "Class weighting policy used by the tree classifier."},
+        {"name": "max_depth", "description": "Maximum depth of the decision tree."},
     ],
     "ridge": [
-        {"name": "alpha", "when": "stronger regularization", "example": 2.0},
+        {"name": "alpha", "description": "L2 regularization strength."},
     ],
     "xgbreg": [
-        {"name": "max_depth", "when": "noticeable CV variance", "example": 3},
-        {"name": "learning_rate", "when": "noticeable CV variance", "example": 0.05},
-        {"name": "n_estimators", "when": "stable boosting with lower learning rate", "example": 200},
+        {"name": "use_eval_set", "description": "Controls whether FEDOT creates an internal validation split for boosting fit calls."},
+        {"name": "early_stopping_rounds", "description": "Number of validation rounds without improvement before stopping; null disables eval-set early stopping."},
+        {"name": "max_depth", "description": "Maximum depth of each boosting tree."},
+        {"name": "learning_rate", "description": "Shrinkage applied to each boosting step."},
+        {"name": "n_estimators", "description": "Number of boosting trees."},
+    ],
+    "lgbmreg": [
+        {"name": "use_eval_set", "description": "Controls whether FEDOT creates an internal validation split for LightGBM fit calls."},
+        {"name": "early_stopping_rounds", "description": "Number of validation rounds without improvement before stopping; null disables eval-set early stopping."},
+        {"name": "num_leaves", "description": "Maximum number of leaves in each LightGBM tree."},
+        {"name": "learning_rate", "description": "Shrinkage applied to each boosting step."},
+        {"name": "n_estimators", "description": "Number of boosting trees."},
     ],
     "treg": [
-        {"name": "max_depth", "when": "avoid overfitting", "example": 8},
-        {"name": "n_estimators", "when": "stabilize ensemble estimate", "example": 300},
+        {"name": "max_depth", "description": "Maximum depth of each tree."},
+        {"name": "n_estimators", "description": "Number of trees in the ensemble."},
     ],
 }
 
 
+FEDERATED_AUTOML_REFERENCE = "fedot_ind.core.ensemble.random_automl_forest.RAFEnsembler"
+
+
+STRATEGY_DESCRIPTIONS: Dict[str, str] = {
+    "federated_automl": (
+        "RAFEnsembler-based strategy: train several internal AutoML branches on sample folds "
+        "and stack their predictions through a final head model."
+    ),
+    "kernel_automl": "KernelEnsembler-based strategy over transformed feature representations.",
+    "forecasting_assumptions": "Forecasting strategy that evaluates built-in forecasting assumptions.",
+    "forecasting_exogenous": "Forecasting strategy that augments the model with exogenous time-series variables.",
+    "lora_strategy": "LoRA model strategy exposed by Fedot.Industrial for neural adaptation flows.",
+    "sampling_strategy": "Big-dataset strategy that samples the training tensor before fitting task models.",
+}
+
+
+STRATEGY_REQUIREMENTS: Dict[str, str] = {
+    "federated_automl": "supervised target, train/test split, branch AutoML params",
+    "kernel_automl": "kernel ensemble configuration and dedicated prediction path",
+    "forecasting_assumptions": "forecasting task contract and forecast horizon",
+    "forecasting_exogenous": "forecasting task plus exogenous time-series columns",
+    "lora_strategy": "LoRA/model-specific data and training configuration",
+    "sampling_strategy": "sampling_algorithm, sampling_range, and task-specific runner",
+}
+
+
+def _framework_strategy_names() -> List[str]:
+    if IndustrialStrategy is not None:
+        try:
+            strategy = IndustrialStrategy({}, "federated_automl", {})
+            return list(strategy.industrial_strategy_fit.keys())
+        except Exception as exc:
+            logger.warning("Fedot.Industrial strategy catalog introspection failed: %s", exc)
+    return [
+        "federated_automl",
+        "kernel_automl",
+        "forecasting_assumptions",
+        "forecasting_exogenous",
+        "lora_strategy",
+        "sampling_strategy",
+    ]
+
+
+FRAMEWORK_TRAINING_STRATEGIES = _framework_strategy_names()
+WIRED_STRATEGY_TASKS: Dict[str, set[str]] = {
+    "federated_automl": {"classification", "regression", "ts_classification", "ts_regression"},
+}
+
+
 TRAINING_STRATEGY_HINTS: Dict[str, List[Dict[str, Any]]] = {
-    "classification": [
+    task_type: [
         {
-            "name": "federated_automl",
-            "description": (
-                "Fedot.Industrial strategy for larger datasets: split samples into worker folds, "
-                "fit one AutoML branch per fold, then connect branch predictions into a head model."
+            "name": strategy_name,
+            "description": STRATEGY_DESCRIPTIONS.get(strategy_name, ""),
+            "fedot_industrial_reference": (
+                FEDERATED_AUTOML_REFERENCE
+                if strategy_name == "federated_automl"
+                else FEDOT_STRATEGY_REFERENCE
             ),
-            "fedot_industrial_reference": "examples/automl_example/custom_strategy/big_data/federated_automl_example.py",
-        },
-        {
-            "name": "imbalance_aware_quality",
-            "description": "For imbalanced classification, judge revisions by F1/precision as well as accuracy.",
-            "fedot_industrial_reference": "Custom ApiTemplate examples use learning_config.optimisation_loss.quality_loss='f1'.",
-        },
-        {
-            "name": "manual_params_over_tuner",
-            "description": "Classification tuner is intentionally avoided here; prefer explicit node params or model replacement.",
-            "fedot_industrial_reference": "Keeps the graph trainable while avoiding Fedot ROC-AUC tuner tracebacks.",
-        },
-        {
-            "name": "big_dataset_sampling",
-            "description": "For very large tabular datasets, Fedot.Industrial examples use strategy_params.learning_strategy='big_dataset' and sampling_strategy such as CUR.",
-            "fedot_industrial_reference": "examples/automl_example/custom_strategy/big_data/random_sampling_example.py",
-        },
-    ],
-    "regression": [
-        {
-            "name": "federated_automl",
-            "description": (
-                "Fedot.Industrial strategy for larger datasets: split samples into worker folds, "
-                "fit one AutoML branch per fold, then connect branch predictions into a regression head."
+            "source": FEDOT_STRATEGY_REFERENCE,
+            "status": (
+                "wired"
+                if task_type in WIRED_STRATEGY_TASKS.get(strategy_name, set())
+                else "upstream only"
             ),
-            "fedot_industrial_reference": "fedot_ind.core.ensemble.random_automl_forest.RAFEnsembler",
-        },
-        {
-            "name": "manual_params_or_tuner",
-            "description": "Regression graphs may be tuned by Fedot PipelineTuner; Critic can still propose explicit regularization params.",
-        },
-    ],
-    "ts_classification": [
-        {
-            "name": "federated_automl",
-            "description": (
-                "Fedot.Industrial strategy for large fixed-window time-series classification: "
-                "branch AutoML models are trained on sample folds and joined through a classification head."
-            ),
-            "fedot_industrial_reference": "examples/automl_example/custom_strategy/big_data/federated_automl_example.py",
-        },
-    ],
-    "ts_regression": [
-        {
-            "name": "federated_automl",
-            "description": (
-                "Fedot.Industrial strategy for large fixed-window time-series regression: "
-                "branch AutoML models are trained on sample folds and joined through a regression head."
-            ),
-            "fedot_industrial_reference": "fedot_ind.core.ensemble.random_automl_forest.RAFEnsembler",
-        },
-    ],
+        }
+        for strategy_name in FRAMEWORK_TRAINING_STRATEGIES
+    ]
+    for task_type in SUPPORTED_TASKS
 }
 
 
@@ -329,28 +599,23 @@ FEDERATED_AUTOML_PIPELINE_EFFECTS = [
 FEDERATED_AUTOML_EDITABLE_PARAMS = [
     {
         "name": "data_type",
-        "effect": "table keeps tabular operations; time_series enables heavier TS feature extraction.",
-        "example": "table",
+        "description": "Controls whether branch AutoML searches tabular operations or time-series feature extraction operations.",
     },
     {
         "name": "available_operations",
-        "effect": "Candidate operations that branch AutoML may place inside generated branch pipelines.",
-        "example": ["rf", "xgboost", "logit"],
+        "description": "Candidate operations that branch AutoML may place inside generated branch pipelines.",
     },
     {
         "name": "timeout",
-        "effect": "AutoML budget used inside strategy training.",
-        "example": 10,
+        "description": "AutoML budget used inside strategy training.",
     },
     {
         "name": "n_splits",
-        "effect": "Number of branch folds/models trained before stacking.",
-        "example": 5,
+        "description": "Number of branch folds/models trained before stacking.",
     },
     {
         "name": "n_jobs",
-        "effect": "Parallelism passed to branch AutoML/models where supported.",
-        "example": 1,
+        "description": "Parallelism passed to branch AutoML/models where supported.",
     },
 ]
 
@@ -361,12 +626,18 @@ FEDERATED_AUTOML_RUNTIME_NOTICE = (
 )
 
 
+def _strategy_default_operations(task_type: str, preferred: List[str]) -> List[str]:
+    available = OPERATIONS.get(task_type, {}).get("models", [])
+    return [operation for operation in preferred if operation in available]
+
+
 TRAINING_STRATEGIES: Dict[str, List[Dict[str, Any]]] = {
     "classification": [
         {
             "name": "federated_automl",
             "label": "Federated AutoML ensemble",
             "description": "Split the training set into worker folds, train one AutoML branch per fold, and join branches with an xgboost head.",
+            "fedot_industrial_reference": FEDERATED_AUTOML_REFERENCE,
             "pipeline_effects": FEDERATED_AUTOML_PIPELINE_EFFECTS,
             "editable_params": FEDERATED_AUTOML_EDITABLE_PARAMS,
             "runtime_notice": FEDERATED_AUTOML_RUNTIME_NOTICE,
@@ -375,7 +646,10 @@ TRAINING_STRATEGIES: Dict[str, List[Dict[str, Any]]] = {
                 "data_type": "table",
                 "problem": "classification",
                 "n_jobs": 1,
-                "available_operations": ["rf", "xgboost", "logit", "dt", "lgbm"],
+                "available_operations": _strategy_default_operations(
+                    "classification",
+                    ["rf", "xgboost", "logit", "dt", "lgbm", "catboost"],
+                ),
             },
         },
     ],
@@ -384,6 +658,7 @@ TRAINING_STRATEGIES: Dict[str, List[Dict[str, Any]]] = {
             "name": "federated_automl",
             "label": "Federated AutoML ensemble",
             "description": "Split the training set into worker folds, train one AutoML branch per fold, and join branches with a tree-regression head.",
+            "fedot_industrial_reference": FEDERATED_AUTOML_REFERENCE,
             "pipeline_effects": FEDERATED_AUTOML_PIPELINE_EFFECTS,
             "editable_params": FEDERATED_AUTOML_EDITABLE_PARAMS,
             "runtime_notice": FEDERATED_AUTOML_RUNTIME_NOTICE,
@@ -392,7 +667,10 @@ TRAINING_STRATEGIES: Dict[str, List[Dict[str, Any]]] = {
                 "data_type": "table",
                 "problem": "regression",
                 "n_jobs": 1,
-                "available_operations": ["treg", "xgbreg", "ridge", "lasso", "dtreg", "lgbmreg", "sgdr"],
+                "available_operations": _strategy_default_operations(
+                    "regression",
+                    ["treg", "xgbreg", "ridge", "lasso", "dtreg", "lgbmreg", "sgdr", "catboostreg"],
+                ),
             },
         },
     ],
@@ -401,6 +679,7 @@ TRAINING_STRATEGIES: Dict[str, List[Dict[str, Any]]] = {
             "name": "federated_automl",
             "label": "Federated AutoML TS ensemble",
             "description": "Train multiple AutoML branches on fixed-window time-series folds and join branch predictions with a classification head.",
+            "fedot_industrial_reference": FEDERATED_AUTOML_REFERENCE,
             "pipeline_effects": FEDERATED_AUTOML_PIPELINE_EFFECTS,
             "editable_params": FEDERATED_AUTOML_EDITABLE_PARAMS,
             "runtime_notice": FEDERATED_AUTOML_RUNTIME_NOTICE,
@@ -412,6 +691,7 @@ TRAINING_STRATEGIES: Dict[str, List[Dict[str, Any]]] = {
             "name": "federated_automl",
             "label": "Federated AutoML TS ensemble",
             "description": "Train multiple AutoML branches on fixed-window time-series folds and join branch predictions with a regression head.",
+            "fedot_industrial_reference": FEDERATED_AUTOML_REFERENCE,
             "pipeline_effects": FEDERATED_AUTOML_PIPELINE_EFFECTS,
             "editable_params": FEDERATED_AUTOML_EDITABLE_PARAMS,
             "runtime_notice": FEDERATED_AUTOML_RUNTIME_NOTICE,
@@ -421,44 +701,29 @@ TRAINING_STRATEGIES: Dict[str, List[Dict[str, Any]]] = {
 }
 
 
-FEDOT_INDUSTRIAL_STRATEGY_CATALOG = [
-    {
-        "strategy": "federated_automl",
-        "status": "wired",
-        "current_scope": "classification, regression, ts_classification, ts_regression",
-        "requires": "supervised target, train/test split, branch AutoML params",
-    },
-    {
-        "strategy": "sampling_strategy",
-        "status": "upstream only",
-        "current_scope": "not exposed in MAFIS yet",
-        "requires": "big-dataset sampling contract: sampling_algorithm, sampling_range, task-specific runner",
-    },
-    {
-        "strategy": "kernel_automl",
-        "status": "upstream only",
-        "current_scope": "not exposed in MAFIS yet",
-        "requires": "kernel feature/ensemble configuration and a dedicated prediction path",
-    },
-    {
-        "strategy": "forecasting_assumptions",
-        "status": "upstream only",
-        "current_scope": "not exposed in MAFIS yet",
-        "requires": "forecasting task contract, forecast horizon, assumptions runner",
-    },
-    {
-        "strategy": "forecasting_exogenous",
-        "status": "upstream only",
-        "current_scope": "not exposed in MAFIS yet",
-        "requires": "forecasting task plus exogenous time-series columns",
-    },
-    {
-        "strategy": "lora_strategy",
-        "status": "upstream only",
-        "current_scope": "not exposed in MAFIS yet",
-        "requires": "LoRA/model-specific data and training configuration",
-    },
-]
+def _build_fedot_industrial_strategy_catalog() -> List[Dict[str, Any]]:
+    catalog = []
+    for strategy_name in FRAMEWORK_TRAINING_STRATEGIES:
+        wired = strategy_name == "federated_automl"
+        catalog.append({
+            "strategy": strategy_name,
+            "status": "wired" if wired else "upstream only",
+            "current_scope": (
+                "classification, regression, ts_classification, ts_regression"
+                if wired
+                else "not exposed in MAFIS execution yet"
+            ),
+            "requires": STRATEGY_REQUIREMENTS.get(strategy_name, ""),
+            "description": STRATEGY_DESCRIPTIONS.get(strategy_name, ""),
+            "fedot_industrial_reference": (
+                FEDERATED_AUTOML_REFERENCE if wired else FEDOT_STRATEGY_REFERENCE
+            ),
+            "source": FEDOT_STRATEGY_REFERENCE,
+        })
+    return catalog
+
+
+FEDOT_INDUSTRIAL_STRATEGY_CATALOG = _build_fedot_industrial_strategy_catalog()
 
 
 def get_training_strategies(task_type: str) -> List[Dict[str, Any]]:
@@ -500,6 +765,10 @@ def get_operation_catalog(task_type: str) -> Dict[str, List[Dict[str, Any]]]:
                 "operation": name,
                 "description": OPERATION_DESCRIPTIONS.get(name, ""),
                 "param_hints": OPERATION_PARAM_HINTS.get(name, []),
+                "source": _operation_repository_info(name).get("source", ""),
+                "fedot_industrial_meta": _operation_repository_info(name).get("meta", ""),
+                "tags": _operation_repository_info(name).get("tags", []),
+                "presets": _operation_repository_info(name).get("presets", []),
             }
             for name in names
         ]
@@ -536,6 +805,47 @@ def diagnose_runtime_error(
         "recommendations": [],
         "recoverable": True,
     }
+
+    if "early stopping" in lower and "eval metric" in lower:
+        root_ids = set()
+        if nodes:
+            ids = {n.get("id") for n in nodes}
+            children = {inp for n in nodes for inp in n.get("inputs", [])}
+            root_ids = {node_id for node_id in ids - children if node_id}
+        root_nodes = [n for n in nodes if n.get("id") in root_ids] or nodes[-1:]
+        boosting_nodes = [
+            n for n in root_nodes
+            if n.get("operation") in {"lgbm", "lgbmreg", "xgboost", "xgbreg"}
+        ]
+        diagnostic.update({
+            "kind": "boosting_early_stopping_config_error",
+            "summary": (
+                "Boosting training failed because early stopping was enabled without "
+                "a usable evaluation set and metric for this direct graph run."
+            ),
+            "recommendations": [
+                "Disable eval-set early stopping for this model by setting use_eval_set=false and early_stopping_rounds=null.",
+                "Then rerun the same graph before replacing the model.",
+                "If the error persists, replace the boosting model with rf/logit for classification or ridge/treg for regression.",
+            ],
+        })
+        if boosting_nodes:
+            diagnostic["problem_nodes"] = [
+                {"id": n.get("id"), "operation": n.get("operation")}
+                for n in boosting_nodes
+            ]
+            diagnostic["suggested_mutations"] = [
+                {
+                    "type": "set_params",
+                    "node_id": n.get("id"),
+                    "params": {
+                        "use_eval_set": False,
+                        "early_stopping_rounds": None,
+                    },
+                }
+                for n in boosting_nodes[:1]
+            ]
+        return diagnostic
 
     if "expected 2d array" in lower and "got 1d array" in lower:
         diagnostic.update({
