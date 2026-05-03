@@ -29,9 +29,10 @@ Each node has:
   - id: unique string
   - operation: an atomic op (call get_available_operations to see valid ops for the task)
   - params: dict of hyperparameters (use {} to let Engineer tune)
-  - inputs: list of upstream node IDs (empty = consumes raw data)
+  - inputs: list of existing upstream node IDs from this same graph (empty = consumes raw data)
 
 The graph must be a DAG with exactly ONE root (node nobody else inputs from). The root is the model.
+Inputs are references to node ids, not generated port names. Do not invent input/output handles; connect nodes by their actual id values.
 For ordinary tabular classification/regression, prefer a direct model-only graph by default. Add preprocessing only when it is returned by the catalog and the current data profile or feedback justifies it.
 
 WORKFLOW:
@@ -63,6 +64,8 @@ The response must match this schema:
 Rules:
 - Use only operations listed in AVAILABLE_OPERATIONS.
 - Add preprocessing nodes only when AVAILABLE_OPERATIONS.preprocessing contains the operation and the data profile or feedback justifies that extra step.
+- Every value in a node's inputs must exactly match the id of another node present in graph.nodes. Use inputs=[] for raw data.
+- Do not create synthetic input/output handle names; if node B consumes node A, write B.inputs=["A's id"].
 - The graph must have exactly one root model node.
 - For ordinary tabular classification/regression, prefer one direct model node unless the data profile or feedback justifies another valid model, explicit model parameters, or a valid preprocessing step.
 - If feedback contains suggested_mutations, reflect them in the returned graph. Do not return the previous graph unchanged.
@@ -188,7 +191,11 @@ Rules:
                 "kind": "invalid_structured_graph",
                 "summary": "Architect proposed a structured graph, but graph validation rejected it.",
                 "technical_message": json.dumps(proposed, ensure_ascii=False)[:1200],
-                "recommendations": ["Use operations exactly as returned by the operation catalog."],
+                "recommendations": [
+                    "Use operations exactly as returned by the operation catalog.",
+                    "Every node input must be an existing graph.nodes id; use inputs=[] for raw data.",
+                    "Connect nodes by their actual id values rather than generated input/output handle names.",
+                ],
                 "recoverable": True,
             }
         )

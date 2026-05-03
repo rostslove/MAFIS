@@ -1003,7 +1003,11 @@ class PipelineGraph:
                 return False, f"Operation '{n.operation}' not allowed for task '{self.task_type}'"
             for inp in n.inputs:
                 if inp not in id_set:
-                    return False, f"Node '{n.id}' references missing input '{inp}'"
+                    return False, (
+                        f"Node '{n.id}' references missing input '{inp}'. "
+                        "Each input must be the id of an existing node in graph.nodes; "
+                        "use inputs=[] when a node consumes raw data."
+                    )
 
         # Single root (node with no children)
         children: set[str] = set()
