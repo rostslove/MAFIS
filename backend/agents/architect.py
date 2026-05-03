@@ -63,6 +63,7 @@ The response must match this schema:
   "reasoning": "Short explanation of operation choices using only the available operation catalog."
 }
 Rules:
+- Return strict JSON literals: use null, true, and false; never Python None, True, or False.
 - Use only operations listed in AVAILABLE_OPERATIONS.
 - Add preprocessing nodes only when AVAILABLE_OPERATIONS.preprocessing contains the operation and the data profile or feedback justifies that extra step.
 - Every value in a node's inputs must exactly match the id of another node present in graph.nodes. Use inputs=[] for raw data.
@@ -171,7 +172,10 @@ Rules:
                     "kind": "invalid_structured_llm_output",
                     "summary": "Architect LLM response was not a valid GraphProposal JSON object.",
                     "technical_message": raw_text[:1200] or response.get("error", ""),
-                    "recommendations": ["The backend will use a deterministic graph proposal instead."],
+                    "recommendations": [
+                        "Return strict JSON: use null instead of Python None, true/false instead of True/False.",
+                        "The backend will use a deterministic graph proposal instead.",
+                    ],
                     "recoverable": True,
                 }
             )
@@ -332,6 +336,7 @@ Rules:
             "Use available_operations.training_strategies_catalog for selectable execution strategies; "
             "available_operations.training_strategies is the upstream reference list.\n"
             "Respect training_strategy_policy: keep graph.training_strategy null when allowed_now=false.\n"
+            "Return strict JSON literals: null/true/false, not Python None/True/False.\n"
             "Return only the GraphProposal JSON object.\n"
             f"{json.dumps(payload, ensure_ascii=False)}"
         )

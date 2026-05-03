@@ -60,10 +60,10 @@ The backend requirements intentionally do not install `fedot-ind`, `pandas`, `sc
 Recommended default model:
 
 ```text
-qwen2.5-coder:7b
+qwen2.5-coder:14b
 ```
 
-It is a practical default for Architect-style JSON/tool reasoning. If the server is CPU-only or low on RAM, use `qwen2.5-coder:3b` instead.
+It is the shared model for all MAFIS agents and gives more stable JSON/tool reasoning than the previous 7B default. If the server is CPU-only or low on RAM, use `qwen2.5-coder:7b` or `qwen2.5-coder:3b` instead.
 
 With Docker Compose, Ollama is started automatically and the model is pulled by `ollama-pull`:
 
@@ -87,7 +87,7 @@ cd D:\Diploma\Fedot.Industrial
 $env:FEDOT_INDUSTRIAL_PATH="$HOME/Fedot.Industrial"
 $env:LLM_BASE_URL="http://localhost:11434/v1"
 $env:LLM_API_KEY="ollama"
-$env:LLM_MODEL="qwen2.5-coder:7b"
+$env:LLM_MODEL="qwen2.5-coder:14b"
 poetry run python ../industrial-learning-agent/backend/app.py
 ```
 
@@ -106,7 +106,7 @@ cd ~/Fedot.Industrial
 export FEDOT_INDUSTRIAL_PATH="$HOME/Fedot.Industrial"
 export LLM_BASE_URL="http://localhost:11434/v1"
 export LLM_API_KEY="ollama"
-export LLM_MODEL="qwen2.5-coder:7b"
+export LLM_MODEL="qwen2.5-coder:14b"
 poetry run python ../industrial-learning-agent/backend/app.py
 ```
 

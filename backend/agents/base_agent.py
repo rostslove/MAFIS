@@ -33,7 +33,7 @@ def _load_project_env() -> None:
 
 _load_project_env()
 
-DEFAULT_LLM_MODEL = "qwen2.5-coder:7b"
+DEFAULT_LLM_MODEL = "qwen2.5-coder:14b"
 DEFAULT_LLM_BASE_URL = "http://localhost:11434/v1"
 LLM_MODEL = os.environ.get("LLM_MODEL", DEFAULT_LLM_MODEL)
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL") or os.environ.get("OPENROUTER_BASE_URL", DEFAULT_LLM_BASE_URL)
