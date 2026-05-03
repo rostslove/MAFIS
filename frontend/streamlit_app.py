@@ -270,6 +270,17 @@ def format_number(value: Any) -> str:
         return str(value)
 
 
+def format_elapsed(seconds: Any) -> str:
+    try:
+        total = max(0, int(seconds))
+    except (TypeError, ValueError):
+        total = 0
+    minutes, sec = divmod(total, 60)
+    if minutes:
+        return f"{minutes}m {sec:02d}s"
+    return f"{sec}s"
+
+
 def latest_iteration(result: Dict[str, Any]) -> Dict[str, Any]:
     for item in reversed((result or {}).get("iterations", [])):
         if "error" not in item:
@@ -393,6 +404,36 @@ def render_training_strategy(graph: Dict[str, Any]) -> None:
         st.code(json.dumps(params, ensure_ascii=False, indent=2), language="json")
 
 
+def render_strategy_runtime_notice(graph: Dict[str, Any]) -> None:
+    strategy = (graph or {}).get("training_strategy") or {}
+    if strategy:
+        st.warning(
+            "Fedot.Industrial training strategy is selected. It may train several internal "
+            "AutoML branches, so evaluation can take noticeably longer than direct graph execution."
+        )
+
+
+def render_strategy_selection_details(strategy_name: str, strategy_spec: Dict[str, Any]) -> None:
+    if strategy_name == "direct graph":
+        st.info("Direct graph execution trains exactly the visible graph nodes and their node parameters.")
+        return
+
+    notice = strategy_spec.get("runtime_notice")
+    if notice:
+        st.warning(notice)
+
+    effects = strategy_spec.get("pipeline_effects", []) or []
+    if effects:
+        st.write("What changes in the pipeline")
+        for effect in effects:
+            st.write(f"- {effect}")
+
+    editable = strategy_spec.get("editable_params", []) or []
+    if editable:
+        st.write("What you can change for this strategy")
+        st.dataframe(pd.DataFrame(editable), use_container_width=True, hide_index=True)
+
+
 def mutation_rows(mutations: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     rows = []
     for mutation in mutations:
@@ -478,6 +519,7 @@ def stream_run(payload: Dict[str, Any]) -> None:
     seen_diagnostics = set()
     total_steps = 4
     done_steps = 0
+    progress_value = 0.0
 
     with requests.post(f"{BACKEND_URL}/orchestrate/stream", json=payload, stream=True, timeout=1800) as response:
         response.raise_for_status()
@@ -496,6 +538,21 @@ def stream_run(payload: Dict[str, Any]) -> None:
                     lines.append(message)
             elif event_type == "agent_start":
                 lines.append(f"{event.get('agent')}: started")
+            elif event_type == "agent_progress":
+                agent = event.get("agent", "Agent")
+                elapsed = event.get("elapsed_seconds", 0)
+                message = event.get("message", "still running")
+                try:
+                    elapsed_seconds = max(0, int(float(elapsed or 0)))
+                except (TypeError, ValueError):
+                    elapsed_seconds = 0
+                lines.append(f"{agent}: {message} ({format_elapsed(elapsed_seconds)})")
+                if agent == "Engineer":
+                    progress_value = max(
+                        progress_value,
+                        min(0.70, 0.25 + min(elapsed_seconds, 1800) / 1800 * 0.35),
+                    )
+                    progress.progress(progress_value)
             elif event_type == "agent_done":
                 lines.append(f"{event.get('agent')}: {event.get('summary', '')}")
                 if event.get("diagnostics"):
@@ -505,7 +562,8 @@ def stream_run(payload: Dict[str, Any]) -> None:
                             seen_diagnostics.add(key)
                             lines.append(f"{event.get('agent')} note: {diagnostic.get('summary', '')}")
                 done_steps += 1
-                progress.progress(min(done_steps / total_steps, 1.0))
+                progress_value = min(done_steps / total_steps, 1.0)
+                progress.progress(progress_value)
             elif event_type == "diagnostics":
                 for diagnostic in event.get("diagnostics", []):
                     key = (event.get("agent"), diagnostic.get("kind"), diagnostic.get("summary"))
@@ -530,6 +588,7 @@ def stream_run(payload: Dict[str, Any]) -> None:
             elif event_type == "complete":
                 archive_current_result("Previous full evaluation")
                 st.session_state.result = event.get("result", {})
+                progress_value = 1.0
                 progress.progress(1.0)
                 lines.append("Run completed.")
 
@@ -730,9 +789,15 @@ def graph_editor_tab(config: Dict[str, Any]) -> None:
         strategy_names = ["direct graph"] + [item.get("name", "") for item in available_strategies]
         current_name = current_strategy.get("name") or "direct graph"
         current_index = strategy_names.index(current_name) if current_name in strategy_names else 0
+        selected_strategy = st.selectbox(
+            "Execution mode",
+            strategy_names,
+            index=current_index,
+            key=f"strategy_execution_mode_{current_name}",
+        )
+        selected_spec = next((item for item in available_strategies if item.get("name") == selected_strategy), {})
+        render_strategy_selection_details(selected_strategy, selected_spec)
         with st.form("training_strategy_form"):
-            selected_strategy = st.selectbox("Execution mode", strategy_names, index=current_index)
-            selected_spec = next((item for item in available_strategies if item.get("name") == selected_strategy), {})
             default_params = selected_spec.get("default_params", {}) or {}
             shown_params = current_strategy.get("params", {}) if selected_strategy == current_name else default_params
             params_text = st.text_area(
@@ -826,10 +891,10 @@ def graph_editor_tab(config: Dict[str, Any]) -> None:
         if strategy_catalog_rows:
             st.write("Training strategies")
             st.dataframe(pd.DataFrame(strategy_catalog_rows), use_container_width=True, hide_index=True)
-        strategy_hints = config.get("training_strategy_hints", {}).get(task_type, []) or []
-        if strategy_hints:
-            st.write("Training strategy hints")
-            st.dataframe(pd.DataFrame(strategy_hints), use_container_width=True, hide_index=True)
+        strategy_coverage = config.get("fedot_industrial_strategy_catalog", []) or []
+        if strategy_coverage:
+            st.write("Fedot.Industrial strategy coverage")
+            st.dataframe(pd.DataFrame(strategy_coverage), use_container_width=True, hide_index=True)
 
     with evaluate_tab:
         evaluation_panel()
@@ -853,6 +918,7 @@ def evaluation_panel() -> None:
 
     st.write("Approved graph for evaluation")
     render_graph(approved_graph, show_details=True)
+    render_strategy_runtime_notice(approved_graph)
     if st.button("Evaluate Approved Graph", type="primary", use_container_width=True, key="editor_evaluate_approved_graph"):
         payload = current_payload(
             {

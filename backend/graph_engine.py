@@ -318,13 +318,65 @@ def get_training_strategy_hints(task_type: str) -> List[Dict[str, Any]]:
     return TRAINING_STRATEGY_HINTS.get(task_type, [])
 
 
+FEDERATED_AUTOML_PIPELINE_EFFECTS = [
+    "The approved graph stays as the user-facing contract.",
+    "Fedot.Industrial splits the train part into branch folds.",
+    "Each branch runs AutoML over available_operations.",
+    "Branch predictions are stacked into a final head model.",
+]
+
+
+FEDERATED_AUTOML_EDITABLE_PARAMS = [
+    {
+        "name": "data_type",
+        "effect": "table keeps tabular operations; time_series enables heavier TS feature extraction.",
+        "example": "table",
+    },
+    {
+        "name": "available_operations",
+        "effect": "Candidate operations that branch AutoML may place inside generated branch pipelines.",
+        "example": ["rf", "xgboost", "logit"],
+    },
+    {
+        "name": "timeout",
+        "effect": "AutoML budget used inside strategy training.",
+        "example": 10,
+    },
+    {
+        "name": "n_splits",
+        "effect": "Number of branch folds/models trained before stacking.",
+        "example": 5,
+    },
+    {
+        "name": "n_jobs",
+        "effect": "Parallelism passed to branch AutoML/models where supported.",
+        "example": 1,
+    },
+]
+
+
+FEDERATED_AUTOML_RUNTIME_NOTICE = (
+    "Fedot.Industrial training strategies can take noticeably longer than direct graph execution, "
+    "because they may train several internal AutoML branch pipelines before scoring the approved graph."
+)
+
+
 TRAINING_STRATEGIES: Dict[str, List[Dict[str, Any]]] = {
     "classification": [
         {
             "name": "federated_automl",
             "label": "Federated AutoML ensemble",
             "description": "Split the training set into worker folds, train one AutoML branch per fold, and join branches with an xgboost head.",
-            "default_params": {"timeout": 10, "data_type": "table", "problem": "classification", "n_jobs": 1},
+            "pipeline_effects": FEDERATED_AUTOML_PIPELINE_EFFECTS,
+            "editable_params": FEDERATED_AUTOML_EDITABLE_PARAMS,
+            "runtime_notice": FEDERATED_AUTOML_RUNTIME_NOTICE,
+            "default_params": {
+                "timeout": 10,
+                "data_type": "table",
+                "problem": "classification",
+                "n_jobs": 1,
+                "available_operations": ["rf", "xgboost", "logit", "dt", "lgbm"],
+            },
         },
     ],
     "regression": [
@@ -332,7 +384,16 @@ TRAINING_STRATEGIES: Dict[str, List[Dict[str, Any]]] = {
             "name": "federated_automl",
             "label": "Federated AutoML ensemble",
             "description": "Split the training set into worker folds, train one AutoML branch per fold, and join branches with a tree-regression head.",
-            "default_params": {"timeout": 10, "data_type": "table", "problem": "regression", "n_jobs": 1},
+            "pipeline_effects": FEDERATED_AUTOML_PIPELINE_EFFECTS,
+            "editable_params": FEDERATED_AUTOML_EDITABLE_PARAMS,
+            "runtime_notice": FEDERATED_AUTOML_RUNTIME_NOTICE,
+            "default_params": {
+                "timeout": 10,
+                "data_type": "table",
+                "problem": "regression",
+                "n_jobs": 1,
+                "available_operations": ["treg", "xgbreg", "ridge", "lasso", "dtreg", "lgbmreg", "sgdr"],
+            },
         },
     ],
     "ts_classification": [
@@ -340,6 +401,9 @@ TRAINING_STRATEGIES: Dict[str, List[Dict[str, Any]]] = {
             "name": "federated_automl",
             "label": "Federated AutoML TS ensemble",
             "description": "Train multiple AutoML branches on fixed-window time-series folds and join branch predictions with a classification head.",
+            "pipeline_effects": FEDERATED_AUTOML_PIPELINE_EFFECTS,
+            "editable_params": FEDERATED_AUTOML_EDITABLE_PARAMS,
+            "runtime_notice": FEDERATED_AUTOML_RUNTIME_NOTICE,
             "default_params": {"timeout": 10, "data_type": "time_series", "problem": "classification", "n_jobs": 1},
         },
     ],
@@ -348,14 +412,61 @@ TRAINING_STRATEGIES: Dict[str, List[Dict[str, Any]]] = {
             "name": "federated_automl",
             "label": "Federated AutoML TS ensemble",
             "description": "Train multiple AutoML branches on fixed-window time-series folds and join branch predictions with a regression head.",
+            "pipeline_effects": FEDERATED_AUTOML_PIPELINE_EFFECTS,
+            "editable_params": FEDERATED_AUTOML_EDITABLE_PARAMS,
+            "runtime_notice": FEDERATED_AUTOML_RUNTIME_NOTICE,
             "default_params": {"timeout": 10, "data_type": "time_series", "problem": "regression", "n_jobs": 1},
         },
     ],
 }
 
 
+FEDOT_INDUSTRIAL_STRATEGY_CATALOG = [
+    {
+        "strategy": "federated_automl",
+        "status": "wired",
+        "current_scope": "classification, regression, ts_classification, ts_regression",
+        "requires": "supervised target, train/test split, branch AutoML params",
+    },
+    {
+        "strategy": "sampling_strategy",
+        "status": "upstream only",
+        "current_scope": "not exposed in MAFIS yet",
+        "requires": "big-dataset sampling contract: sampling_algorithm, sampling_range, task-specific runner",
+    },
+    {
+        "strategy": "kernel_automl",
+        "status": "upstream only",
+        "current_scope": "not exposed in MAFIS yet",
+        "requires": "kernel feature/ensemble configuration and a dedicated prediction path",
+    },
+    {
+        "strategy": "forecasting_assumptions",
+        "status": "upstream only",
+        "current_scope": "not exposed in MAFIS yet",
+        "requires": "forecasting task contract, forecast horizon, assumptions runner",
+    },
+    {
+        "strategy": "forecasting_exogenous",
+        "status": "upstream only",
+        "current_scope": "not exposed in MAFIS yet",
+        "requires": "forecasting task plus exogenous time-series columns",
+    },
+    {
+        "strategy": "lora_strategy",
+        "status": "upstream only",
+        "current_scope": "not exposed in MAFIS yet",
+        "requires": "LoRA/model-specific data and training configuration",
+    },
+]
+
+
 def get_training_strategies(task_type: str) -> List[Dict[str, Any]]:
     return TRAINING_STRATEGIES.get(task_type, [])
+
+
+def get_fedot_industrial_strategy_catalog() -> List[Dict[str, Any]]:
+    return FEDOT_INDUSTRIAL_STRATEGY_CATALOG
 
 
 def get_training_strategy_spec(task_type: str, name: str) -> Optional[Dict[str, Any]]:

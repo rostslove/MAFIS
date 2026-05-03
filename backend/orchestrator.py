@@ -1,6 +1,8 @@
+import asyncio
 import json
 import logging
 import os
+import time
 from typing import Any, AsyncGenerator, Dict, Optional
 
 import pandas as pd
@@ -40,6 +42,15 @@ async def _connect_mcp() -> MCPToolClient:
     server_script = os.path.join(os.path.dirname(__file__), "mcp_server.py")
     await client.connect(server_script=server_script)
     return client
+
+
+def _execute_engineer_sync(
+    engineer: Engineer,
+    architect_result: ArchitectResult,
+    data_context: DataContext,
+) -> EngineerResult:
+    """Run long local MCP training away from the SSE event loop."""
+    return asyncio.run(engineer.execute(architect_result, data_context))
 
 
 async def run_orchestration_stream(
@@ -144,7 +155,39 @@ async def run_orchestration_stream(
                 )
 
                 yield _event("agent_start", agent="Engineer", iteration=iteration, step="2/3")
-                engineer_result = await engineer.execute(architect_result, data_context)
+                strategy_name = (architect_result.graph.get("training_strategy") or {}).get("name") or ""
+                if strategy_name:
+                    yield _event(
+                        "status",
+                        message=(
+                            f"Engineer is running Fedot.Industrial strategy '{strategy_name}'. "
+                            "This can take longer than direct graph execution."
+                        ),
+                    )
+                engineer_task = asyncio.create_task(
+                    asyncio.to_thread(_execute_engineer_sync, engineer, architect_result, data_context)
+                )
+                engineer_started = time.monotonic()
+                while not engineer_task.done():
+                    await asyncio.sleep(15)
+                    if engineer_task.done():
+                        break
+                    elapsed = int(time.monotonic() - engineer_started)
+                    if strategy_name:
+                        message = (
+                            f"Still training '{strategy_name}'. Fedot.Industrial may be fitting "
+                            "several internal branch pipelines."
+                        )
+                    else:
+                        message = "Still training and scoring the approved graph."
+                    yield _event(
+                        "agent_progress",
+                        agent="Engineer",
+                        iteration=iteration,
+                        elapsed_seconds=elapsed,
+                        message=message,
+                    )
+                engineer_result = await engineer_task
                 yield _event(
                     "agent_done",
                     agent="Engineer",

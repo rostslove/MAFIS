@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import sys
+from copy import deepcopy
 from inspect import Parameter, signature
 from typing import Any, Dict, List, Optional, Union, get_args, get_origin
 
@@ -139,6 +140,20 @@ def _strategy_data_type(task_type: str) -> str:
     return "time_series" if task_type in ("ts_classification", "ts_regression") else "table"
 
 
+def _is_table_strategy(data_type: str) -> bool:
+    return str(data_type or "").lower() in {"table", "tabular"}
+
+
+def _default_strategy_operations(problem: str, data_type: str) -> List[str]:
+    if not _is_table_strategy(data_type):
+        return []
+    if problem == "classification":
+        return ["rf", "xgboost", "logit", "dt", "lgbm"]
+    if problem == "regression":
+        return ["treg", "xgbreg", "ridge", "lasso", "dtreg", "lgbmreg", "sgdr"]
+    return []
+
+
 def _load_strategy_arrays(csv_path: str, target_column: str, task_type: str) -> tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
     csv_path = normalize_csv_path(csv_path)
     df = pd.read_csv(csv_path)
@@ -192,11 +207,13 @@ def _make_strategy_input(features: np.ndarray, target: np.ndarray, task_type: st
     problem = _task_problem(task_type)
     fedot_task = Task(TaskTypesEnum.classification if problem == "classification" else TaskTypesEnum.regression)
     X = np.asarray(features, dtype=float)
-    # RAFEnsembler operates on sample-first tensors and later creates image-like
-    # data sources for each worker branch. Keeping a singleton channel works for
-    # both tabular rows and fixed-window time-series rows.
-    if X.ndim == 2:
+    data_type = DataTypesEnum.table
+    # RAFEnsembler always builds image-like branch data sources internally.
+    # Keep tabular tasks 2D so sklearn/FEDOT table models stay cheap; use a
+    # singleton channel only for fixed-window time-series strategy runs.
+    if task_type in ("ts_classification", "ts_regression") and X.ndim == 2:
         X = X.reshape(X.shape[0], 1, X.shape[1])
+        data_type = DataTypesEnum.image
     y = np.asarray(target)
     if problem == "classification":
         y = y.reshape(-1, 1)
@@ -207,8 +224,43 @@ def _make_strategy_input(features: np.ndarray, target: np.ndarray, task_type: st
         features=X,
         target=y,
         task=fedot_task,
-        data_type=DataTypesEnum.image,
+        data_type=data_type,
     )
+
+
+def _predict_raf_ensemble(solver, input_data, problem: str) -> np.ndarray:
+    """Predict with RAFEnsembler's decomposed branches and head model.
+
+    The upstream RAFEnsembler.predict path calls the decomposed pipeline with a
+    single default data source, while its branch preprocessors were fitted on
+    data_source_img/{i}. Fedot.Industrial's own strategy code predicts branches
+    first and then feeds their outputs to the head; mirror that behavior here.
+    """
+    branch_nodes = list(getattr(solver.current_pipeline.root_node, "nodes_from", []) or [])
+    if not branch_nodes:
+        return np.asarray(solver.current_pipeline.predict(input_data, "labels").predict)
+
+    branch_outputs = [np.asarray(branch.predict(input_data).predict) for branch in branch_nodes]
+    if problem == "classification":
+        branch_labels = []
+        for output in branch_outputs:
+            if output.ndim < 2:
+                output = np.array([output, 1 - output]).T
+            branch_labels.append(np.argmax(output, axis=1).reshape(-1, 1))
+        head_features = np.hstack(branch_labels)
+        output_mode = "labels"
+    else:
+        head_features = np.hstack([output.reshape(-1, 1) for output in branch_outputs])
+        output_mode = "default"
+
+    head_input = deepcopy(input_data)
+    n_samples, n_channels = head_features.shape
+    head_input.idx = np.arange(n_samples)
+    head_input.features = head_features.reshape(n_samples, n_channels, 1)
+
+    head_model = deepcopy(solver.current_pipeline.root_node)
+    head_model.nodes_from = []
+    return np.asarray(head_model.predict(head_input, output_mode).predict)
 
 
 def _train_strategy_graph(
@@ -236,12 +288,17 @@ def _train_strategy_graph(
     strategy = graph.training_strategy
     params = dict(strategy.get("params", {}) or {})
     problem = _task_problem(graph.task_type)
+    data_type = params.get("data_type") or _strategy_data_type(graph.task_type)
     params.update({
         "problem": problem,
-        "data_type": params.get("data_type") or _strategy_data_type(graph.task_type),
+        "data_type": data_type,
         "timeout": float(params.get("timeout", 10) or 10),
         "n_jobs": int(params.get("n_jobs", 1) or 1),
     })
+    if not params.get("available_operations"):
+        operations = _default_strategy_operations(problem, data_type)
+        if operations:
+            params["available_operations"] = operations
     if primary_metric:
         params["metric"] = primary_metric
 
@@ -249,11 +306,12 @@ def _train_strategy_graph(
     requested_splits = int(params.pop("n_splits", 5) or 5)
     n_splits = max(2, min(requested_splits, n_train)) if n_train >= 2 else 1
     batch_size = max(1, int(np.ceil(n_train / n_splits)))
+    report_params = dict(params)
 
     solver = RAFEnsembler(composing_params=dict(params), n_splits=n_splits, batch_size=batch_size)
     solver.fit(train)
-    train_preds = np.asarray(solver.predict(train, "labels")).reshape(-1)
-    test_preds = np.asarray(solver.predict(test, "labels")).reshape(-1)
+    train_preds = _predict_raf_ensemble(solver, train, problem).reshape(-1)
+    test_preds = _predict_raf_ensemble(solver, test, problem).reshape(-1)
     train_metrics = compute_metrics(graph.task_type, y_train, train_preds, primary_metric)
     test_metrics = compute_metrics(graph.task_type, y_test, test_preds, primary_metric)
 
@@ -267,7 +325,7 @@ def _train_strategy_graph(
         "graph": graph.to_dict(),
         "training_strategy": {
             "name": strategy.get("name"),
-            "params": params,
+            "params": report_params,
             "n_splits": n_splits,
             "batch_size": batch_size,
             "head": "xgboost" if problem == "classification" else "treg",
@@ -277,6 +335,11 @@ def _train_strategy_graph(
             "Fedot.Industrial federated_automl strategy was used instead of direct graph execution.",
             "The displayed graph is the approved architecture contract; RAFEnsembler internally trains AutoML branches on worker folds and joins them with a head model.",
             f"Strategy split: {n_splits} branch models, batch_size={batch_size}, head={'xgboost' if problem == 'classification' else 'treg'}.",
+            (
+                "data_type=table constrained available_operations to tabular FEDOT models."
+                if _is_table_strategy(data_type)
+                else "data_type=time_series allows Fedot.Industrial TS feature extraction and heavier industrial operations."
+            ),
         ],
     }
 
