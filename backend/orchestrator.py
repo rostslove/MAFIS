@@ -373,37 +373,6 @@ async def propose_architecture(
         await mcp_client.cleanup()
 
 
-async def tune_approved_graph(
-    csv_path: str,
-    target_column: str,
-    task_type: str,
-    graph: Dict[str, Any],
-    forecast_length: Optional[int] = None,
-    primary_metric: Optional[str] = None,
-    test_size: float = 0.2,
-    iterations: int = 30,
-) -> Dict[str, Any]:
-    """Thin wrapper around the MCP `tune_graph_hyperparameters` tool."""
-    csv_path = normalize_csv_path(csv_path)
-    args: Dict[str, Any] = {
-        "graph_json": json.dumps(graph, ensure_ascii=False),
-        "csv_path": csv_path,
-        "target_column": target_column,
-        "iterations": iterations,
-        "test_size": test_size,
-    }
-    if primary_metric:
-        args["primary_metric"] = primary_metric
-    if forecast_length:
-        args["forecast_length"] = forecast_length
-
-    mcp_client = await _connect_mcp()
-    try:
-        return await mcp_client.call_tool("tune_graph_hyperparameters", args)
-    finally:
-        await mcp_client.cleanup()
-
-
 async def propose_revision_from_critic(
     csv_path: str,
     target_column: str,

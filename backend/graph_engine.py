@@ -369,16 +369,100 @@ DEFAULT_GRAPHS: Dict[str, List[Dict[str, Any]]] = {
         {"id": "model", "operation": "ridge", "params": {}, "inputs": []},
     ],
     "ts_classification": [
-        {"id": "feat", "operation": "quantile_extractor", "params": {}, "inputs": []},
-        {"id": "model", "operation": "industrial_stat_clf", "params": {}, "inputs": ["feat"]},
+        {"id": "stat_feat", "operation": "quantile_extractor", "params": {}, "inputs": []},
+        {"id": "freq_feat", "operation": "fourier_basis", "params": {}, "inputs": []},
+        {"id": "model", "operation": "industrial_stat_clf", "params": {}, "inputs": ["stat_feat", "freq_feat"]},
     ],
     "ts_regression": [
-        {"id": "feat", "operation": "quantile_extractor", "params": {}, "inputs": []},
-        {"id": "model", "operation": "industrial_stat_reg", "params": {}, "inputs": ["feat"]},
+        {"id": "stat_feat", "operation": "quantile_extractor", "params": {}, "inputs": []},
+        {"id": "freq_feat", "operation": "fourier_basis", "params": {}, "inputs": []},
+        {"id": "model", "operation": "industrial_stat_reg", "params": {}, "inputs": ["stat_feat", "freq_feat"]},
     ],
     "ts_forecasting": [
         {"id": "smooth", "operation": "smoothing", "params": {}, "inputs": []},
         {"id": "model", "operation": "ar", "params": {}, "inputs": ["smooth"]},
+    ],
+}
+
+
+def _graph_template(
+    task_type: str,
+    nodes: List[Dict[str, Any]],
+    training_strategy: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    graph = {
+        "task_type": task_type,
+        "nodes": [
+            {
+                "id": node.get("id"),
+                "operation": node.get("operation"),
+                "params": dict(node.get("params", {}) or {}),
+                "inputs": list(node.get("inputs", []) or []),
+            }
+            for node in nodes
+        ],
+    }
+    if training_strategy:
+        graph["training_strategy"] = {
+            "name": training_strategy.get("name"),
+            "params": dict(training_strategy.get("params", {}) or {}),
+        }
+    return graph
+
+
+INDUSTRIAL_GRAPH_TEMPLATES: Dict[str, List[Dict[str, Any]]] = {
+    "classification": [
+        {
+            "name": "tabular_direct_model",
+            "description": "Direct FEDOT/Fedot.Industrial table model over numeric CSV features.",
+            "graph": _graph_template("classification", DEFAULT_GRAPHS["classification"]),
+        },
+        {
+            "name": "federated_automl_strategy",
+            "description": "Fedot.Industrial RAFEnsembler strategy with internal AutoML branches.",
+            "graph": _graph_template(
+                "classification",
+                DEFAULT_GRAPHS["classification"],
+                {"name": "federated_automl", "params": {}},
+            ),
+        },
+    ],
+    "regression": [
+        {
+            "name": "tabular_direct_model",
+            "description": "Direct FEDOT/Fedot.Industrial table model over numeric CSV features.",
+            "graph": _graph_template("regression", DEFAULT_GRAPHS["regression"]),
+        },
+        {
+            "name": "federated_automl_strategy",
+            "description": "Fedot.Industrial RAFEnsembler strategy with internal AutoML branches.",
+            "graph": _graph_template(
+                "regression",
+                DEFAULT_GRAPHS["regression"],
+                {"name": "federated_automl", "params": {}},
+            ),
+        },
+    ],
+    "ts_classification": [
+        {
+            "name": "industrial_feature_fusion",
+            "description": "Parallel statistical and frequency feature branches merged by Fedot.Industrial.",
+            "graph": _graph_template("ts_classification", DEFAULT_GRAPHS["ts_classification"]),
+        },
+    ],
+    "ts_regression": [
+        {
+            "name": "industrial_feature_fusion",
+            "description": "Parallel statistical and frequency feature branches merged by Fedot.Industrial.",
+            "graph": _graph_template("ts_regression", DEFAULT_GRAPHS["ts_regression"]),
+        },
+    ],
+    "ts_forecasting": [
+        {
+            "name": "forecasting_smoothing_ar",
+            "description": "Fedot.Industrial forecasting preprocessing followed by an autoregressive model.",
+            "graph": _graph_template("ts_forecasting", DEFAULT_GRAPHS["ts_forecasting"]),
+        },
     ],
 }
 
@@ -510,6 +594,51 @@ OPERATION_PARAM_HINTS: Dict[str, List[Dict[str, Any]]] = {
         {"name": "n_estimators", "description": "Number of trees in the ensemble."},
     ],
 }
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items() if k != "hyperopt-dist"}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    if callable(value):
+        return getattr(value, "__name__", str(value))
+    try:
+        json.dumps(value)
+    except TypeError:
+        return str(value)
+    return value
+
+
+def _build_industrial_search_space() -> Dict[str, Dict[str, Any]]:
+    """Return Fedot.Industrial parameter ranges in a JSON-safe form."""
+    try:
+        from fedot_ind.core.tuning.search_space import get_industrial_search_space
+
+        class _SearchSpaceContext:
+            custom_search_space = None
+            replace_default_search_space = False
+
+        raw_space = get_industrial_search_space(_SearchSpaceContext())
+        if not isinstance(raw_space, dict):
+            return {}
+        return {
+            str(operation): _json_safe(params)
+            for operation, params in raw_space.items()
+            if isinstance(params, dict)
+        }
+    except Exception as exc:
+        logger.warning("Fedot.Industrial search space import failed: %s", exc)
+        return {}
+
+
+INDUSTRIAL_SEARCH_SPACE: Dict[str, Dict[str, Any]] = _build_industrial_search_space()
+
+
+def _operation_search_space(operation: str) -> Dict[str, Any]:
+    return INDUSTRIAL_SEARCH_SPACE.get(operation, {})
 
 
 FEDERATED_AUTOML_REFERENCE = "fedot_ind.core.ensemble.random_automl_forest.RAFEnsembler"
@@ -765,6 +894,7 @@ def get_operation_catalog(task_type: str) -> Dict[str, List[Dict[str, Any]]]:
                 "operation": name,
                 "description": OPERATION_DESCRIPTIONS.get(name, ""),
                 "param_hints": OPERATION_PARAM_HINTS.get(name, []),
+                "industrial_search_space": _operation_search_space(name),
                 "source": _operation_repository_info(name).get("source", ""),
                 "fedot_industrial_meta": _operation_repository_info(name).get("meta", ""),
                 "tags": _operation_repository_info(name).get("tags", []),
@@ -1107,8 +1237,8 @@ def slice_input_data(input_data: InputData, sample_indices) -> InputData:
     )
 
 
-def split_input_data(input_data: InputData, test_size: float = 0.2) -> Tuple[InputData, InputData]:
-    """Train/val split for InputData."""
+def _basic_split_input_data(input_data: InputData, test_size: float = 0.2) -> Tuple[InputData, InputData]:
+    """Local fallback train/val split for shapes Fedot.Industrial splitters do not cover."""
     n = input_sample_count(input_data)
     if n < 2:
         raise ValueError("At least two samples are required for a train/test split.")
@@ -1130,6 +1260,25 @@ def split_input_data(input_data: InputData, test_size: float = 0.2) -> Tuple[Inp
     perm = rng.permutation(n)
     train_idx, val_idx = perm[:cut], perm[cut:]
     return slice_input_data(input_data, train_idx), slice_input_data(input_data, val_idx)
+
+
+def split_input_data(input_data: InputData, test_size: float = 0.2) -> Tuple[InputData, InputData]:
+    """Train/val split for InputData, using Fedot.Industrial split hooks where safe."""
+    test_size = min(max(float(test_size) if test_size is not None else 0.2, 0.05), 0.5)
+    if input_data.data_type == DataTypesEnum.table:
+        try:
+            from fedot_ind.core.repository.industrial_implementations.abstract import split_any_industrial
+
+            return split_any_industrial(
+                input_data,
+                split_ratio=1 - test_size,
+                shuffle=True,
+                stratify=input_data.task.task_type == TaskTypesEnum.classification,
+                random_seed=42,
+            )
+        except Exception as exc:
+            logger.warning("Fedot.Industrial split failed; using local split: %s", exc)
+    return _basic_split_input_data(input_data, test_size=test_size)
 
 
 # ============== Metrics ==============

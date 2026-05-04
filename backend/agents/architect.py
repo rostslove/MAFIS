@@ -29,7 +29,7 @@ When training_strategy is used, it must be an object: {"name": "strategy_name", 
 Each node has:
   - id: unique string
   - operation: an atomic op (call get_available_operations to see valid ops for the task)
-  - params: dict of hyperparameters (use {} to let Engineer tune)
+  - params: dict of explicit hyperparameters (use {} to keep framework defaults)
   - inputs: list of existing upstream node IDs from this same graph (empty = consumes raw data)
 
 The graph must be a DAG with exactly ONE root (node nobody else inputs from). The root is the model.
@@ -72,8 +72,9 @@ Rules:
 - There is no implicit raw-data node. The raw dataset is represented only by inputs=[] on source nodes.
 - The graph must have exactly one root model node.
 - For ordinary tabular classification/regression, prefer one direct model node unless the data profile or feedback justifies another valid model, explicit model parameters, or a valid preprocessing step.
+- For time-series classification/regression, prefer Fedot.Industrial feature-fusion templates when the data profile indicates sequence-like numeric windows.
 - If feedback contains suggested_mutations, reflect them in the returned graph. Do not return the previous graph unchanged.
-- Param hints describe parameter meanings only; choose parameter values from data profile, diagnostics, and feedback, not from fixed templates.
+- Param hints describe parameter meanings. industrial_search_space contains Fedot.Industrial-supported parameter ranges; when setting explicit params, stay inside those ranges.
 - If feedback mentions class imbalance or unstable validation, either change the model or set explicit parameters justified by the current data profile.
 - Keep graph.training_strategy null unless the user explicitly asked for a strategy, previous_graph already uses one, or Critic suggested a set_strategy mutation.
 - If strategy use is allowed and AVAILABLE_OPERATIONS.training_strategies_catalog contains the requested strategy, set graph.training_strategy as an object {"name": "...", "params": {}}.
@@ -338,7 +339,9 @@ Rules:
             }
         return (
             "Create one valid graph proposal for this payload.\n"
-            "Use available_operations.catalog[].param_hints only as neutral parameter descriptions.\n"
+            "Use available_operations.catalog[].industrial_search_space as the Fedot.Industrial source of allowed parameter ranges.\n"
+            "Use available_operations.catalog[].param_hints as neutral parameter descriptions.\n"
+            "Use available_operations.industrial_templates as Fedot.Industrial-native graph patterns, especially for time-series tasks.\n"
             "Use available_operations.training_strategies_catalog for selectable execution strategies; "
             "available_operations.training_strategies is the upstream reference list.\n"
             "Respect training_strategy_policy: keep graph.training_strategy null when allowed_now=false.\n"

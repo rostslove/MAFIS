@@ -13,6 +13,7 @@ from graph_engine import (
     DEFAULT_GRAPHS,
     FEDOT_IND_VERSION,
     FEDOT_INDUSTRIAL_SOURCE,
+    INDUSTRIAL_GRAPH_TEMPLATES,
     METRICS_BY_TASK,
     OPERATIONS,
     OPERATION_DESCRIPTIONS,
@@ -28,7 +29,6 @@ from orchestrator import (
     propose_revision_from_critic,
     run_orchestration,
     run_orchestration_stream,
-    tune_approved_graph,
 )
 from m4_benchmark import M4_GROUPS, M4_TARGET_COLUMN, M4_TASK_TYPE, prepare_m4_dataset_csv
 
@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 AGENT_TOOLS = {
     "architect": ["get_data_profile", "get_available_operations", "propose_graph", "mutate_graph", "visualize_graph"],
-    "engineer": ["tune_graph_hyperparameters", "train_graph"],
+    "engineer": ["train_graph"],
     "critic": ["validate_graph", "get_node_importance", "explain_graph"],
     "scribe": ["generate_report"],
 }
@@ -49,7 +49,6 @@ TOOL_DESCRIPTIONS = {
     "propose_graph": "Validate a graph candidate and return Mermaid markup",
     "mutate_graph": "Apply add/remove/replace/set_params/connect mutations to a graph",
     "visualize_graph": "Render graph JSON to Mermaid markup",
-    "tune_graph_hyperparameters": "Tune node hyperparameters without changing graph structure",
     "train_graph": "Fit and score a graph exactly as proposed, using training_strategy when selected",
     "validate_graph": "Cross-validate a graph",
     "get_node_importance": "Estimate node contribution by ablation",
@@ -94,6 +93,7 @@ async def get_config(request):
         "training_strategy_hints": {task: get_training_strategy_hints(task) for task in SUPPORTED_TASKS},
         "fedot_industrial_strategy_catalog": get_fedot_industrial_strategy_catalog(),
         "default_graphs": DEFAULT_GRAPHS,
+        "industrial_graph_templates": INDUSTRIAL_GRAPH_TEMPLATES,
         "llm_configured": bool(os.getenv("LLM_API_KEY") or os.getenv("OPENROUTER_API_KEY") or LLM_BASE_URL),
         "openrouter_configured": "openrouter.ai" in LLM_BASE_URL and bool(os.getenv("OPENROUTER_API_KEY")),
         "fedot_ind_version": FEDOT_IND_VERSION,
@@ -200,25 +200,6 @@ async def orchestrate(request):
         return _error(str(exc), 500)
 
 
-async def engineer_tune(request):
-    payload = await _json_body(request)
-    try:
-        result = await tune_approved_graph(
-            csv_path=payload.get("csv_path", ""),
-            target_column=payload.get("target_column", ""),
-            task_type=payload.get("task_type", "classification"),
-            graph=payload.get("graph") or {},
-            forecast_length=payload.get("forecast_length"),
-            primary_metric=payload.get("primary_metric"),
-            test_size=_payload_test_size(payload),
-            iterations=int(payload.get("iterations", 30) or 30),
-        )
-        return JSONResponse(result)
-    except Exception as exc:
-        logger.exception("Engineer tuning failed")
-        return _error(str(exc), 500)
-
-
 async def benchmark_m4_load(request):
     payload = await _json_body(request)
     try:
@@ -277,7 +258,6 @@ routes = [
     Route("/graph/mutate", graph_mutate, methods=["POST"]),
     Route("/orchestrate", orchestrate, methods=["POST"]),
     Route("/orchestrate/stream", orchestrate_stream, methods=["POST"]),
-    Route("/engineer/tune", engineer_tune, methods=["POST"]),
     Route("/benchmarks/m4/load", benchmark_m4_load, methods=["POST"]),
 ]
 

@@ -50,12 +50,12 @@ Main tools:
 
 - `get_baselines`
 - `train_baseline`
-- `tune_graph_hyperparameters`
 - `train_graph`
 
-Output: graph score, metrics, tuned node parameters, baseline comparison.
+Output: graph score, metrics, training notes, baseline comparison.
 
-Engineer does not change graph structure. It only fits the graph and tunes node parameters.
+Engineer does not tune node hyperparameters. It fits the graph as proposed and reports recovery feedback when an optional node fails.
+Operation catalogs include Fedot.Industrial search-space metadata, so Architect and Critic can choose explicit parameters from framework-supported ranges. Time-series starter graphs use Fedot.Industrial feature-fusion templates with parallel extractor branches where available.
 
 ### Critic
 

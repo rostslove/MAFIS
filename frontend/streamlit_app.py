@@ -1110,19 +1110,6 @@ def render_engineer_report(
         if metrics:
             render_metric_table("Test metrics (hold-out)", metrics)
 
-    tuned_nodes = engineer.get("tuned_nodes", []) or []
-    if tuned_nodes:
-        st.write("Tuned hyperparameters")
-        rows = [
-            {
-                "node": node.get("id", ""),
-                "operation": node.get("operation", ""),
-                "params": format_params(node.get("tuned_params", {}) or {}),
-            }
-            for node in tuned_nodes
-        ]
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
     if show_diagnostics:
         render_diagnostics(engineer.get("diagnostics", []), "Engineer diagnostics", use_expander=False)
 
@@ -1197,75 +1184,6 @@ def request_architect_revision(iteration: Dict[str, Any], message: str = "") -> 
         )
     else:
         st.success("Architect prepared a new draft (no mutations selected; LLM-driven revision). Approve it to make it the active pipeline.")
-
-
-def request_engineer_tuning(iteration: Dict[str, Any], iterations: int) -> Dict[str, Any]:
-    graph = st.session_state.get("approved_graph") or iteration.get("architect", {}).get("graph", {})
-    payload = current_payload({"graph": graph, "iterations": int(iterations)})
-    result = post_json("/engineer/tune", payload, timeout=1800)
-    st.session_state.tune_last_result = result
-
-    if result.get("error"):
-        return result
-
-    archive_current_result("Before hyperparameter tuning")
-
-    architect = iteration.setdefault("architect", {})
-    tuned_graph = result.get("graph") or graph
-    architect["graph"] = tuned_graph
-    st.session_state.graph = tuned_graph
-    st.session_state.approved_graph = tuned_graph
-    st.session_state.graph_approved = True
-
-    previous = iteration.get("engineer", {}) or {}
-    metrics = result.get("metrics", {}) or {}
-    iteration["engineer"] = {
-        **previous,
-        "graph_score": result.get("score", metrics.get("primary_score", previous.get("graph_score", 0))),
-        "graph_metrics": metrics,
-        "train_metrics": result.get("train_metrics", {}) or {},
-        "test_metrics": result.get("test_metrics", {}) or metrics,
-        "split_info": result.get("split_info", {}) or {},
-        "training_strategy": result.get("training_strategy", {}) or previous.get("training_strategy", {}),
-        "tuned_nodes": result.get("tuned_nodes", []) or [],
-        "graph_error": result.get("error", "") or "",
-        "target_info": result.get("target_info", {}) or previous.get("target_info", {}),
-        "training_notes": result.get("training_notes", []) or previous.get("training_notes", []),
-        "diagnostics": result.get("diagnostics", []) or [],
-        "tool_calls": previous.get("tool_calls", []),
-    }
-    return result
-
-
-def render_engineer_tuning_controls(iteration: Dict[str, Any]) -> None:
-    st.markdown("#### Engineer Tuning")
-    st.caption(
-        "Runs the existing MCP `tune_graph_hyperparameters` tool on the approved graph, "
-        "then recalculates train and hold-out test metrics with the selected split."
-    )
-    tune_cols = st.columns([1, 2])
-    iterations = tune_cols[0].number_input(
-        "Tuning iterations",
-        min_value=1,
-        max_value=100,
-        value=int(st.session_state.get("tune_iterations", 30)),
-        step=5,
-        key="tune_iterations",
-    )
-    if tune_cols[1].button("Tune Approved Graph", use_container_width=True, key="engineer_tune_approved"):
-        try:
-            with st.spinner("Engineer is tuning the approved graph..."):
-                result = request_engineer_tuning(iteration, int(iterations))
-            if result.get("error"):
-                st.warning(result.get("error"))
-                render_diagnostics(result.get("diagnostics", []) or [], "Tuning diagnostics", use_expander=False)
-            else:
-                st.session_state.tune_success_message = (
-                    "Tuning completed. Metrics were recalculated on train and test splits."
-                )
-                st.rerun()
-        except Exception as exc:
-            st.error(f"Engineer tuning failed: {exc}")
 
 
 def _numeric_or_none(value: Any) -> float | None:
@@ -1482,12 +1400,6 @@ def results_tab() -> None:
         st.error("No successful evaluation found.")
         return
 
-    tune_message = st.session_state.get("tune_success_message", "")
-    if tune_message:
-        del st.session_state["tune_success_message"]
-    if tune_message:
-        st.success(tune_message)
-
     engineer = item.get("engineer", {})
     critic = item.get("critic", {})
     has_runtime_failure = bool(engineer.get("graph_error"))
@@ -1505,8 +1417,6 @@ def results_tab() -> None:
     render_graph(item.get("architect", {}).get("graph", {}), show_details=False)
 
     render_runtime_failure_once(item)
-    if not has_runtime_failure:
-        render_engineer_tuning_controls(item)
     engineer = item.get("engineer", {})
     render_engineer_report(
         engineer,
@@ -1515,8 +1425,6 @@ def results_tab() -> None:
         show_diagnostics=not has_runtime_failure,
     )
     render_evaluation_history(result)
-    if engineer.get("tuned_nodes"):
-        st.info("Critic feedback below is from the last full evaluation. Run Evaluate Approved Graph again to reassess the tuned parameters.")
     render_critic_feedback(critic, compact_runtime_error=has_runtime_failure)
 
     st.markdown("#### Next Pipeline Decision")
@@ -1570,7 +1478,7 @@ def tools_tab(tools: Dict[str, Any]) -> None:
 
 def main() -> None:
     st.title(APP_SHORT_NAME)
-    st.caption(f"{APP_NAME}: LLM agents compose, tune, validate and report Fedot.Industrial pipeline graphs and strategies through MCP tools.")
+    st.caption(f"{APP_NAME}: LLM agents compose, train, validate and report Fedot.Industrial pipeline graphs and strategies through MCP tools.")
     config = load_config()
     sidebar(config)
     tools = load_tools()

@@ -11,15 +11,14 @@ logger = logging.getLogger("Engineer")
 
 
 class Engineer(BaseAgent):
-    """Technical agent responsible for fitting and tuning a proposed graph."""
+    """Technical agent responsible for fitting a proposed graph."""
 
     ALLOWED_TOOLS = [
-        "tune_graph_hyperparameters",
         "train_graph",
     ]
 
     SYSTEM_PROMPT = """You are an ML Engineer. You receive a validated pipeline graph.
-Your role is to tune graph hyperparameters when safe and train the graph as-is.
+Your role is to train the graph as-is and report metrics.
 If a non-root operation crashes during training, skip that operation, retry the
 remaining graph, and report the skipped node as recovery feedback for Critic."""
 
@@ -41,7 +40,6 @@ remaining graph, and report the skipped node as recovery feedback for Critic."""
                 result.test_metrics = graph_run.get("test_metrics", {}) or {}
                 result.split_info = graph_run.get("split_info", {}) or {}
                 result.training_strategy = graph_run.get("training_strategy", {}) or {}
-                result.tuned_nodes = graph_run.get("tuned_nodes", []) or []
                 result.graph_error = graph_run.get("error", "") or ""
                 result.target_info = graph_run.get("target_info", {}) or result.target_info
                 result.training_notes.extend(graph_run.get("training_notes", []) or [])
@@ -81,57 +79,17 @@ remaining graph, and report the skipped node as recovery feedback for Critic."""
             return result
 
     async def _train_graph(self, graph_json: str, dc: DataContext) -> dict:
-        if dc.task_type in ("classification", "ts_classification"):
-            trained = await self._train_without_tuning(graph_json, dc)
-            if trained.get("error"):
-                trained = await self._recover_by_skipping_node(graph_json, dc, trained)
-            if trained.get("training_strategy"):
-                trained.setdefault("training_notes", []).append(
-                    "Node-level hyperparameter tuning was skipped because the selected Fedot.Industrial "
-                    "training strategy performs its own branch AutoML search."
-                )
-            else:
-                if trained.get("recovered_from_error"):
-                    trained.setdefault("training_notes", []).append(
-                        "Fedot hyperparameter tuning was skipped for classification. After node-skip recovery, "
-                        "the remaining graph was trained and scored with external sklearn metrics."
-                    )
-                else:
-                    trained.setdefault("training_notes", []).append(
-                        "Fedot hyperparameter tuning was skipped for classification because Fedot.Industrial 0.5 "
-                        "prints internal ROC-AUC shape tracebacks for binary probability matrices during tuning. "
-                        "The graph was trained as-is and scored with external sklearn metrics. To improve it, use "
-                        "manual graph mutations or explicit node parameters instead of Fedot's classification tuner."
-                    )
-            return trained
-
-        args = {
-            "graph_json": graph_json,
-            "csv_path": dc.csv_path,
-            "target_column": dc.target_column,
-            "iterations": 20,
-            "test_size": dc.test_size,
-        }
-        if dc.primary_metric:
-            args["primary_metric"] = dc.primary_metric
-        if dc.forecast_length:
-            args["forecast_length"] = dc.forecast_length
-
-        tuned = await self.call_mcp_tool("tune_graph_hyperparameters", args)
-        if isinstance(tuned, dict) and not tuned.get("error") and float(tuned.get("score") or 0) != 0:
-            return tuned
-
-        logger.warning("[Engineer] tuning failed or returned zero score, training graph without tuning")
-        trained = await self._train_without_tuning(graph_json, dc)
-        if isinstance(tuned, dict) and tuned.get("error") and trained.get("error"):
-            trained.setdefault("diagnostics", [])
-            trained["diagnostics"].extend(self._extract_diagnostics(tuned))
-            trained["tuning_error"] = tuned.get("error")
+        trained = await self._train_direct(graph_json, dc)
         if trained.get("error"):
             trained = await self._recover_by_skipping_node(graph_json, dc, trained)
+        if trained.get("training_strategy"):
+            trained.setdefault("training_notes", []).append(
+                "Fedot.Industrial training strategy executed its own internal search. "
+                "MAFIS did not run separate node-level hyperparameter tuning."
+            )
         return trained
 
-    async def _train_without_tuning(self, graph_json: str, dc: DataContext) -> dict:
+    async def _train_direct(self, graph_json: str, dc: DataContext) -> dict:
         args = {
             "graph_json": graph_json,
             "csv_path": dc.csv_path,
@@ -171,7 +129,7 @@ remaining graph, and report the skipped node as recovery feedback for Critic."""
         for node in candidates:
             recovered_graph = self._graph_with_node_skipped(graph, str(node["id"]))
             recovered_json = json.dumps(recovered_graph, ensure_ascii=False)
-            recovered = await self._train_without_tuning(recovered_json, dc)
+            recovered = await self._train_direct(recovered_json, dc)
             if not isinstance(recovered, dict):
                 recovered = {"score": 0, "error": "train_graph returned no data"}
 

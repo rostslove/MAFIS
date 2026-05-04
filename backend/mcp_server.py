@@ -26,7 +26,7 @@ from sklearn.preprocessing import LabelEncoder
 
 from data_profiler import DataProfiler
 from graph_engine import (
-    OPERATIONS, METRICS_BY_TASK, SUPPORTED_TASKS, DEFAULT_GRAPHS,
+    OPERATIONS, METRICS_BY_TASK, SUPPORTED_TASKS, DEFAULT_GRAPHS, INDUSTRIAL_GRAPH_TEMPLATES,
     PipelineGraph, compute_metrics, get_operation_catalog, get_training_strategies,
     get_training_strategy_hints, is_ts_task,
     input_sample_count, load_input_data, slice_input_data, split_input_data,
@@ -402,6 +402,7 @@ def get_available_operations(task_type: str) -> str:
         "training_strategies_catalog": get_training_strategies(task_type),
         "training_strategies": get_training_strategy_hints(task_type),
         "default_graph": DEFAULT_GRAPHS.get(task_type, []),
+        "industrial_templates": INDUSTRIAL_GRAPH_TEMPLATES.get(task_type, []),
     })
 
 
@@ -454,7 +455,7 @@ def visualize_graph(graph_json: str) -> str:
 
 
 # ================================================================
-#                          GRAPH TRAIN / TUNE
+#                          GRAPH TRAIN
 # ================================================================
 
 @mcp.tool()
@@ -518,98 +519,6 @@ def train_graph(
     except Exception as e:
         logger.exception("train_graph failed")
         return json.dumps({"score": 0, "error": str(e)})
-
-
-@mcp.tool()
-def tune_graph_hyperparameters(
-    graph_json: str,
-    csv_path: str,
-    target_column: str,
-    iterations: int = 20,
-    forecast_length: Optional[int] = None,
-    primary_metric: Optional[str] = None,
-    test_size: float = 0.2,
-) -> str:
-    """Tune node hyperparameters of a graph using Fedot's PipelineTuner. Returns tuned graph + score."""
-    try:
-        from fedot.core.pipelines.tuning.tuner_builder import TunerBuilder
-
-        csv_path = normalize_csv_path(csv_path)
-        graph = PipelineGraph.from_dict(json.loads(graph_json))
-        ok, msg = graph.validate()
-        if not ok:
-            return json.dumps({"score": 0, "error": f"Invalid graph: {msg}"})
-
-        if graph.uses_training_strategy():
-            payload = _train_strategy_graph(graph, csv_path, target_column, primary_metric, test_size)
-            return json.dumps(payload)
-
-        if graph.task_type in ("classification", "ts_classification"):
-            return json.dumps({
-                "score": 0,
-                "error": "tuning skipped for classification",
-                "target_info": _target_info(csv_path, target_column, graph.task_type),
-            })
-
-        ts = float(test_size) if test_size is not None else 0.2
-        ts = min(max(ts, 0.05), 0.5)
-
-        input_data = load_input_data(csv_path, target_column, graph.task_type, forecast_length)
-        train, val = split_input_data(input_data, test_size=ts)
-
-        pipeline = graph.to_fedot_pipeline()
-
-        try:
-            tuner = TunerBuilder(input_data.task).with_iterations(iterations).build(train)
-            pipeline = tuner.tune(pipeline)
-        except Exception as e:
-            logger.warning(f"Tuning failed, using untuned pipeline: {e}")
-
-        pipeline.fit(train)
-        train_preds = _predict_pipeline(pipeline, train, graph.task_type)
-        test_preds = _predict_pipeline(pipeline, val, graph.task_type)
-        train_metrics = compute_metrics(graph.task_type, train.target, train_preds, primary_metric)
-        test_metrics = compute_metrics(graph.task_type, val.target, test_preds, primary_metric)
-        metrics = test_metrics
-        _store_run(pipeline, graph, input_data, test_preds)
-
-        # Extract tuned params back per node
-        tuned_nodes = []
-        try:
-            for fnode, gnode in zip(pipeline.nodes, graph.nodes):
-                tuned_params = dict(getattr(fnode, "parameters", {}) or {})
-                if tuned_params:
-                    gnode.params = {**(gnode.params or {}), **tuned_params}
-                tuned_nodes.append({"id": gnode.id, "operation": gnode.operation, "tuned_params": tuned_params})
-        except Exception:
-            pass
-
-        target_info = _target_info(csv_path, target_column, graph.task_type)
-        training_notes = []
-        if target_info.get("fedot_receives_raw_target") and target_info.get("reference_encoded"):
-            training_notes.append(
-                "Fedot graph received the raw string classification target; reference mapping is shown only for readable diagnostics."
-            )
-
-        return json.dumps({
-            "score": metrics["primary_score"],
-            "metrics": metrics,
-            "train_metrics": train_metrics,
-            "test_metrics": test_metrics,
-            "split_info": {
-                "test_size": ts,
-                "n_train": input_sample_count(train),
-                "n_test": input_sample_count(val),
-            },
-            "graph": graph.to_dict(),
-            "tuned_nodes": tuned_nodes,
-            "target_info": target_info,
-            "training_notes": training_notes,
-        })
-    except Exception as e:
-        logger.exception("tune_graph_hyperparameters failed")
-        return json.dumps({"score": 0, "error": str(e)})
-
 
 @mcp.tool()
 def validate_graph(
@@ -743,7 +652,7 @@ def explain_graph(top_k: int = 10) -> str:
     pipeline = _LAST.get("pipeline")
     graph = _LAST.get("graph")
     if pipeline is None or graph is None:
-        return json.dumps({"error": "No trained graph yet. Call train_graph or tune_graph_hyperparameters first."})
+        return json.dumps({"error": "No trained graph yet. Call train_graph first."})
 
     try:
         # Find the root (model) node and try to extract feature_importances_
