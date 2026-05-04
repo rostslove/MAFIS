@@ -53,9 +53,18 @@ Return JSON only."""
         graph_json = json.dumps(graph, ensure_ascii=False)
 
         try:
+            recovered_from_node_skip = self._has_node_skip_recovery(engineer_result)
             if engineer_result.graph_error:
                 validation = {
                     "skipped": "Graph training failed; cross-validation would repeat the same failure.",
+                    "diagnostics": engineer_result.diagnostics,
+                }
+            elif recovered_from_node_skip:
+                validation = {
+                    "skipped": (
+                        "Engineer trained a recovered graph after skipping a failed node; "
+                        "cross-validation should run after Architect applies the recovery mutation."
+                    ),
                     "diagnostics": engineer_result.diagnostics,
                 }
             else:
@@ -66,6 +75,14 @@ Return JSON only."""
                     "error": engineer_result.graph_error,
                 }
                 node_importance = {"skipped": "Graph was not trained successfully; node ablation is unavailable."}
+            elif recovered_from_node_skip:
+                explanation = await self.call_mcp_tool("explain_graph", {"top_k": 10})
+                node_importance = {
+                    "skipped": (
+                        "Node ablation is skipped because the approved graph differs from "
+                        "the recovered graph Engineer actually trained."
+                    )
+                }
             else:
                 explanation = await self.call_mcp_tool("explain_graph", {"top_k": 10})
                 node_importance = await self._maybe_get_node_importance(graph, graph_json, data_context)
@@ -172,6 +189,18 @@ Return JSON only."""
 
     @staticmethod
     def _build_assessment(engineer: EngineerResult, validation: Dict[str, Any], dc: DataContext) -> str:
+        if Critic._has_node_skip_recovery(engineer):
+            metric = engineer.graph_metrics.get("primary_metric") or dc.primary_metric or "primary"
+            metric_value = engineer.graph_metrics.get("primary_metric_value", engineer.graph_score)
+            try:
+                metric_value_text = f"{float(metric_value):.4f}"
+            except (TypeError, ValueError):
+                metric_value_text = str(metric_value)
+            return (
+                f"Engineer recovered training by skipping a failed graph node. "
+                f"Recovered test {metric}={metric_value_text}; Critic is proposing a graph revision "
+                "so the approved pipeline matches the graph that actually trained."
+            )
         if engineer.graph_error:
             return "Graph failed before scoring; Critic is focusing on recovery mutations from runtime diagnostics."
         cv = ""
@@ -194,6 +223,8 @@ Return JSON only."""
     @staticmethod
     def _strengths(engineer: EngineerResult, validation: Dict[str, Any], dc: DataContext) -> List[str]:
         strengths = []
+        if Critic._has_node_skip_recovery(engineer):
+            strengths.append("Engineer recovered by training the graph without the failed node")
         if engineer.graph_error:
             return ["The failure was captured and converted into diagnostics"]
         if engineer.graph_score > 0:
@@ -209,6 +240,8 @@ Return JSON only."""
     @staticmethod
     def _weaknesses(engineer: EngineerResult, validation: Dict[str, Any], dc: DataContext) -> List[str]:
         weaknesses = []
+        if Critic._has_node_skip_recovery(engineer):
+            weaknesses.append("The approved graph still contains a node that failed during training")
         if engineer.graph_error:
             weaknesses.append("The graph could not be trained with the current runtime parameters")
             return weaknesses
@@ -426,6 +459,11 @@ Return JSON only."""
         mutations: List[Dict[str, Any]],
     ) -> List[str]:
         plan: List[str] = []
+        if self._has_node_skip_recovery(engineer):
+            plan.append(
+                "First update the approved graph so it removes or replaces the node that Engineer had to skip."
+            )
+            plan.extend(self._diagnostic_recommendations(engineer.diagnostics))
         if engineer.graph_error:
             plan.append("First fix the graph/runtime error before judging model quality.")
             plan.extend(self._diagnostic_recommendations(engineer.diagnostics))
@@ -436,6 +474,10 @@ Return JSON only."""
             plan.append(
                 f"The test graph score is below the standalone target floor for {dc.task_type} "
                 f"({engineer.graph_score:.4f} < {quality_floor:.2f})."
+            )
+        elif self._has_node_skip_recovery(engineer):
+            plan.append(
+                "Recovered metrics are available, but the approved graph should be revised before acceptance."
             )
         else:
             plan.append("The graph passes the current standalone quality check; keep it unless domain constraints require changes.")
@@ -595,6 +637,8 @@ Return JSON only."""
 
     @staticmethod
     def _should_stop(engineer: EngineerResult, feedback: CriticFeedback, validation: Dict[str, Any], task_type: str) -> bool:
+        if Critic._has_node_skip_recovery(engineer):
+            return False
         if engineer.graph_score <= 0:
             return False
         if feedback.weaknesses:
@@ -603,3 +647,10 @@ Return JSON only."""
             return False
         metric = engineer.graph_metrics.get("primary_metric", "")
         return engineer.graph_score >= Critic._target_quality_floor(task_type, str(metric))
+
+    @staticmethod
+    def _has_node_skip_recovery(engineer: EngineerResult) -> bool:
+        return any(
+            isinstance(item, dict) and item.get("kind") == "node_skipped_after_runtime_error"
+            for item in (engineer.diagnostics or [])
+        )

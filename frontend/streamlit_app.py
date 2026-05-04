@@ -242,6 +242,16 @@ def unique_text(items: List[str]) -> List[str]:
     return unique
 
 
+def decision_label(value: Any) -> str:
+    labels = {
+        "needs_revision": "Need revision",
+        "need_revision": "Need revision",
+        "accepted": "Accepted",
+    }
+    text = str(value or "").strip()
+    return labels.get(text, text)
+
+
 def runtime_failure_details(engineer: Dict[str, Any], critic: Dict[str, Any]) -> Dict[str, Any]:
     error = str(engineer.get("graph_error") or "").strip()
     if not error:
@@ -626,7 +636,10 @@ def stream_run(payload: Dict[str, Any]) -> None:
                     )
                     progress.progress(progress_value)
             elif event_type == "agent_done":
-                lines.append(f"{event.get('agent')}: {event.get('summary', '')}")
+                summary = str(event.get("summary", ""))
+                if event.get("agent") == "Critic":
+                    summary = summary.replace("needs_revision", "Need revision").replace("accepted", "Accepted")
+                lines.append(f"{event.get('agent')}: {summary}")
                 if event.get("diagnostics"):
                     for diagnostic in event["diagnostics"]:
                         key = (event.get("agent"), diagnostic.get("kind"), diagnostic.get("summary"))
@@ -647,7 +660,7 @@ def stream_run(payload: Dict[str, Any]) -> None:
                 primary_value = event.get("primary_metric_value", event.get("graph_score", 0))
                 lines.append(
                     f"Evaluation done: test {primary_metric}={format_number(primary_value)}, "
-                    f"critic decision={event.get('winner')}"
+                    f"critic decision={decision_label(event.get('winner'))}"
                 )
                 if event.get("graph"):
                     st.session_state.graph = event["graph"]
@@ -1122,7 +1135,7 @@ def render_critic_feedback(critic: Dict[str, Any], compact_runtime_error: bool =
         st.write(critic.get("assessment", "No critic assessment."))
 
     cols = st.columns(2)
-    cols[0].metric("Decision", critic.get("winner", ""))
+    cols[0].metric("Decision", decision_label(critic.get("winner", "")))
     cols[1].metric("Suggested changes", len(critic.get("suggested_mutations", []) or []))
 
     if critic.get("strengths") and not compact_runtime_error:
@@ -1281,7 +1294,7 @@ def evaluation_summary_row(kind: str, result: Dict[str, Any], current_metric: st
         "test value": format_number(value),
         "train value": format_number(train_value) if train_value is not None else "",
         "delta to current": delta,
-        "critic": critic.get("winner", ""),
+        "critic": decision_label(critic.get("winner", "")),
         "test_size": (engineer.get("split_info", {}) or {}).get("test_size", ""),
     }
 
@@ -1485,7 +1498,7 @@ def results_tab() -> None:
 
     col1, col2, col3 = st.columns(3)
     col1.metric(f"Test {primary_metric}", "n/a" if has_runtime_failure else format_number(primary_value))
-    col2.metric("Critic decision", critic.get("winner", ""))
+    col2.metric("Critic decision", decision_label(critic.get("winner", "")))
     col3.metric("Suggested changes", len(critic.get("suggested_mutations", []) or []))
 
     st.markdown("#### Evaluated Graph")
