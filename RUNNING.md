@@ -63,7 +63,7 @@ Recommended default model:
 qwen2.5-coder:14b
 ```
 
-It is the shared model for all MAFIS agents and gives more stable JSON/tool reasoning than the previous 7B default. If the server is CPU-only or low on RAM, use `qwen2.5-coder:7b` or `qwen2.5-coder:3b` instead.
+It is the shared model for all MAFIS agents and gives more stable JSON/tool reasoning. If the server is CPU-only or low on RAM, use a smaller compatible Ollama model instead.
 
 With Docker Compose, Ollama is started automatically and the model is pulled by `ollama-pull`:
 

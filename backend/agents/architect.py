@@ -34,6 +34,7 @@ Each node has:
 
 The graph must be a DAG with exactly ONE root (node nobody else inputs from). The root is the model.
 Inputs are references to node ids, not generated port names. Do not invent input/output handles; connect nodes by their actual id values.
+There is no implicit raw-data node in graph.nodes. A node that consumes the dataset directly must use inputs=[].
 For ordinary tabular classification/regression, prefer a direct model-only graph by default. Add preprocessing only when it is returned by the catalog and the current data profile or feedback justifies it.
 
 WORKFLOW:
@@ -68,6 +69,7 @@ Rules:
 - Add preprocessing nodes only when AVAILABLE_OPERATIONS.preprocessing contains the operation and the data profile or feedback justifies that extra step.
 - Every value in a node's inputs must exactly match the id of another node present in graph.nodes. Use inputs=[] for raw data.
 - Do not create synthetic input/output handle names; if node B consumes node A, write B.inputs=["A's id"].
+- There is no implicit raw-data node. The raw dataset is represented only by inputs=[] on source nodes.
 - The graph must have exactly one root model node.
 - For ordinary tabular classification/regression, prefer one direct model node unless the data profile or feedback justifies another valid model, explicit model parameters, or a valid preprocessing step.
 - If feedback contains suggested_mutations, reflect them in the returned graph. Do not return the previous graph unchanged.
@@ -111,7 +113,7 @@ Rules:
                         "technical_message": json.dumps(diagnostics, ensure_ascii=False)[:1200],
                         "recommendations": [
                             "Approve the deterministic graph if it is suitable, or edit it manually before evaluation.",
-                            "For local 7B models, keep graph requests short and operation names exact.",
+                            "For local models, keep graph requests short and operation names exact.",
                         ],
                         "recoverable": True,
                     }
@@ -181,24 +183,7 @@ Rules:
             )
             return None, "", "", "", diagnostics
 
-        if proposal.graph.training_strategy and not self._training_strategy_allowed(prev_feedback, prev_graph):
-            proposal.graph.training_strategy = None
-            diagnostics.append(
-                {
-                    "agent": "Architect",
-                    "kind": "training_strategy_removed",
-                    "summary": "Architect proposed a training strategy without an explicit request or Critic recommendation.",
-                    "technical_message": (
-                        "training_strategy was reset to null. Strategies are execution modes and "
-                        "must be selected by the user, preserved from the previous graph, or recommended by Critic."
-                    ),
-                    "recommendations": [
-                        "Keep graph.training_strategy null unless strategy use is explicitly requested.",
-                        "Use model nodes and node parameters for ordinary graph improvements.",
-                    ],
-                    "recoverable": True,
-                }
-            )
+        self._enforce_training_strategy_policy(proposal, prev_feedback, prev_graph, diagnostics)
 
         proposed = await self.call_mcp_tool("propose_graph", {"graph_json": proposal.graph.as_graph_json()})
         if isinstance(proposed, dict) and proposed.get("valid") and proposed.get("graph"):
@@ -225,6 +210,27 @@ Rules:
             }
         )
         return None, "", proposal.analysis, proposal.reasoning, diagnostics
+
+    def _enforce_training_strategy_policy(self, proposal, prev_feedback, prev_graph, diagnostics) -> None:
+        if not proposal.graph.training_strategy or self._training_strategy_allowed(prev_feedback, prev_graph):
+            return
+        proposal.graph.training_strategy = None
+        diagnostics.append(
+            {
+                "agent": "Architect",
+                "kind": "training_strategy_removed",
+                "summary": "Architect proposed a training strategy without an explicit request or Critic recommendation.",
+                "technical_message": (
+                    "training_strategy was reset to null. Strategies are execution modes and "
+                    "must be selected by the user, preserved from the previous graph, or recommended by Critic."
+                ),
+                "recommendations": [
+                    "Keep graph.training_strategy null unless strategy use is explicitly requested.",
+                    "Use model nodes and node parameters for ordinary graph improvements.",
+                ],
+                "recoverable": True,
+            }
+        )
 
     @staticmethod
     def _fallback_graph(task_type: str, prev_graph: Optional[dict] = None):
@@ -336,6 +342,7 @@ Rules:
             "Use available_operations.training_strategies_catalog for selectable execution strategies; "
             "available_operations.training_strategies is the upstream reference list.\n"
             "Respect training_strategy_policy: keep graph.training_strategy null when allowed_now=false.\n"
+            "For graph node inputs, use [] for raw data and otherwise use only existing node ids.\n"
             "Return strict JSON literals: null/true/false, not Python None/True/False.\n"
             "Return only the GraphProposal JSON object.\n"
             f"{json.dumps(payload, ensure_ascii=False)}"
