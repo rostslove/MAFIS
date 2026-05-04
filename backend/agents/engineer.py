@@ -19,8 +19,8 @@ class Engineer(BaseAgent):
 
     SYSTEM_PROMPT = """You are an ML Engineer. You receive a validated pipeline graph.
 Your role is to train the graph as-is and report metrics.
-If a non-root operation crashes during training, skip that operation, retry the
-remaining graph, and report the skipped node as recovery feedback for Critic."""
+If non-root operations crash during training, skip those operations, retry the
+remaining graph, and report skipped nodes as recovery feedback for Critic."""
 
     def __init__(self, name: str = "Engineer", mcp_client=None):
         super().__init__(name=name, mcp_client=mcp_client)
@@ -71,7 +71,6 @@ remaining graph, and report the skipped node as recovery feedback for Critic."""
                     "kind": "engineer_error",
                     "summary": "Engineer could not complete training.",
                     "technical_message": str(exc),
-                    "recommendations": ["Check the graph and dataset format, then run again."],
                     "recoverable": True,
                 }
             )
@@ -111,7 +110,7 @@ remaining graph, and report the skipped node as recovery feedback for Critic."""
         dc: DataContext,
         failed_run: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Try one-node bypass recovery for crashes in optional graph nodes."""
+        """Try bypass recovery for crashes in optional graph nodes."""
         graph = self._parse_graph_json(graph_json)
         if not graph or graph.get("training_strategy"):
             return failed_run
@@ -134,7 +133,7 @@ remaining graph, and report the skipped node as recovery feedback for Critic."""
                 recovered = {"score": 0, "error": "train_graph returned no data"}
 
             if not recovered.get("error"):
-                diagnostic = self._node_skipped_diagnostic(node, original_error, recovered_graph)
+                diagnostic = self._nodes_skipped_diagnostic([node], original_error, recovered_graph)
                 recovered.setdefault("diagnostics", [])
                 recovered["diagnostics"] = (
                     list(failed_run.get("diagnostics", []) or [])
@@ -163,6 +162,52 @@ remaining graph, and report the skipped node as recovery feedback for Critic."""
                 "error": recovered.get("error"),
             })
 
+        if len(candidates) > 1:
+            recovered_graph = self._graph_with_nodes_skipped(
+                graph,
+                [str(node["id"]) for node in candidates if node.get("id")],
+            )
+            recovered_json = json.dumps(recovered_graph, ensure_ascii=False)
+            recovered = await self._train_direct(recovered_json, dc)
+            if not isinstance(recovered, dict):
+                recovered = {"score": 0, "error": "train_graph returned no data"}
+
+            attempts.append({
+                "id": "__all_optional__",
+                "operation": "skip_all_optional_nodes",
+                "error": recovered.get("error"),
+            })
+
+            if not recovered.get("error"):
+                diagnostic = self._nodes_skipped_diagnostic(candidates, original_error, recovered_graph)
+                recovered.setdefault("diagnostics", [])
+                recovered["diagnostics"] = (
+                    list(failed_run.get("diagnostics", []) or [])
+                    + [diagnostic]
+                    + list(recovered.get("diagnostics", []) or [])
+                )
+                skipped = ", ".join(
+                    f"'{node.get('id')}' ({node.get('operation')})" for node in candidates
+                )
+                recovered.setdefault("training_notes", [])
+                recovered["training_notes"].append(
+                    f"Engineer skipped failed optional nodes {skipped} and retrained the remaining graph. "
+                    "Critic should decide whether to remove or replace them."
+                )
+                recovered["recovered_from_error"] = True
+                recovered["original_error"] = original_error
+                recovered["effective_graph"] = recovered_graph
+                recovered["skipped_nodes"] = diagnostic["failed_nodes"]
+                logger.info(
+                    "[Engineer] recovered by skipping optional nodes: %s",
+                    ", ".join(str(node.get("id")) for node in candidates),
+                )
+                return recovered
+
+        problem_nodes = [
+            {"id": node.get("id"), "operation": node.get("operation")}
+            for node in candidates
+        ]
         failed_run.setdefault("diagnostics", [])
         failed_run["diagnostics"].append(
             {
@@ -170,14 +215,8 @@ remaining graph, and report the skipped node as recovery feedback for Critic."""
                 "kind": "node_skip_recovery_failed",
                 "summary": "Engineer tried to skip optional nodes, but the graph still failed during training.",
                 "technical_message": original_error,
-                "problem_nodes": [
-                    {"id": item.get("id"), "operation": item.get("operation")}
-                    for item in attempts
-                ],
+                "problem_nodes": problem_nodes,
                 "recovery_attempts": attempts,
-                "recommendations": [
-                    "Ask Architect to simplify the graph or replace preprocessing nodes before evaluating quality."
-                ],
                 "recoverable": True,
             }
         )
@@ -253,6 +292,13 @@ remaining graph, and report the skipped node as recovery feedback for Critic."""
         recovered["nodes"] = new_nodes
         return recovered
 
+    @classmethod
+    def _graph_with_nodes_skipped(cls, graph: Dict[str, Any], node_ids: List[str]) -> Dict[str, Any]:
+        recovered = dict(graph)
+        for node_id in node_ids:
+            recovered = cls._graph_with_node_skipped(recovered, node_id)
+        return recovered
+
     @staticmethod
     def _unique_inputs(inputs: List[str], node_id: str) -> List[str]:
         unique: List[str] = []
@@ -263,28 +309,36 @@ remaining graph, and report the skipped node as recovery feedback for Critic."""
         return unique
 
     @staticmethod
-    def _node_skipped_diagnostic(
-        node: Dict[str, Any],
+    def _nodes_skipped_diagnostic(
+        nodes: List[Dict[str, Any]],
         original_error: str,
         recovered_graph: Dict[str, Any],
     ) -> Dict[str, Any]:
-        problem_node = {"id": node.get("id"), "operation": node.get("operation")}
+        problem_nodes = [
+            {"id": node.get("id"), "operation": node.get("operation")}
+            for node in nodes
+        ]
+        if len(problem_nodes) == 1:
+            summary = (
+                f"Node '{problem_nodes[0].get('id')}' ({problem_nodes[0].get('operation')}) "
+                "failed during training, so Engineer skipped it and retrained the remaining graph."
+            )
+        else:
+            skipped = ", ".join(
+                f"'{node.get('id')}' ({node.get('operation')})" for node in problem_nodes
+            )
+            summary = (
+                f"Optional nodes {skipped} failed during training, so Engineer skipped them "
+                "and retrained the remaining graph."
+            )
         return {
             "agent": "Engineer",
             "kind": "node_skipped_after_runtime_error",
-            "summary": (
-                f"Node '{node.get('id')}' ({node.get('operation')}) failed during training, "
-                "so Engineer skipped it and retrained the remaining graph."
-            ),
+            "summary": summary,
             "technical_message": original_error[:2000],
-            "failed_nodes": [problem_node],
-            "problem_nodes": [problem_node],
+            "failed_nodes": problem_nodes,
+            "problem_nodes": problem_nodes,
             "effective_graph": recovered_graph,
-            "suggested_mutations": [{"type": "remove", "node_id": node.get("id")}],
-            "recommendations": [
-                "Critic should decide whether Architect removes this node permanently or replaces it with a safer alternative.",
-                "If the dataset contains missing values, prefer explicit imputation before adding preprocessing transforms.",
-            ],
             "recoverable": True,
             "recovered": True,
         }

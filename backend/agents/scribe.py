@@ -1,12 +1,12 @@
-"""Scribe: turns a MAFIS evaluation into a compact final report."""
+"""Scribe: asks the LLM to turn evaluation facts into a report."""
 
+import json
 import logging
 from typing import Any, Dict, List
 
-import json
-
-from .base_agent import BaseAgent
+from .base_agent import BaseAgent, extract_json_block
 from .schemas import DataContext, ScribeReport
+from .structured import parse_scribe_report_object
 
 logger = logging.getLogger("Scribe")
 
@@ -17,15 +17,19 @@ class Scribe(BaseAgent):
     ALLOWED_TOOLS = ["generate_report"]
 
     SYSTEM_PROMPT = """You are the Scribe Agent for MultiAgentFedot.IndustrialSystem (MAFIS).
-Write a concise technical report from the approved graph evaluation summary.
-Return JSON only:
+Write a concise technical report from the provided factual evaluation payload.
+
+Return one strict JSON object:
 {
   "title": "...",
   "summary": "...",
   "methodology": "...",
   "results": "...",
   "recommendations": ["..."]
-}"""
+}
+
+Use only facts present in the payload. Do not invent metrics, causes, or
+recommendations. Return JSON only."""
 
     def __init__(self, name: str = "Scribe", mcp_client=None):
         super().__init__(name=name, mcp_client=mcp_client)
@@ -42,71 +46,36 @@ Return JSON only:
             if not isinstance(tool_report, dict):
                 tool_report = {}
 
-            llm_report: Dict[str, Any] = {}
-            best_score = tool_report.get("best_score", 0)
-            n_evaluations = tool_report.get("n_evaluations", tool_report.get("n_iterations", len(all_iterations)))
-
-            report.title = llm_report.get("title") or f"MAFIS report: {data_context.task_type}"
-            report.summary = llm_report.get("summary") or (
-                f"Completed {n_evaluations} approved graph evaluation(s). Best test score: {best_score:.4f}."
+            payload = {
+                "task_type": data_context.task_type,
+                "primary_metric": data_context.primary_metric,
+                "data_profile": data_context.profile,
+                "tool_report": tool_report,
+                "iterations": all_iterations,
+            }
+            response = await self.call_llm(
+                "Write the report JSON for this payload:\n"
+                f"{json.dumps(payload, ensure_ascii=False)}",
+                max_rounds=1,
+                use_tools=False,
             )
-            report.methodology = llm_report.get("methodology") or (
-                "Architect prepared a graph, Engineer trained the approved graph, "
-                "and Critic evaluated graph quality using metrics, validation stability, diagnostics and data profile."
-            )
-            report.results = llm_report.get("results") or self._default_results(tool_report)
-            report.recommendations = llm_report.get("recommendations") or self._default_recommendations(all_iterations)
+            raw_text = response.get("full_response", "") or response.get("error", "")
+            parsed = extract_json_block(raw_text)
+            llm_report = parse_scribe_report_object(parsed) if parsed else None
+            if llm_report:
+                report.title = llm_report.title
+                report.summary = llm_report.summary
+                report.methodology = llm_report.methodology
+                report.results = llm_report.results
+                report.recommendations = llm_report.recommendations
             report.best_graph_mermaid = tool_report.get("best_graph_mermaid", "")
-            report.full_response = json.dumps(llm_report, ensure_ascii=False) if llm_report else json.dumps(tool_report, ensure_ascii=False)
+            report.full_response = raw_text
             report.tool_calls = self.get_tool_calls()
             logger.info("[Scribe] report ready")
             return report
 
         except Exception as exc:
             logger.exception("[Scribe] failed")
-            report.title = "MAFIS report"
-            report.summary = f"Report generation failed: {exc}"
-            report.recommendations = ["Review backend logs and rerun the orchestration"]
+            report.full_response = str(exc)
             report.tool_calls = self.get_tool_calls()
             return report
-
-    @staticmethod
-    def _default_results(tool_report: Dict[str, Any]) -> str:
-        summaries = tool_report.get("evaluation_summaries", tool_report.get("iteration_summaries", []))
-        if not summaries:
-            return "No successful evaluation summaries were produced."
-        lines = [
-            f"Evaluation {item.get('iteration')}: "
-            f"{item.get('primary_metric') or 'score'}={Scribe._fmt(item.get('primary_metric_value', item.get('graph_score', 0)))}, "
-            f"ranking_score={Scribe._fmt(item.get('graph_score', 0))}, "
-            f"decision={item.get('winner', 'n/a')}"
-            for item in summaries
-        ]
-        return "\n".join(lines)
-
-    @staticmethod
-    def _fmt(value: Any) -> str:
-        try:
-            return f"{float(value):.4f}"
-        except (TypeError, ValueError):
-            return str(value)
-
-    @staticmethod
-    def _default_recommendations(iterations: List[Dict[str, Any]]) -> List[str]:
-        if not iterations:
-            return ["Run at least one approved graph evaluation"]
-        last = iterations[-1].get("critic", {})
-        diagnostics = []
-        diagnostics.extend(iterations[-1].get("engineer", {}).get("diagnostics", []) or [])
-        diagnostics.extend(last.get("diagnostics", []) or [])
-        recommendations = []
-        for diagnostic in diagnostics:
-            for rec in diagnostic.get("recommendations", []) or []:
-                if rec not in recommendations:
-                    recommendations.append(rec)
-        if recommendations:
-            return recommendations[:4]
-        suggestions = last.get("suggested_mutations", [])
-        if suggestions:
-            return ["Review the final Critic mutations before approving a new graph", "Use explicit node parameters for manual refinement"]
-        return ["Export and validate the best graph on a held-out dataset"]

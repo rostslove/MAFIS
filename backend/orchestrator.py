@@ -143,6 +143,13 @@ async def run_orchestration_stream(
                         prev_feedback=prev_feedback,
                         prev_graph=prev_graph,
                     )
+                if not architect_result.graph:
+                    yield _event(
+                        "error",
+                        message="Architect LLM did not produce a valid graph proposal.",
+                        diagnostics=architect_result.diagnostics,
+                    )
+                    return
                 yield _event(
                     "agent_done",
                     agent="Architect",
@@ -360,6 +367,13 @@ async def propose_architecture(
             prev_feedback=feedback,
             prev_graph=current_graph,
         )
+        if not result.graph:
+            return {
+                "error": "Architect LLM did not produce a valid graph proposal.",
+                "profile": profile,
+                "diagnostics": result.diagnostics,
+                "tool_calls": [tc.to_dict() for tc in result.tool_calls],
+            }
         return {
             "profile": profile,
             "graph": result.graph,
@@ -386,10 +400,9 @@ async def propose_revision_from_critic(
 ) -> Dict[str, Any]:
     """Create a new draft graph from explicit Critic feedback; user must approve it.
 
-    Critic mutations are alternatives, not a sequence. ``selected_mutations`` lets
-    the frontend pass the subset the user picked via checkboxes. If omitted, only
-    the first suggested mutation is applied to avoid combining incompatible
-    alternatives (e.g. xgboost-only params plus a replace to rf)."""
+    ``selected_mutations`` lets the frontend pass the subset the user picked via
+    checkboxes. Architect receives those mutations as LLM context and returns the
+    revised graph; this function no longer revises the graph itself."""
     csv_path = normalize_csv_path(csv_path)
     if task_type not in SUPPORTED_TASKS:
         return {"error": f"Unknown task type: {task_type}"}
@@ -400,35 +413,11 @@ async def propose_revision_from_critic(
     if not ok:
         return {"error": f"Current graph is invalid: {validation_message}"}
 
-    all_mutations = critic_feedback.get("suggested_mutations", []) or []
-    if selected_mutations is not None:
-        mutations = [m for m in selected_mutations if isinstance(m, dict)]
-    else:
-        mutations = all_mutations[:1]
-    draft = graph
-    applied = []
-    for mutation in mutations:
-        try:
-            candidate = draft.apply_mutation(mutation)
-            ok, _ = candidate.validate()
-            if ok:
-                draft = candidate
-                applied.append(mutation)
-        except Exception:
-            logger.exception("Failed to apply mutation %s", mutation)
-
-    if applied:
-        return {
-            "profile": profile,
-            "graph": draft.to_dict(),
-            "mermaid": draft.to_mermaid(),
-            "analysis": "Architect drafted a new graph by applying Critic feedback. It is not approved yet.",
-            "reasoning": _revision_reasoning(critic_feedback, applied, message),
-            "diagnostics": [],
-            "applied_mutations": applied,
-            "requires_approval": True,
-            "tool_calls": [],
-        }
+    selected_feedback_mutations = (
+        [m for m in selected_mutations if isinstance(m, dict)]
+        if selected_mutations is not None
+        else critic_feedback.get("suggested_mutations", []) or []
+    )
 
     data_context = DataContext(
         csv_path=csv_path,
@@ -443,7 +432,7 @@ async def propose_revision_from_critic(
         assessment=critic_feedback.get("assessment", ""),
         strengths=critic_feedback.get("strengths", []) or [],
         weaknesses=critic_feedback.get("weaknesses", []) or [],
-        suggested_mutations=[],
+        suggested_mutations=selected_feedback_mutations,
         improvement_plan=critic_feedback.get("improvement_plan", []) or [],
         should_stop=False,
     )
@@ -459,24 +448,21 @@ async def propose_revision_from_critic(
             prev_feedback=feedback,
             prev_graph=current_graph,
         )
-        revised_graph = result.graph
-        heuristic_applied = []
-        if _same_graph(revised_graph, current_graph):
-            heuristic_mutation = _heuristic_revision_mutation(graph, profile, critic_feedback)
-            if heuristic_mutation:
-                candidate = graph.apply_mutation(heuristic_mutation)
-                ok, _ = candidate.validate()
-                if ok:
-                    revised_graph = candidate.to_dict()
-                    heuristic_applied.append(heuristic_mutation)
+        if not result.graph:
+            return {
+                "error": "Architect LLM did not produce a valid revised graph proposal.",
+                "profile": profile,
+                "diagnostics": result.diagnostics,
+                "tool_calls": [tc.to_dict() for tc in result.tool_calls],
+            }
         return {
             "profile": profile,
-            "graph": revised_graph,
-            "mermaid": PipelineGraph.from_dict(revised_graph).to_mermaid(),
-            "analysis": "Architect drafted a revised graph from Critic feedback. It is not approved yet.",
-            "reasoning": result.reasoning or _revision_reasoning(critic_feedback, heuristic_applied, message),
+            "graph": result.graph,
+            "mermaid": result.mermaid or PipelineGraph.from_dict(result.graph).to_mermaid(),
+            "analysis": result.analysis,
+            "reasoning": result.reasoning,
             "diagnostics": result.diagnostics,
-            "applied_mutations": heuristic_applied,
+            "applied_mutations": selected_feedback_mutations,
             "requires_approval": True,
             "tool_calls": [tc.to_dict() for tc in result.tool_calls],
         }
@@ -486,84 +472,11 @@ async def propose_revision_from_critic(
         await mcp_client.cleanup()
 
     return {
+        "error": "Architect revision proposal failed.",
         "profile": profile,
-        "graph": graph.to_dict(),
-        "mermaid": graph.to_mermaid(),
-        "analysis": "Critic did not provide a valid structural mutation, so Architect kept the current graph as the draft.",
-        "reasoning": _revision_reasoning(critic_feedback, [], message),
         "diagnostics": [],
-        "applied_mutations": [],
-        "requires_approval": True,
         "tool_calls": [],
     }
-
-
-def _revision_reasoning(critic_feedback: Dict[str, Any], applied: list, message: str = "") -> str:
-    parts = []
-    assessment = critic_feedback.get("assessment")
-    if assessment:
-        parts.append(f"Critic assessment: {assessment}")
-    plan = critic_feedback.get("improvement_plan", []) or []
-    if plan:
-        parts.append("Improvement plan: " + " ".join(str(item) for item in plan[:4]))
-    parts.append(f"Applied mutations: {applied}")
-    if message:
-        parts.append(f"User note: {message}")
-    return "\n".join(parts)
-
-
-def _same_graph(left: Dict[str, Any], right: Dict[str, Any]) -> bool:
-    return json.dumps(left or {}, sort_keys=True) == json.dumps(right or {}, sort_keys=True)
-
-
-def _heuristic_revision_mutation(
-    graph: PipelineGraph,
-    profile: Dict[str, Any],
-    critic_feedback: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
-    if graph.task_type != "classification":
-        return None
-    root_id = graph.root_id()
-    root = next((node for node in graph.nodes if node.id == root_id), None)
-    if root is None:
-        return None
-    feedback_text = " ".join(
-        str(item)
-        for item in [
-            critic_feedback.get("assessment", ""),
-            *(critic_feedback.get("weaknesses", []) or []),
-            *(critic_feedback.get("improvement_plan", []) or []),
-        ]
-    ).lower()
-    wants_balance = profile.get("is_imbalanced") or "imbalance" in feedback_text or "class weight" in feedback_text
-    wants_regularization = "variance" in feedback_text or "regularization" in feedback_text
-
-    params: Dict[str, Any] = {}
-    if wants_balance:
-        try:
-            ratio = float(profile.get("imbalance_ratio") or 0)
-        except (TypeError, ValueError):
-            ratio = 0
-        weight = round(min(max(1.0 / ratio, 1.0), 20.0), 3) if ratio else 3.0
-        if root.operation == "xgboost":
-            params["scale_pos_weight"] = weight
-        elif root.operation in ("rf", "logit", "lgbm", "dt"):
-            params["class_weight"] = "balanced"
-            if root.operation == "logit":
-                params["max_iter"] = 1000
-
-    if wants_regularization:
-        params.update({
-            "xgboost": {"max_depth": 3, "learning_rate": 0.05, "n_estimators": 200},
-            "rf": {"max_depth": 8, "n_estimators": 300},
-            "logit": {"C": 0.5, "max_iter": 1000},
-            "lgbm": {"num_leaves": 31, "learning_rate": 0.05, "n_estimators": 200},
-            "dt": {"max_depth": 6},
-        }.get(root.operation, {}))
-
-    if params:
-        return {"type": "set_params", "node_id": root_id, "params": params}
-    return None
 
 
 def mutate_graph_locally(graph: Dict[str, Any], mutation: Dict[str, Any]) -> Dict[str, Any]:

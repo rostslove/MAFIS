@@ -773,8 +773,7 @@ def architect_tab(config: Dict[str, Any]) -> None:
             placeholder="Example: prefer a simpler linear model, use frequency features for a signal task, or keep the graph conservative.",
             height=110,
         )
-        ask_col, default_col = st.columns(2)
-        if ask_col.button("Ask Architect", type="primary", use_container_width=True, key="architect_ask"):
+        if st.button("Ask Architect", type="primary", use_container_width=True, key="architect_ask"):
             try:
                 payload = current_payload(
                     {
@@ -788,22 +787,6 @@ def architect_tab(config: Dict[str, Any]) -> None:
                 st.success("Architect proposed a graph.")
             except Exception as exc:
                 st.error(f"Architect failed: {exc}")
-
-        if default_col.button("Use Reliable Default", use_container_width=True, key="architect_use_default"):
-            graph = {
-                "task_type": task_type,
-                "nodes": config.get("default_graphs", {}).get(task_type, []),
-            }
-            set_graph(
-                {
-                    "graph": graph,
-                    "analysis": "Reliable default graph selected without an LLM call.",
-                    "reasoning": "This graph is intentionally small so Engineer can first verify that the data format and target are trainable.",
-                    "diagnostics": [],
-                }
-            )
-            st.session_state.architect_tool_calls = []
-            st.success("Default graph selected.")
 
     with col_right:
         status = "approved" if st.session_state.get("graph_approved") else "draft"
@@ -1138,10 +1121,18 @@ def render_critic_feedback(critic: Dict[str, Any], compact_runtime_error: bool =
         for item in critic["improvement_plan"]:
             st.write(f"- {item}")
     if critic.get("suggested_mutations"):
-        st.write(
-            "Concrete mutations for Architect (alternatives - pick the ones you want applied; "
-            "combining incompatible ones may produce an invalid graph)"
+        recovery_remove_mode = compact_runtime_error or any(
+            isinstance(item, dict)
+            and item.get("kind") in {"node_skipped_after_runtime_error", "node_skip_recovery_failed"}
+            for item in (critic.get("diagnostics", []) or [])
         )
+        if recovery_remove_mode:
+            st.write("Concrete recovery mutations for Architect")
+        else:
+            st.write(
+                "Concrete mutations for Architect (alternatives - pick the ones you want applied; "
+                "combining incompatible ones may produce an invalid graph)"
+            )
         rows = mutation_rows(critic["suggested_mutations"])
         for idx, (mutation, row) in enumerate(zip(critic["suggested_mutations"], rows)):
             label = f"**{row['action']}** `{row['node']}`"
@@ -1149,7 +1140,8 @@ def render_critic_feedback(critic: Dict[str, Any], compact_runtime_error: bool =
                 label += f" -> `{row['target']}`"
             if row.get("details"):
                 label += f" - {row['details']}"
-            st.checkbox(label, value=(idx == 0), key=f"critic_mut_{idx}")
+            default_selected = mutation.get("type") == "remove" if recovery_remove_mode else idx == 0
+            st.checkbox(label, value=default_selected, key=f"critic_mut_{idx}")
 
     if not compact_runtime_error:
         render_diagnostics(critic.get("diagnostics", []), "Critic diagnostics", use_expander=False)

@@ -373,7 +373,7 @@ def _target_info(csv_path: str, target_column: str, task_type: str) -> Dict[str,
 
 @mcp.tool()
 def get_data_profile(csv_path: str, target_column: str, task_type: str = "classification") -> str:
-    """Profile a CSV: returns JSON with n_samples, n_features, issues, recommendations."""
+    """Profile a CSV: returns factual dataset shape, target distribution and issues."""
     try:
         csv_path = normalize_csv_path(csv_path)
         df = pd.read_csv(csv_path)

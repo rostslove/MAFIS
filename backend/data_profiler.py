@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from typing import Dict, Any, List
+from typing import Dict, Any
 from enum import Enum
 
 
@@ -145,7 +145,6 @@ class DataProfiler:
             issues.append("frequent_outliers")
 
         profile["issues"] = issues if issues else ["none"]
-        profile["recommendations"] = DataProfiler._generate_recommendations(profile)
 
         return profile
 
@@ -153,35 +152,3 @@ class DataProfiler:
     def _infer_task_type(y) -> str:
         unique_count = len(np.unique(y))
         return TaskType.CLASSIFICATION.value if unique_count < 20 else TaskType.REGRESSION.value
-
-    @staticmethod
-    def _generate_recommendations(profile: Dict) -> List[str]:
-        recommendations = []
-        issues = profile.get("issues", [])
-
-        for issue in issues:
-            if "missing_values" in issue:
-                recommendations.append("Handle missing values (imputation or removal)")
-            if "class_imbalance" in issue:
-                recommendations.append("Use SMOTE or class_weight balancing")
-            if "feature_scaling" in issue:
-                recommendations.append("Apply StandardScaler or RobustScaler")
-            if "small_dataset" in issue:
-                recommendations.append("Use regularization, avoid complex models")
-            if "large_dataset" in issue:
-                recommendations.append("Consider sampling or distributed training")
-            if "high_dimensionality" in issue:
-                recommendations.append("Apply PCA or feature selection")
-            if "skewed_features" in issue:
-                recommendations.append("Apply log/Box-Cox transform or use tree-based models")
-            if "multicollinearity" in issue:
-                recommendations.append("Drop correlated features or use regularized models (ridge/lasso)")
-            if "high_cardinality_categoricals" in issue:
-                recommendations.append("Use target/frequency encoding for high-cardinality categoricals")
-            if "frequent_outliers" in issue:
-                recommendations.append("Use RobustScaler or tree-based models tolerant to outliers")
-
-        if profile.get("sample_feature_ratio", 0) < 10:
-            recommendations.append("Low sample-to-feature ratio: prefer simpler models")
-
-        return recommendations

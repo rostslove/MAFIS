@@ -70,6 +70,108 @@ class GraphProposalObject(BaseModel):
         return "" if value is None else str(value).strip()
 
 
+class CriticMutationObject(BaseModel):
+    type: str
+    node_id: Optional[str] = None
+    new_operation: Optional[str] = None
+    node: Optional[GraphNodeObject] = None
+    params: Dict[str, Any] = Field(default_factory=dict)
+    strategy: Optional[Dict[str, Any]] = None
+    rewire_input_of: Optional[str] = None
+    input_id: Optional[str] = None
+
+    @validator("type")
+    def allowed_type(cls, value: str) -> str:
+        value = value.strip()
+        allowed = {"remove", "replace", "add", "set_params", "set_strategy", "clear_strategy", "connect"}
+        if value not in allowed:
+            raise ValueError(f"unsupported mutation type: {value}")
+        return value
+
+    @validator("node_id", "new_operation", "rewire_input_of", "input_id", pre=True, always=True)
+    def optional_string(cls, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    def as_mutation_dict(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"type": self.type}
+        if self.node_id:
+            payload["node_id"] = self.node_id
+        if self.new_operation:
+            payload["new_operation"] = self.new_operation
+        if self.node is not None:
+            payload["node"] = self.node.dict()
+        if self.params:
+            payload["params"] = self.params
+        if self.strategy:
+            payload["strategy"] = self.strategy
+        if self.rewire_input_of:
+            payload["rewire_input_of"] = self.rewire_input_of
+        if self.input_id:
+            payload["input_id"] = self.input_id
+        return payload
+
+
+class CriticFeedbackObject(BaseModel):
+    assessment: str = ""
+    strengths: List[str] = Field(default_factory=list)
+    weaknesses: List[str] = Field(default_factory=list)
+    suggested_mutations: List[CriticMutationObject] = Field(default_factory=list)
+    improvement_plan: List[str] = Field(default_factory=list)
+    should_stop: bool = False
+
+    @validator("assessment", pre=True, always=True)
+    def stringify_assessment(cls, value: Any) -> str:
+        return "" if value is None else str(value).strip()
+
+    @validator("strengths", "weaknesses", "improvement_plan", pre=True, always=True)
+    def string_list(cls, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, list):
+            raise ValueError("must be a list of strings")
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    @validator("suggested_mutations", pre=True, always=True)
+    def mutation_list(cls, value: Any) -> List[Any]:
+        if value is None:
+            return []
+        if isinstance(value, dict):
+            return [value]
+        if not isinstance(value, list):
+            raise ValueError("suggested_mutations must be a list")
+        return [item for item in value if isinstance(item, dict)]
+
+    def mutations_as_dicts(self) -> List[Dict[str, Any]]:
+        return [mutation.as_mutation_dict() for mutation in self.suggested_mutations]
+
+
+class ScribeReportObject(BaseModel):
+    title: str = ""
+    summary: str = ""
+    methodology: str = ""
+    results: str = ""
+    recommendations: List[str] = Field(default_factory=list)
+
+    @validator("title", "summary", "methodology", "results", pre=True, always=True)
+    def stringify_text(cls, value: Any) -> str:
+        return "" if value is None else str(value).strip()
+
+    @validator("recommendations", pre=True, always=True)
+    def recommendation_list(cls, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, list):
+            raise ValueError("recommendations must be a list")
+        return [str(item).strip() for item in value if str(item).strip()]
+
+
 class ToolCallObject(BaseModel):
     name: str
     arguments: Dict[str, Any] = Field(default_factory=dict)
@@ -153,5 +255,19 @@ def parse_tool_call_object(payload: Any) -> ToolCallObject | None:
 def parse_graph_proposal_object(payload: Any) -> GraphProposalObject | None:
     try:
         return GraphProposalObject.parse_obj(payload)
+    except ValidationError:
+        return None
+
+
+def parse_critic_feedback_object(payload: Any) -> CriticFeedbackObject | None:
+    try:
+        return CriticFeedbackObject.parse_obj(payload)
+    except ValidationError:
+        return None
+
+
+def parse_scribe_report_object(payload: Any) -> ScribeReportObject | None:
+    try:
+        return ScribeReportObject.parse_obj(payload)
     except ValidationError:
         return None

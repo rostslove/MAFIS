@@ -44,7 +44,7 @@ AGENT_TOOLS = {
 }
 
 TOOL_DESCRIPTIONS = {
-    "get_data_profile": "Profile dataset shape, target distribution, issues and recommendations",
+    "get_data_profile": "Profile dataset shape, target distribution and factual data issues",
     "get_available_operations": "Return atomic graph operations allowed for a task type",
     "propose_graph": "Validate a graph candidate and return Mermaid markup",
     "mutate_graph": "Apply add/remove/replace/set_params/connect mutations to a graph",
