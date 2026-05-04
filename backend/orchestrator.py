@@ -9,7 +9,7 @@ import pandas as pd
 
 from agents import Architect, ArchitectResult, Critic, CriticFeedback, DataContext, Engineer, EngineerResult, IterationRecord, Scribe
 from data_profiler import DataProfiler
-from graph_engine import SUPPORTED_TASKS, PipelineGraph, diagnose_runtime_error, is_ts_task
+from graph_engine import SUPPORTED_TASKS, PipelineGraph, is_ts_task
 from mcp_client import MCPToolClient
 from path_utils import describe_missing_csv, normalize_csv_path
 
@@ -436,20 +436,17 @@ async def propose_revision_from_critic(
         mutations = [m for m in selected_mutations if isinstance(m, dict)]
     else:
         mutations = all_mutations[:1]
-    diagnostics = []
     draft = graph
     applied = []
     for mutation in mutations:
         try:
             candidate = draft.apply_mutation(mutation)
-            ok, validation_message = candidate.validate()
+            ok, _ = candidate.validate()
             if ok:
                 draft = candidate
                 applied.append(mutation)
-            else:
-                diagnostics.append(diagnose_runtime_error(validation_message, task_type=task_type, graph=candidate))
-        except Exception as exc:
-            diagnostics.append(diagnose_runtime_error(exc, task_type=task_type, graph=draft))
+        except Exception:
+            logger.exception("Failed to apply mutation %s", mutation)
 
     if applied:
         return {
@@ -458,7 +455,7 @@ async def propose_revision_from_critic(
             "mermaid": draft.to_mermaid(),
             "analysis": "Architect drafted a new graph by applying Critic feedback. It is not approved yet.",
             "reasoning": _revision_reasoning(critic_feedback, applied, message),
-            "diagnostics": diagnostics,
+            "diagnostics": [],
             "applied_mutations": applied,
             "requires_approval": True,
             "tool_calls": [],
@@ -499,26 +496,23 @@ async def propose_revision_from_critic(
             heuristic_mutation = _heuristic_revision_mutation(graph, profile, critic_feedback)
             if heuristic_mutation:
                 candidate = graph.apply_mutation(heuristic_mutation)
-                ok, validation_message = candidate.validate()
+                ok, _ = candidate.validate()
                 if ok:
                     revised_graph = candidate.to_dict()
                     heuristic_applied.append(heuristic_mutation)
-                else:
-                    diagnostics.append(diagnose_runtime_error(validation_message, task_type=task_type, graph=candidate))
         return {
             "profile": profile,
             "graph": revised_graph,
             "mermaid": PipelineGraph.from_dict(revised_graph).to_mermaid(),
             "analysis": "Architect drafted a revised graph from Critic feedback. It is not approved yet.",
             "reasoning": result.reasoning or _revision_reasoning(critic_feedback, heuristic_applied, message),
-            "diagnostics": diagnostics + result.diagnostics,
+            "diagnostics": result.diagnostics,
             "applied_mutations": heuristic_applied,
             "requires_approval": True,
             "tool_calls": [tc.to_dict() for tc in result.tool_calls],
         }
-    except Exception as exc:
+    except Exception:
         logger.exception("Architect revision proposal failed")
-        diagnostics.append(diagnose_runtime_error(exc, task_type=task_type, graph=graph))
     finally:
         await mcp_client.cleanup()
 
@@ -528,7 +522,7 @@ async def propose_revision_from_critic(
         "mermaid": graph.to_mermaid(),
         "analysis": "Critic did not provide a valid structural mutation, so Architect kept the current graph as the draft.",
         "reasoning": _revision_reasoning(critic_feedback, [], message),
-        "diagnostics": diagnostics,
+        "diagnostics": [],
         "applied_mutations": [],
         "requires_approval": True,
         "tool_calls": [],
@@ -607,13 +601,11 @@ def mutate_graph_locally(graph: Dict[str, Any], mutation: Dict[str, Any]) -> Dic
     pipeline_graph = PipelineGraph.from_dict(graph)
     mutated = pipeline_graph.apply_mutation(mutation)
     ok, message = mutated.validate()
-    diagnostics = [] if ok else [diagnose_runtime_error(message, task_type=mutated.task_type, graph=mutated)]
     return {
         "valid": ok,
         "message": message,
         "graph": mutated.to_dict(),
         "mermaid": mutated.to_mermaid() if ok else "",
-        "diagnostics": diagnostics,
     }
 
 

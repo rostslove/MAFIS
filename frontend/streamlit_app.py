@@ -572,6 +572,18 @@ def mutate_graph(mutation: Dict[str, Any]) -> None:
         st.error(f"Mutation failed: {exc}")
 
 
+def update_node(node_id: str, current_operation: str, new_operation: str, params: Dict[str, Any]) -> None:
+    if new_operation != current_operation:
+        mutate_graph({
+            "type": "replace",
+            "node_id": node_id,
+            "new_operation": new_operation,
+            "params": params,
+        })
+    else:
+        mutate_graph({"type": "set_params", "node_id": node_id, "params": params})
+
+
 def stream_run(payload: Dict[str, Any]) -> None:
     log_box = st.empty()
     progress = st.progress(0)
@@ -815,8 +827,10 @@ def graph_editor_tab(config: Dict[str, Any]) -> None:
     operations = config.get("operations", {}).get(task_type, {})
     preprocessing_ops = operations.get("preprocessing", [])
     model_ops = operations.get("models", [])
-    node_ids = [node.get("id") for node in graph.get("nodes", [])]
     root_id = root_node_id(graph)
+    nodes = graph.get("nodes", [])
+    current_model = next((node for node in nodes if node.get("id") == root_id), {})
+    preprocessing_nodes = [node for node in nodes if node.get("id") != root_id]
 
     status_col, approve_col, discard_col = st.columns([2, 1, 1])
     status_col.caption("Approved" if st.session_state.get("graph_approved") else "Draft")
@@ -843,107 +857,130 @@ def graph_editor_tab(config: Dict[str, Any]) -> None:
                 st.write(st.session_state.architect_reasoning)
 
     with edit_tab:
-        st.write("Training Strategy")
-        available_strategies = config.get("training_strategies", {}).get(task_type, []) or []
-        current_strategy = graph.get("training_strategy") or {}
-        strategy_names = ["direct graph"] + [item.get("name", "") for item in available_strategies]
-        current_name = current_strategy.get("name") or "direct graph"
-        current_index = strategy_names.index(current_name) if current_name in strategy_names else 0
-        selected_strategy = st.selectbox(
-            "Execution mode",
-            strategy_names,
-            index=current_index,
-            key=f"strategy_execution_mode_{current_name}",
-        )
-        selected_spec = next((item for item in available_strategies if item.get("name") == selected_strategy), {})
-        render_strategy_selection_details(selected_strategy, selected_spec)
-        with st.form("training_strategy_form"):
-            default_params = selected_spec.get("default_params", {}) or {}
-            shown_params = current_strategy.get("params", {}) if selected_strategy == current_name else default_params
-            params_text = st.text_area(
-                "Strategy params",
-                value=json.dumps(shown_params or {}, ensure_ascii=False, indent=2),
-                height=110,
-                disabled=selected_strategy == "direct graph",
-            )
-            strategy_submitted = st.form_submit_button("Apply Training Strategy")
-            if strategy_submitted:
-                if selected_strategy == "direct graph":
-                    mutate_graph({"type": "clear_strategy"})
-                else:
-                    try:
-                        params = json.loads(params_text or "{}")
-                        mutate_graph({"type": "set_strategy", "strategy": {"name": selected_strategy, "params": params}})
-                    except json.JSONDecodeError as exc:
-                        st.error(f"Invalid strategy params: {exc}")
+        preprocessing_col, model_col = st.columns([1, 1])
 
-        st.divider()
-        model_col, params_col = st.columns([1, 1])
+        with preprocessing_col:
+            st.write("Preprocessing")
+            if preprocessing_nodes:
+                selected_options = [node.get("id", "") for node in preprocessing_nodes]
+                selected_id = st.selectbox("Node", selected_options, key="preprocessing_editor_node")
+                current_preprocessing = next(
+                    (node for node in preprocessing_nodes if node.get("id") == selected_id),
+                    preprocessing_nodes[0],
+                )
+                available_preprocessing_ops = preprocessing_ops or [current_preprocessing.get("operation", "")]
+                if current_preprocessing.get("operation") not in available_preprocessing_ops:
+                    available_preprocessing_ops = [current_preprocessing.get("operation", "")] + available_preprocessing_ops
+                with st.form("edit_preprocessing"):
+                    prep_index = available_preprocessing_ops.index(current_preprocessing.get("operation"))
+                    prep_op = st.selectbox("Operation", available_preprocessing_ops, index=prep_index)
+                    prep_params_text = st.text_area(
+                        "Parameters",
+                        value=json.dumps(current_preprocessing.get("params", {}) or {}, ensure_ascii=False, indent=2),
+                        height=100,
+                    )
+                    apply_prep, remove_prep = st.columns([1, 1])
+                    apply_clicked = apply_prep.form_submit_button("Apply")
+                    remove_clicked = remove_prep.form_submit_button("Remove")
+                    if apply_clicked:
+                        try:
+                            update_node(
+                                current_preprocessing.get("id", ""),
+                                current_preprocessing.get("operation", ""),
+                                prep_op,
+                                json.loads(prep_params_text or "{}"),
+                            )
+                        except json.JSONDecodeError as exc:
+                            st.error(f"Invalid preprocessing parameters: {exc}")
+                    if remove_clicked:
+                        mutate_graph({"type": "remove", "node_id": current_preprocessing.get("id", "")})
+            elif preprocessing_ops:
+                root_inputs = current_model.get("inputs", [])
+                with st.form("add_preprocessing"):
+                    new_id = st.text_input("Node id", value="preprocessing")
+                    prep_op = st.selectbox("Operation", preprocessing_ops, key="add_preprocessing_op")
+                    prep_params_text = st.text_area("Parameters", value="{}", height=100)
+                    add_clicked = st.form_submit_button("Add preprocessing")
+                    if add_clicked:
+                        try:
+                            params = json.loads(prep_params_text or "{}")
+                            mutate_graph({
+                                "type": "add",
+                                "node": {
+                                    "id": new_id,
+                                    "operation": prep_op,
+                                    "params": params,
+                                    "inputs": root_inputs,
+                                },
+                                "rewire_input_of": root_id,
+                            })
+                        except json.JSONDecodeError as exc:
+                            st.error(f"Invalid preprocessing parameters: {exc}")
+            else:
+                st.caption("No preprocessing operations are exposed for this task.")
+
         with model_col:
             st.write("Model")
-            if model_ops:
-                with st.form("replace_model"):
-                    current_model = next((node for node in graph.get("nodes", []) if node.get("id") == root_id), {})
-                    st.text_input("Model node", value=root_id, disabled=True)
-                    default_index = model_ops.index(current_model.get("operation")) if current_model.get("operation") in model_ops else 0
-                    new_op = st.selectbox("Model operation", model_ops, index=default_index, key="model_op")
-                    replace = st.form_submit_button("Replace Model")
-                    if replace:
-                        mutate_graph({"type": "replace", "node_id": root_id, "new_operation": new_op})
+            if model_ops and current_model:
+                available_model_ops = model_ops
+                if current_model.get("operation") not in available_model_ops:
+                    available_model_ops = [current_model.get("operation", "")] + available_model_ops
+                with st.form("edit_model"):
+                    st.text_input("Node id", value=root_id, disabled=True)
+                    model_index = available_model_ops.index(current_model.get("operation"))
+                    model_op = st.selectbox("Operation", available_model_ops, index=model_index, key="model_editor_op")
+                    model_params_text = st.text_area(
+                        "Parameters",
+                        value=json.dumps(current_model.get("params", {}) or {}, ensure_ascii=False, indent=2),
+                        height=100,
+                    )
+                    submitted = st.form_submit_button("Apply model")
+                    if submitted:
+                        try:
+                            update_node(
+                                root_id,
+                                current_model.get("operation", ""),
+                                model_op,
+                                json.loads(model_params_text or "{}"),
+                            )
+                        except json.JSONDecodeError as exc:
+                            st.error(f"Invalid model parameters: {exc}")
             else:
                 st.caption("No model operations returned by backend config.")
 
-        with params_col:
-            st.write("Parameters")
-            with st.form("params_node"):
-                node_id = st.selectbox("Node", node_ids, key="params_node_id")
-                current = next((node for node in graph.get("nodes", []) if node.get("id") == node_id), {})
+        with st.expander("Training strategy"):
+            available_strategies = config.get("training_strategies", {}).get(task_type, []) or []
+            current_strategy = graph.get("training_strategy") or {}
+            strategy_names = ["direct graph"] + [item.get("name", "") for item in available_strategies]
+            current_name = current_strategy.get("name") or "direct graph"
+            current_index = strategy_names.index(current_name) if current_name in strategy_names else 0
+            selected_strategy = st.selectbox(
+                "Execution mode",
+                strategy_names,
+                index=current_index,
+                key=f"strategy_execution_mode_{current_name}",
+            )
+            selected_spec = next((item for item in available_strategies if item.get("name") == selected_strategy), {})
+            render_strategy_selection_details(selected_strategy, selected_spec)
+            with st.form("training_strategy_form"):
+                default_params = selected_spec.get("default_params", {}) or {}
+                shown_params = current_strategy.get("params", {}) if selected_strategy == current_name else default_params
                 params_text = st.text_area(
-                    "Parameter object",
-                    value=json.dumps(current.get("params", {}) or {}, ensure_ascii=False, indent=2),
-                    height=130,
+                    "Parameters",
+                    value=json.dumps(shown_params or {}, ensure_ascii=False, indent=2),
+                    height=90,
+                    disabled=selected_strategy == "direct graph",
                 )
-                submitted = st.form_submit_button("Apply Parameters")
-                if submitted:
-                    try:
-                        params = json.loads(params_text or "{}")
-                        mutate_graph({"type": "set_params", "node_id": node_id, "params": params})
-                    except json.JSONDecodeError as exc:
-                        st.error(f"Invalid parameter object: {exc}")
-
-        st.divider()
-        insert_col, remove_col = st.columns([1, 1])
-        with insert_col:
-            st.write("Insert Before Model")
-            if preprocessing_ops:
-                root_node = next((node for node in graph.get("nodes", []) if node.get("id") == root_id), {})
-                old_inputs = root_node.get("inputs", [])
-                with st.form("insert_preprocessing"):
-                    new_id = st.text_input("Node id", value=f"prep_{len(node_ids) + 1}")
-                    new_op = st.selectbox("Preprocessing operation", preprocessing_ops, key="insert_op")
-                    submitted = st.form_submit_button("Insert")
-                    if submitted:
-                        mutate_graph(
-                            {
-                                "type": "add",
-                                "node": {"id": new_id, "operation": new_op, "params": {}, "inputs": old_inputs},
-                                "rewire_input_of": root_id,
-                            }
-                        )
-            else:
-                st.caption("No safe preprocessing operations are exposed for this task.")
-
-        with remove_col:
-            st.write("Remove Node")
-            removable = [node_id for node_id in node_ids if node_id != root_id]
-            if removable:
-                with st.form("remove_node"):
-                    node_id = st.selectbox("Preprocessing node", removable, key="remove_node_id")
-                    remove = st.form_submit_button("Remove Node")
-                    if remove:
-                        mutate_graph({"type": "remove", "node_id": node_id})
-            else:
-                st.caption("The graph currently has only the model node.")
+                strategy_submitted = st.form_submit_button("Apply strategy")
+                if strategy_submitted:
+                    if selected_strategy == "direct graph":
+                        mutate_graph({"type": "clear_strategy"})
+                    else:
+                        try:
+                            params = json.loads(params_text or "{}")
+                            mutate_graph({"type": "set_strategy", "strategy": {"name": selected_strategy, "params": params}})
+                        except json.JSONDecodeError as exc:
+                            st.error(f"Invalid strategy parameters: {exc}")
 
     with operations_tab:
         render_operation_catalog(config, task_type, "editor")

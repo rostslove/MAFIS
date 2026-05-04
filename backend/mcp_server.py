@@ -27,7 +27,7 @@ from sklearn.preprocessing import LabelEncoder
 from data_profiler import DataProfiler
 from graph_engine import (
     OPERATIONS, METRICS_BY_TASK, SUPPORTED_TASKS, DEFAULT_GRAPHS,
-    PipelineGraph, compute_metrics, diagnose_runtime_error, get_operation_catalog, get_training_strategies,
+    PipelineGraph, compute_metrics, get_operation_catalog, get_training_strategies,
     get_training_strategy_hints, is_ts_task,
     input_sample_count, load_input_data, slice_input_data, split_input_data,
 )
@@ -367,26 +367,6 @@ def _target_info(csv_path: str, target_column: str, task_type: str) -> Dict[str,
     return info
 
 
-def _failure_payload(error: Exception, task_type: str = "", graph: Optional[PipelineGraph] = None) -> Dict[str, Any]:
-    diagnostic = diagnose_runtime_error(error, task_type=task_type, graph=graph)
-    return {
-        "score": 0,
-        "error": str(error),
-        "diagnostics": [diagnostic],
-        "recommendations": diagnostic.get("recommendations", []),
-    }
-
-
-def _invalid_graph_payload(message: str, graph: PipelineGraph) -> Dict[str, Any]:
-    diagnostic = diagnose_runtime_error(message, task_type=graph.task_type, graph=graph)
-    return {
-        "score": 0,
-        "error": f"Invalid graph: {message}",
-        "diagnostics": [diagnostic],
-        "recommendations": diagnostic.get("recommendations", []),
-    }
-
-
 # ================================================================
 #                          DATA / OPERATIONS
 # ================================================================
@@ -435,13 +415,11 @@ def propose_graph(graph_json: str) -> str:
     try:
         graph = PipelineGraph.from_dict(json.loads(graph_json))
         ok, msg = graph.validate()
-        diagnostics = [] if ok else [diagnose_runtime_error(msg, task_type=graph.task_type, graph=graph)]
         return json.dumps({
             "valid": ok,
             "message": msg,
             "graph": graph.to_dict(),
             "mermaid": graph.to_mermaid() if ok else "",
-            "diagnostics": diagnostics,
         })
     except Exception as e:
         return json.dumps({"valid": False, "message": str(e), "graph": None})
@@ -455,13 +433,11 @@ def mutate_graph(graph_json: str, mutation_json: str) -> str:
         mutation = json.loads(mutation_json)
         new_graph = graph.apply_mutation(mutation)
         ok, msg = new_graph.validate()
-        diagnostics = [] if ok else [diagnose_runtime_error(msg, task_type=new_graph.task_type, graph=new_graph)]
         return json.dumps({
             "valid": ok,
             "message": msg,
             "graph": new_graph.to_dict(),
             "mermaid": new_graph.to_mermaid() if ok else "",
-            "diagnostics": diagnostics,
         })
     except Exception as e:
         return json.dumps({"valid": False, "message": str(e)})
@@ -496,7 +472,7 @@ def train_graph(
         graph = PipelineGraph.from_dict(json.loads(graph_json))
         ok, msg = graph.validate()
         if not ok:
-            return json.dumps(_invalid_graph_payload(msg, graph))
+            return json.dumps({"score": 0, "error": f"Invalid graph: {msg}"})
 
         ts = float(test_size) if test_size is not None else 0.2
         ts = min(max(ts, 0.05), 0.5)
@@ -541,7 +517,7 @@ def train_graph(
         })
     except Exception as e:
         logger.exception("train_graph failed")
-        return json.dumps(_failure_payload(e, task_type=getattr(locals().get("graph", None), "task_type", ""), graph=locals().get("graph")))
+        return json.dumps({"score": 0, "error": str(e)})
 
 
 @mcp.tool()
@@ -562,42 +538,16 @@ def tune_graph_hyperparameters(
         graph = PipelineGraph.from_dict(json.loads(graph_json))
         ok, msg = graph.validate()
         if not ok:
-            return json.dumps(_invalid_graph_payload(msg, graph))
+            return json.dumps({"score": 0, "error": f"Invalid graph: {msg}"})
 
         if graph.uses_training_strategy():
             payload = _train_strategy_graph(graph, csv_path, target_column, primary_metric, test_size)
-            payload.setdefault("diagnostics", []).append({
-                "agent": "Engineer",
-                "kind": "strategy_tuning_not_applicable",
-                "summary": "The selected training strategy owns AutoML branch search; node-level PipelineTuner was not applied.",
-                "technical_message": "federated_automl is executed through RAFEnsembler rather than a single PipelineGraph object.",
-                "recommendations": [
-                    "Tune strategy params such as timeout or n_splits, or switch back to direct graph execution for node-level tuning."
-                ],
-                "recoverable": True,
-            })
             return json.dumps(payload)
 
         if graph.task_type in ("classification", "ts_classification"):
-            diagnostic = {
-                "agent": "Engineer",
-                "kind": "tuning_skipped",
-                "summary": "Classification tuning skipped to avoid Fedot ROC-AUC metric tracebacks.",
-                "technical_message": (
-                    "Fedot.Industrial 0.5 tuner may evaluate binary ROC-AUC on a two-column probability matrix "
-                    "and print repeated internal ValueError tracebacks. Training the graph as-is is cleaner."
-                ),
-                "recommendations": [
-                    "Use train_graph for classification graphs.",
-                    "Let Critic inspect the trained graph and suggest model replacement or explicit parameters.",
-                ],
-                "recoverable": True,
-            }
             return json.dumps({
                 "score": 0,
                 "error": "tuning skipped for classification",
-                "diagnostics": [diagnostic],
-                "recommendations": diagnostic["recommendations"],
                 "target_info": _target_info(csv_path, target_column, graph.task_type),
             })
 
@@ -658,7 +608,7 @@ def tune_graph_hyperparameters(
         })
     except Exception as e:
         logger.exception("tune_graph_hyperparameters failed")
-        return json.dumps(_failure_payload(e, task_type=getattr(locals().get("graph", None), "task_type", ""), graph=locals().get("graph")))
+        return json.dumps({"score": 0, "error": str(e)})
 
 
 @mcp.tool()
@@ -676,25 +626,13 @@ def validate_graph(
         graph = PipelineGraph.from_dict(json.loads(graph_json))
         ok, msg = graph.validate()
         if not ok:
-            payload = _invalid_graph_payload(msg, graph)
-            return json.dumps({"error": payload["error"], "diagnostics": payload["diagnostics"], "recommendations": payload["recommendations"]})
+            return json.dumps({"error": f"Invalid graph: {msg}"})
 
         if graph.uses_training_strategy():
             return json.dumps({
                 "skipped": "Cross-validation for training strategies is skipped to avoid repeatedly running nested AutoML ensembles.",
                 "primary_metric": primary_metric,
                 "primary_score_direction": "higher_is_better",
-                "diagnostics": [{
-                    "agent": "Critic",
-                    "kind": "strategy_cv_skipped",
-                    "summary": "Strategy graph cross-validation was skipped because federated_automl already trains multiple AutoML branches.",
-                    "technical_message": "validate_graph avoids repeating RAFEnsembler for every CV fold.",
-                    "recommendations": [
-                        "Compare this strategy run against previous hold-out evaluations in Evaluation History.",
-                        "Use a smaller n_splits or lower timeout before enabling repeated validation."
-                    ],
-                    "recoverable": True,
-                }],
             })
 
         input_data = load_input_data(csv_path, target_column, graph.task_type, forecast_length)
@@ -728,8 +666,7 @@ def validate_graph(
         })
     except Exception as e:
         logger.exception("validate_graph failed")
-        payload = _failure_payload(e, task_type=getattr(locals().get("graph", None), "task_type", ""), graph=locals().get("graph"))
-        return json.dumps({"error": payload["error"], "diagnostics": payload["diagnostics"], "recommendations": payload["recommendations"]})
+        return json.dumps({"error": str(e)})
 
 
 # ================================================================
