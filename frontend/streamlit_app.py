@@ -33,6 +33,7 @@ METRIC_METADATA_KEYS = {
     "primary_score",
     "primary_score_direction",
 }
+ZERO_SCORE_FAILURE_METRICS = {"accuracy", "f1", "precision", "recall", "roc_auc"}
 
 
 def shared_data_dir() -> Path:
@@ -244,6 +245,13 @@ def decision_label(value: Any) -> str:
 
 def runtime_failure_details(engineer: Dict[str, Any], critic: Dict[str, Any]) -> Dict[str, Any]:
     error = str(engineer.get("graph_error") or "").strip()
+    finetune_error = str(engineer.get("finetune_error") or "").strip()
+    if not error and finetune_error:
+        metrics = engineer.get("test_metrics", {}) or engineer.get("graph_metrics", {}) or {}
+        primary_metric = str(metrics.get("primary_metric") or "").strip()
+        primary_value = metrics.get("primary_metric_value", engineer.get("graph_score", 0))
+        if primary_metric in ZERO_SCORE_FAILURE_METRICS and (_numeric_or_none(primary_value) or 0) <= 0:
+            error = f"Fedot.Industrial finetune failed: {finetune_error}"
     if not error:
         return {}
 
@@ -256,7 +264,9 @@ def runtime_failure_details(engineer: Dict[str, Any], critic: Dict[str, Any]) ->
             continue
         kind = str(diagnostic.get("kind") or "")
         technical = str(diagnostic.get("technical_message") or "")
-        if technical == error or kind.endswith("_error") or kind == "runtime_error":
+        if technical == error or kind.endswith("_error") or kind in {
+            "runtime_error", "node_skip_recovery_failed", "node_skipped_after_runtime_error",
+        }:
             selected = diagnostic
             break
     if not selected and diagnostics:
@@ -264,10 +274,36 @@ def runtime_failure_details(engineer: Dict[str, Any], critic: Dict[str, Any]) ->
 
     summary = str(selected.get("summary") or "").strip()
     technical = str(selected.get("technical_message") or error).strip()
+    if finetune_error and finetune_error not in technical:
+        technical = (
+            "Fedot.Industrial finetune error:\n"
+            f"{finetune_error}\n\n"
+            "Engineer error:\n"
+            f"{technical}"
+        )
     if not summary or summary == technical:
-        summary = "Training failed before metrics were produced."
+        # Build a more helpful summary instead of a generic "training failed"
+        if "finetune failed" in error.lower() or finetune_error:
+            summary = (
+                "Fedot.Industrial finetune raised an exception. "
+                "Engineer attempted node-skip recovery; if recovery did not converge, "
+                "the metrics below come from the direct-fit fallback path."
+            )
+        else:
+            summary = "Training did not complete cleanly. See technical details below."
     recommendations = unique_text(selected.get("recommendations", []) or [])
-    return {"summary": summary, "technical": technical, "recommendations": recommendations}
+    problem_nodes = selected.get("problem_nodes") or []
+    recovery_attempts = selected.get("recovery_attempts") or []
+    fallback_used = str(engineer.get("fallback_used") or "").strip()
+    return {
+        "summary": summary,
+        "technical": technical,
+        "recommendations": recommendations,
+        "problem_nodes": problem_nodes,
+        "recovery_attempts": recovery_attempts,
+        "finetune_error": finetune_error,
+        "fallback_used": fallback_used,
+    }
 
 
 def render_runtime_failure_once(iteration: Dict[str, Any]) -> bool:
@@ -278,14 +314,28 @@ def render_runtime_failure_once(iteration: Dict[str, Any]) -> bool:
         return False
 
     st.error(details["summary"])
+    fallback_used = details.get("fallback_used")
+    if fallback_used:
+        st.warning(
+            f"Engineer used the **{fallback_used}** path as a baseline; metrics shown below come from that fallback, not from a successful Fedot.Industrial finetune."
+        )
     recommendations = details.get("recommendations", []) or []
     if recommendations:
         st.write("Recovery suggestions")
         for recommendation in recommendations[:4]:
             st.write(f"- {recommendation}")
+    problem_nodes = details.get("problem_nodes") or []
+    if problem_nodes:
+        st.write("Problem nodes (Engineer tried to bypass these)")
+        st.dataframe(pd.DataFrame(problem_nodes), use_container_width=True, hide_index=True)
+    recovery_attempts = details.get("recovery_attempts") or []
+    if recovery_attempts:
+        with st.expander(f"Recovery attempts ({len(recovery_attempts)})", expanded=False):
+            st.dataframe(pd.DataFrame(recovery_attempts), use_container_width=True, hide_index=True)
     if details.get("technical"):
-        with st.expander("Technical details", expanded=False):
-            st.code(details["technical"][:4000])
+        # Open by default so the user immediately sees what actually broke.
+        with st.expander("Technical exception (full message)", expanded=True):
+            st.code(details["technical"][:6000])
     return True
 
 
@@ -1090,27 +1140,26 @@ def render_engineer_report(
             "Fedot graph receives raw target values. Mapping is shown only to make class labels readable in diagnostics."
         )
         if target_info.get("reference_encoding"):
-            st.write("Reference label mapping")
-            mapping_rows = [
-                {"label": label, "code": code}
-                for label, code in target_info["reference_encoding"].items()
-            ]
-            st.dataframe(pd.DataFrame(mapping_rows), use_container_width=True, hide_index=True)
+            with st.expander("Reference label mapping"):
+                mapping_rows = [
+                    {"label": label, "code": code}
+                    for label, code in target_info["reference_encoding"].items()
+                ]
+                st.dataframe(pd.DataFrame(mapping_rows), use_container_width=True, hide_index=True)
         if target_info.get("sample_values"):
             st.caption("Target sample: " + ", ".join(target_info["sample_values"][:8]))
 
     notes = engineer.get("training_notes", []) or []
     if notes and show_training_notes:
-        st.write("Training notes")
-        for note in notes:
-            st.write(f"- {note}")
+        with st.expander(f"Training notes ({len(notes)})", expanded=False):
+            for note in notes:
+                st.write(f"- {note}")
 
     if engineer.get("graph_error") and show_failure_details:
         st.error(engineer["graph_error"])
 
     strategy_name = engineer.get("industrial_strategy", "") or ""
     if strategy_name:
-        st.write("Industrial strategy execution")
         strategy_cols = st.columns(2)
         strategy_cols[0].metric("Strategy", strategy_name)
         strategy_cols[1].metric(
@@ -1144,15 +1193,27 @@ def render_engineer_report(
 
     train_metrics = engineer.get("train_metrics", {}) or {}
     test_metrics = engineer.get("test_metrics", {}) or {}
-    if engineer.get("graph_error"):
+    has_metrics = bool(train_metrics or test_metrics or engineer.get("graph_metrics"))
+    has_error = bool(engineer.get("graph_error"))
+    fallback_used = engineer.get("fallback_used", "")
+    finetune_error = engineer.get("finetune_error", "")
+
+    if (has_error or fallback_used or finetune_error) and has_metrics:
+        st.warning(
+            "Metrics below come from the **{path}** fallback path because Fedot.Industrial finetune did not converge. They are a baseline, not the result of a successful tuning run.".format(
+                path=fallback_used or "direct-fit"
+            )
+        )
+    elif has_error and not has_metrics:
         st.caption("Train/test metrics are unavailable because the graph did not finish training.")
-    elif train_metrics or test_metrics:
+
+    if has_metrics and (train_metrics or test_metrics):
         train_col, test_col = st.columns(2)
         with train_col:
             render_metric_table("Train metrics", train_metrics)
         with test_col:
             render_metric_table("Test metrics (hold-out)", test_metrics)
-    else:
+    elif has_metrics:
         metrics = engineer.get("graph_metrics", {}) or {}
         if metrics:
             render_metric_table("Test metrics (hold-out)", metrics)
@@ -1164,7 +1225,7 @@ def render_engineer_report(
 def render_critic_feedback(critic: Dict[str, Any], compact_runtime_error: bool = False) -> None:
     st.markdown("#### Critic Recovery" if compact_runtime_error else "#### Critic Feedback")
     if compact_runtime_error:
-        st.caption("Critic is focused on concrete recovery mutations because Engineer did not produce metrics.")
+        st.caption("Critic is focused on recovery because Engineer reported a training/runtime issue.")
     else:
         st.write(critic.get("assessment", "No critic assessment."))
 
@@ -1191,12 +1252,9 @@ def render_critic_feedback(critic: Dict[str, Any], compact_runtime_error: bool =
             for item in (critic.get("diagnostics", []) or [])
         )
         if recovery_remove_mode:
-            st.write("Concrete recovery mutations for Architect")
+            st.write("Concrete recovery plan for Architect")
         else:
-            st.write(
-                "Concrete mutations for Architect (alternatives - pick the ones you want applied; "
-                "combining incompatible ones may produce an invalid graph)"
-            )
+            st.write("Concrete mutation plan for Architect")
         rows = mutation_rows(critic["suggested_mutations"])
         for idx, (mutation, row) in enumerate(zip(critic["suggested_mutations"], rows)):
             label = f"**{row['action']}** `{row['node']}`"
@@ -1204,7 +1262,7 @@ def render_critic_feedback(critic: Dict[str, Any], compact_runtime_error: bool =
                 label += f" -> `{row['target']}`"
             if row.get("details"):
                 label += f" - {row['details']}"
-            default_selected = mutation.get("type") == "remove" if recovery_remove_mode else idx == 0
+            default_selected = True
             st.checkbox(label, value=default_selected, key=f"critic_mut_{idx}")
 
     if not compact_runtime_error:
@@ -1477,46 +1535,99 @@ def results_tab() -> None:
 
     engineer = item.get("engineer", {})
     critic = item.get("critic", {})
-    has_runtime_failure = bool(engineer.get("graph_error"))
 
     metrics = engineer.get("test_metrics", {}) or engineer.get("graph_metrics", {}) or {}
     primary_metric = metrics.get("primary_metric") or result.get("primary_metric") or "score"
     primary_value = metrics.get("primary_metric_value", engineer.get("graph_score", 0))
+    fallback_used = engineer.get("fallback_used", "")
+    finetune_error = engineer.get("finetune_error", "")
+    primary_float = _numeric_or_none(primary_value)
+    has_runtime_failure = bool(engineer.get("graph_error")) or (
+        bool(finetune_error)
+        and primary_metric in ZERO_SCORE_FAILURE_METRICS
+        and (primary_float is None or primary_float <= 0)
+    )
 
+    # Header summary: always visible.
     col1, col2, col3 = st.columns(3)
-    col1.metric(f"Test {primary_metric}", "n/a" if has_runtime_failure else format_number(primary_value))
+    col1.metric(
+        f"Test {primary_metric}",
+        format_number(primary_value),
+        delta=("(fallback)" if fallback_used else None),
+    )
     col2.metric("Critic decision", decision_label(critic.get("winner", "")))
     col3.metric("Suggested changes", len(critic.get("suggested_mutations", []) or []))
 
-    st.markdown("#### Evaluated Graph")
-    render_graph(item.get("architect", {}).get("graph", {}), show_details=False)
+    if has_runtime_failure:
+        # Show the error banner up front so it's the first thing the user sees.
+        render_runtime_failure_once(item)
 
-    render_runtime_failure_once(item)
-    engineer = item.get("engineer", {})
-    render_engineer_report(
-        engineer,
-        show_failure_details=not has_runtime_failure,
-        show_training_notes=not has_runtime_failure,
-        show_diagnostics=not has_runtime_failure,
-    )
-    render_evaluation_history(result)
-    render_critic_feedback(critic, compact_runtime_error=has_runtime_failure)
+    # Split the long page into focused sub-tabs so the user does not have to
+    # scroll through everything at once.
+    sub_tabs = st.tabs([
+        "Engineer",
+        "Critic",
+        "Diagnostics",
+        "History",
+        "Next action",
+    ])
 
-    st.markdown("#### Next Pipeline Decision")
-    msg = st.text_area(
-        "Optional note for Architect",
-        placeholder="Example: prefer a simpler model, avoid heavy operations, or apply only the model replacement.",
-        height=90,
-    )
-    col_apply, col_keep = st.columns(2)
-    if col_apply.button("Ask Architect To Draft Critic Changes", type="primary", use_container_width=True, key="critic_draft_changes"):
-        try:
-            request_architect_revision(item, msg)
-        except Exception as exc:
-            st.error(f"Architect revision failed: {exc}")
-    if col_keep.button("Keep Current Approved Pipeline", use_container_width=True, key="critic_keep_current"):
-        discard_draft()
-        st.info("Current approved pipeline kept. No new draft accepted.")
+    with sub_tabs[0]:
+        st.markdown("#### Evaluated Graph")
+        render_graph(item.get("architect", {}).get("graph", {}), show_details=False)
+        render_engineer_report(
+            engineer,
+            # When the runtime failure banner is already shown above, suppress
+            # the duplicate inline error inside the Engineer report.
+            show_failure_details=not has_runtime_failure,
+            show_training_notes=True,
+            show_diagnostics=False,
+        )
+
+    with sub_tabs[1]:
+        render_critic_feedback(critic, compact_runtime_error=has_runtime_failure)
+
+    with sub_tabs[2]:
+        eng_diag = engineer.get("diagnostics", []) or []
+        critic_diag = critic.get("diagnostics", []) or []
+        if not eng_diag and not critic_diag:
+            st.caption("No diagnostics produced for this run.")
+        else:
+            if eng_diag:
+                st.markdown("**Engineer diagnostics**")
+                render_diagnostics(eng_diag, "Engineer diagnostics", use_expander=False)
+            if critic_diag:
+                st.markdown("**Critic diagnostics**")
+                render_diagnostics(critic_diag, "Critic diagnostics", use_expander=False)
+
+    with sub_tabs[3]:
+        render_evaluation_history(result)
+
+    with sub_tabs[4]:
+        st.markdown("#### Next Pipeline Decision")
+        msg = st.text_area(
+            "Optional note for Architect",
+            placeholder="Example: prefer a simpler model, avoid heavy operations, or apply only the model replacement.",
+            height=90,
+        )
+        col_apply, col_keep = st.columns(2)
+        if col_apply.button(
+            "Ask Architect To Draft Critic Changes",
+            type="primary",
+            use_container_width=True,
+            key="critic_draft_changes",
+        ):
+            try:
+                request_architect_revision(item, msg)
+            except Exception as exc:
+                st.error(f"Architect revision failed: {exc}")
+        if col_keep.button(
+            "Keep Current Approved Pipeline",
+            use_container_width=True,
+            key="critic_keep_current",
+        ):
+            discard_draft()
+            st.info("Current approved pipeline kept. No new draft accepted.")
 
 
 def report_tab() -> None:

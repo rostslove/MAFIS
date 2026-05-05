@@ -484,6 +484,7 @@ async def propose_revision_from_critic(
         suggested_mutations=graph_mutations,
         improvement_plan=critic_feedback.get("improvement_plan", []) or [],
         should_stop=False,
+        diagnostics=critic_feedback.get("diagnostics", []) or [],
     )
     if message:
         feedback.weaknesses.append(f"User note: {message}")

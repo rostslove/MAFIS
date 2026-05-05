@@ -1039,9 +1039,23 @@ class PipelineGraph:
 
         elif op == "remove":
             nid = mutation["node_id"]
+            removed = next((n for n in nodes if n.id == nid), None)
+            bypass_inputs = list(removed.inputs) if removed is not None else []
             nodes = [n for n in nodes if n.id != nid]
             for n in nodes:
-                n.inputs = [i for i in n.inputs if i != nid]
+                if nid not in n.inputs:
+                    continue
+                rewired: List[str] = []
+                for inp in n.inputs:
+                    if inp == nid:
+                        # Rewire children of the removed node to its parents so
+                        # the graph stays connected and keeps a single root.
+                        for parent_id in bypass_inputs:
+                            if parent_id != n.id and parent_id not in rewired:
+                                rewired.append(parent_id)
+                    elif inp not in rewired:
+                        rewired.append(inp)
+                n.inputs = rewired
 
         elif op == "replace":
             nid = mutation["node_id"]

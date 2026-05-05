@@ -227,6 +227,8 @@ Return JSON only."""
                 "test_metrics": engineer.test_metrics,
                 "split_info": engineer.split_info,
                 "graph_error": engineer.graph_error,
+                "finetune_error": engineer.finetune_error,
+                "fallback_used": engineer.fallback_used,
                 "training_notes": engineer.training_notes,
                 "diagnostics": engineer.diagnostics,
             },
@@ -283,9 +285,12 @@ Return JSON only."""
         dc: DataContext,
         diagnostics: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
+        from graph_engine import PipelineGraph
+
         validated: List[Dict[str, Any]] = []
+        current_graph = graph
         for mutation in mutations:
-            error = self._mutation_validation_error(mutation, graph, dc)
+            error = self._mutation_validation_error(mutation, current_graph, dc)
             if error:
                 diagnostics.append(
                     {
@@ -300,6 +305,11 @@ Return JSON only."""
                 continue
             if mutation not in validated:
                 validated.append(mutation)
+            if mutation.get("type") != "set_strategy":
+                try:
+                    current_graph = PipelineGraph.from_dict(current_graph).apply_mutation(mutation).to_dict()
+                except Exception:
+                    pass
         return validated[:3]
 
     @staticmethod

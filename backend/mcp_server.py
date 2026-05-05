@@ -589,8 +589,9 @@ def train_graph(
     - Runs ``FedotIndustrial.finetune`` with ``industrial_strategy`` (when not
       ``tabular``) and the optional ``industrial_strategy_params`` attached to
       ``industrial_config``.
-    - Falls back to a direct fit only when finetune raises an exception, so the
-      iteration still produces a score.
+    - When finetune raises, attempts a direct fit so we can still expose
+      baseline metrics, and returns ``finetune_error``/``fallback_used`` so the
+      Engineer can decide whether node-skip recovery is needed.
 
     Returns score, metrics, the post-finetune assumption graph, and the
     industrial strategy actually used during the run.
@@ -620,7 +621,8 @@ def train_graph(
             )
             return json.dumps(result)
         except Exception as finetune_exc:
-            logger.exception("Finetune flow failed; falling back to direct fit")
+            logger.exception("Finetune flow failed; recording error and trying direct fit")
+            finetune_error = repr(finetune_exc)
             try:
                 fallback = _train_direct(
                     graph=graph,
@@ -632,18 +634,26 @@ def train_graph(
                 )
                 fallback["training_notes"].insert(
                     0,
-                    f"Finetune flow raised '{finetune_exc}'. Engineer fell back to direct fit.",
+                    f"Fedot.Industrial finetune raised: {finetune_error}. Direct-fit fallback metrics were produced as a baseline.",
                 )
+                fallback["finetune_error"] = finetune_error
+                fallback["fallback_used"] = "direct_fit"
+                fallback["fallback_reason"] = "Fedot.Industrial finetune raised before producing a fitted solver."
                 return json.dumps(fallback)
             except Exception as fallback_exc:
                 logger.exception("Direct-fit fallback also failed")
                 return json.dumps({
                     "score": 0,
-                    "error": f"finetune failed ({finetune_exc}); direct fallback failed ({fallback_exc})",
+                    "error": (
+                        f"Fedot.Industrial finetune failed: {finetune_error}; "
+                        f"direct-fit fallback also failed: {fallback_exc!r}."
+                    ),
+                    "finetune_error": finetune_error,
+                    "fallback_error": repr(fallback_exc),
                 })
     except Exception as e:
         logger.exception("train_graph failed")
-        return json.dumps({"score": 0, "error": str(e)})
+        return json.dumps({"score": 0, "error": repr(e)})
 
 @mcp.tool()
 def validate_graph(

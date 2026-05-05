@@ -189,9 +189,11 @@ Return JSON only."""
             payload["feedback"] = {
                 "decision": prev_fb.winner,
                 "assessment": prev_fb.assessment,
+                "strengths": prev_fb.strengths,
                 "weaknesses": prev_fb.weaknesses,
                 "suggested_mutations": prev_fb.suggested_mutations,
                 "improvement_plan": prev_fb.improvement_plan,
+                "diagnostics": prev_fb.diagnostics,
             }
         return (
             "Create one valid graph proposal for this payload.\n"

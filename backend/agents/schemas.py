@@ -86,6 +86,8 @@ class EngineerResult:
     industrial_strategy: str = "tabular"
     industrial_strategy_params: Dict[str, Any] = field(default_factory=dict)
     graph_error: str = ""
+    finetune_error: str = ""
+    fallback_used: str = ""
     target_info: Dict[str, Any] = field(default_factory=dict)
     training_notes: List[str] = field(default_factory=list)
     diagnostics: List[Dict[str, Any]] = field(default_factory=list)
@@ -103,6 +105,8 @@ class EngineerResult:
             "industrial_strategy": self.industrial_strategy,
             "industrial_strategy_params": self.industrial_strategy_params,
             "graph_error": self.graph_error,
+            "finetune_error": self.finetune_error,
+            "fallback_used": self.fallback_used,
             "target_info": self.target_info,
             "training_notes": self.training_notes,
             "diagnostics": self.diagnostics,

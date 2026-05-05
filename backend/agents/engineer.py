@@ -51,9 +51,33 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
                     or dict(data_context.industrial_strategy_params or {})
                 )
                 result.graph_error = graph_run.get("error", "") or ""
+                result.finetune_error = graph_run.get("finetune_error", "") or ""
+                result.fallback_used = graph_run.get("fallback_used", "") or ""
                 result.target_info = graph_run.get("target_info", {}) or result.target_info
                 result.training_notes.extend(graph_run.get("training_notes", []) or [])
                 result.diagnostics.extend(self._extract_diagnostics(graph_run))
+                # Always surface the underlying training error (with the original
+                # finetune exception, if any) as a diagnostic so the UI can
+                # display the technical message without relying on the Critic
+                # to echo it.
+                if result.graph_error and not any(
+                    isinstance(item, dict)
+                    and item.get("technical_message") == result.graph_error
+                    for item in result.diagnostics
+                ):
+                    result.diagnostics.append({
+                        "agent": "Engineer",
+                        "kind": "runtime_error",
+                        "summary": (
+                            "Fedot.Industrial finetune raised an exception during training."
+                            if result.finetune_error
+                            else "Engineer could not finish training the proposed graph."
+                        ),
+                        "technical_message": result.graph_error,
+                        "finetune_error": result.finetune_error,
+                        "fallback_used": result.fallback_used,
+                        "recoverable": True,
+                    })
                 result.diagnostics = self._unique_diagnostics(result.diagnostics)
                 if result.graph_error:
                     result.graph_metrics["error"] = result.graph_error
@@ -89,7 +113,7 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
 
     async def _train_graph(self, graph_json: str, dc: DataContext) -> dict:
         trained = await self._train_direct(graph_json, dc)
-        if trained.get("error"):
+        if self._should_attempt_node_recovery(trained):
             trained = await self._recover_by_skipping_node(graph_json, dc, trained)
         strategy_name = trained.get("industrial_strategy") or dc.industrial_strategy
         if strategy_name and strategy_name != "tabular":
@@ -136,7 +160,7 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
         if not candidates:
             return failed_run
 
-        original_error = str(failed_run.get("error") or "")
+        original_error = self._failure_message(failed_run)
         attempts: List[Dict[str, Any]] = []
         for node in candidates:
             recovered_graph = self._graph_with_node_skipped(graph, str(node["id"]))
@@ -145,7 +169,7 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
             if not isinstance(recovered, dict):
                 recovered = {"score": 0, "error": "train_graph returned no data"}
 
-            if not recovered.get("error"):
+            if not self._should_attempt_node_recovery(recovered):
                 diagnostic = self._nodes_skipped_diagnostic([node], original_error, recovered_graph)
                 recovered.setdefault("diagnostics", [])
                 recovered["diagnostics"] = (
@@ -172,7 +196,7 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
             attempts.append({
                 "id": node.get("id"),
                 "operation": node.get("operation"),
-                "error": recovered.get("error"),
+                "error": self._failure_message(recovered),
             })
 
         if len(candidates) > 1:
@@ -188,10 +212,10 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
             attempts.append({
                 "id": "__all_optional__",
                 "operation": "skip_all_optional_nodes",
-                "error": recovered.get("error"),
+                "error": self._failure_message(recovered),
             })
 
-            if not recovered.get("error"):
+            if not self._should_attempt_node_recovery(recovered):
                 diagnostic = self._nodes_skipped_diagnostic(candidates, original_error, recovered_graph)
                 recovered.setdefault("diagnostics", [])
                 recovered["diagnostics"] = (
@@ -233,6 +257,7 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
                 "recoverable": True,
             }
         )
+        failed_run["error"] = original_error
         return failed_run
 
     @staticmethod
@@ -355,6 +380,66 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
             "recoverable": True,
             "recovered": True,
         }
+
+    @classmethod
+    def _should_attempt_node_recovery(cls, payload: Dict[str, Any]) -> bool:
+        if not isinstance(payload, dict):
+            return True
+        if payload.get("error"):
+            return True
+        if not payload.get("finetune_error"):
+            return False
+
+        primary_value = cls._primary_score(payload)
+        metrics_missing = not any(
+            isinstance(payload.get(key), dict) and payload.get(key)
+            for key in ("test_metrics", "metrics", "graph_metrics")
+        )
+        if metrics_missing:
+            return True
+        primary_metric = cls._primary_metric(payload)
+        zero_is_failure_metrics = {"accuracy", "f1", "precision", "recall", "roc_auc"}
+        return primary_metric in zero_is_failure_metrics and primary_value <= 0
+
+    @staticmethod
+    def _primary_score(payload: Dict[str, Any]) -> float:
+        for key in ("score",):
+            if key not in payload or payload.get(key) is None:
+                continue
+            try:
+                return float(payload.get(key))
+            except (TypeError, ValueError):
+                pass
+        for section in ("test_metrics", "metrics", "graph_metrics"):
+            metrics = payload.get(section)
+            if not isinstance(metrics, dict):
+                continue
+            for key in ("primary_metric_value", "primary_score"):
+                try:
+                    return float(metrics.get(key) or 0)
+                except (TypeError, ValueError):
+                    continue
+        return 0.0
+
+    @staticmethod
+    def _primary_metric(payload: Dict[str, Any]) -> str:
+        for section in ("test_metrics", "metrics", "graph_metrics"):
+            metrics = payload.get(section)
+            if isinstance(metrics, dict) and metrics.get("primary_metric"):
+                return str(metrics.get("primary_metric"))
+        return ""
+
+    @staticmethod
+    def _failure_message(payload: Dict[str, Any]) -> str:
+        if not isinstance(payload, dict):
+            return "train_graph returned no data"
+        if payload.get("error"):
+            return str(payload.get("error"))
+        if payload.get("finetune_error"):
+            return f"Fedot.Industrial finetune failed: {payload.get('finetune_error')}"
+        if payload.get("fallback_error"):
+            return f"Direct-fit fallback failed: {payload.get('fallback_error')}"
+        return "Training returned unusable metrics"
 
     @staticmethod
     def _extract_diagnostics(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
