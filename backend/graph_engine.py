@@ -385,12 +385,8 @@ DEFAULT_GRAPHS: Dict[str, List[Dict[str, Any]]] = {
 }
 
 
-def _graph_template(
-    task_type: str,
-    nodes: List[Dict[str, Any]],
-    training_strategy: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    graph = {
+def _graph_template(task_type: str, nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
         "task_type": task_type,
         "nodes": [
             {
@@ -402,12 +398,6 @@ def _graph_template(
             for node in nodes
         ],
     }
-    if training_strategy:
-        graph["training_strategy"] = {
-            "name": training_strategy.get("name"),
-            "params": dict(training_strategy.get("params", {}) or {}),
-        }
-    return graph
 
 
 INDUSTRIAL_GRAPH_TEMPLATES: Dict[str, List[Dict[str, Any]]] = {
@@ -417,30 +407,12 @@ INDUSTRIAL_GRAPH_TEMPLATES: Dict[str, List[Dict[str, Any]]] = {
             "description": "Direct FEDOT/Fedot.Industrial table model over numeric CSV features.",
             "graph": _graph_template("classification", DEFAULT_GRAPHS["classification"]),
         },
-        {
-            "name": "federated_automl_strategy",
-            "description": "Fedot.Industrial RAFEnsembler strategy with internal AutoML branches.",
-            "graph": _graph_template(
-                "classification",
-                DEFAULT_GRAPHS["classification"],
-                {"name": "federated_automl", "params": {}},
-            ),
-        },
     ],
     "regression": [
         {
             "name": "tabular_direct_model",
             "description": "Direct FEDOT/Fedot.Industrial table model over numeric CSV features.",
             "graph": _graph_template("regression", DEFAULT_GRAPHS["regression"]),
-        },
-        {
-            "name": "federated_automl_strategy",
-            "description": "Fedot.Industrial RAFEnsembler strategy with internal AutoML branches.",
-            "graph": _graph_template(
-                "regression",
-                DEFAULT_GRAPHS["regression"],
-                {"name": "federated_automl", "params": {}},
-            ),
         },
     ],
     "ts_classification": [
@@ -920,13 +892,9 @@ class PipelineGraph:
 
     task_type: str
     nodes: List[GraphNode] = field(default_factory=list)
-    training_strategy: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        payload = {"task_type": self.task_type, "nodes": [asdict(n) for n in self.nodes]}
-        if self.training_strategy:
-            payload["training_strategy"] = self.training_strategy
-        return payload
+        return {"task_type": self.task_type, "nodes": [asdict(n) for n in self.nodes]}
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict())
@@ -935,12 +903,7 @@ class PipelineGraph:
     def from_dict(cls, d: Dict[str, Any]) -> "PipelineGraph":
         nodes = [GraphNode(**n) for n in d.get("nodes", [])]
         task_type = d.get("task_type", "classification")
-        strategy = d.get("training_strategy", d.get("strategy"))
-        return cls(
-            task_type=task_type,
-            nodes=nodes,
-            training_strategy=normalize_training_strategy(task_type, strategy),
-        )
+        return cls(task_type=task_type, nodes=nodes)
 
     @classmethod
     def default(cls, task_type: str) -> "PipelineGraph":
@@ -951,21 +914,11 @@ class PipelineGraph:
         ops = OPERATIONS.get(self.task_type, {})
         return set(ops.get("preprocessing", []) + ops.get("models", []))
 
-    def uses_training_strategy(self) -> bool:
-        return bool(self.training_strategy and self.training_strategy.get("name"))
-
     def validate(self) -> Tuple[bool, str]:
         if not self.nodes:
             return False, "Graph has no nodes"
         if self.task_type not in OPERATIONS:
             return False, f"Unknown task_type '{self.task_type}'"
-        if self.training_strategy:
-            strategy_name = str(self.training_strategy.get("name") or "")
-            if not get_training_strategy_spec(self.task_type, strategy_name):
-                return False, f"Training strategy '{strategy_name}' not allowed for task '{self.task_type}'"
-            params = self.training_strategy.get("params", {})
-            if params is not None and not isinstance(params, dict):
-                return False, "Training strategy params must be an object"
 
         ids = [n.id for n in self.nodes]
         if len(set(ids)) != len(ids):
@@ -1050,16 +1003,6 @@ class PipelineGraph:
 
     def to_mermaid(self) -> str:
         lines = ["graph LR"]
-        if self.training_strategy:
-            name = self.training_strategy.get("name", "")
-            params = self.training_strategy.get("params", {}) or {}
-            strategy_label = name
-            if params:
-                p = json.dumps(params)
-                if len(p) > 40:
-                    p = p[:37] + "..."
-                strategy_label = f"{name}<br/>{p}"
-            lines.append(f'    training_strategy["strategy: {strategy_label}"]')
         for n in self.nodes:
             label = n.operation
             if n.params:
@@ -1071,14 +1014,11 @@ class PipelineGraph:
         for n in self.nodes:
             for inp in n.inputs:
                 lines.append(f"    {inp} --> {n.id}")
-        if self.training_strategy and self.nodes:
-            raw_nodes = [n for n in self.nodes if not n.inputs]
-            for n in raw_nodes or [self.nodes[0]]:
-                lines.append(f"    training_strategy -.-> {n.id}")
         return "\n".join(lines)
 
     def apply_mutation(self, mutation: Dict[str, Any]) -> "PipelineGraph":
-        """Return a new graph with the mutation applied."""
+        """Return a new graph with the mutation applied. Strategy mutations are
+        handled at the DataContext level by the orchestrator, not here."""
         nodes = [GraphNode(**asdict(n)) for n in self.nodes]
         op = mutation.get("type")
 
@@ -1115,13 +1055,6 @@ class PipelineGraph:
                     elif old_op != new_op:
                         n.params = {}
 
-        elif op == "set_params":
-            nid = mutation["node_id"]
-            params = mutation.get("params", {})
-            for n in nodes:
-                if n.id == nid:
-                    n.params = {**n.params, **params}
-
         elif op == "connect":
             nid = mutation["node_id"]
             new_input = mutation["input_id"]
@@ -1129,17 +1062,15 @@ class PipelineGraph:
                 if n.id == nid and new_input not in n.inputs:
                     n.inputs.append(new_input)
 
-        elif op == "set_strategy":
-            strategy = normalize_training_strategy(self.task_type, mutation.get("strategy"))
-            return PipelineGraph(task_type=self.task_type, nodes=nodes, training_strategy=strategy)
-
-        elif op == "clear_strategy":
-            return PipelineGraph(task_type=self.task_type, nodes=nodes, training_strategy=None)
+        elif op in ("set_strategy", "clear_strategy"):
+            # Strategy mutations are no longer part of the graph; the orchestrator
+            # applies them to DataContext.industrial_strategy. Return graph unchanged.
+            return PipelineGraph(task_type=self.task_type, nodes=nodes)
 
         else:
             raise ValueError(f"Unknown mutation type: {op}")
 
-        return PipelineGraph(task_type=self.task_type, nodes=nodes, training_strategy=self.training_strategy)
+        return PipelineGraph(task_type=self.task_type, nodes=nodes)
 
 
 # ============== Data loading ==============

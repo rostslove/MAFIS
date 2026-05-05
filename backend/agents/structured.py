@@ -28,7 +28,6 @@ class GraphNodeObject(BaseModel):
 class GraphObject(BaseModel):
     task_type: str
     nodes: List[GraphNodeObject]
-    training_strategy: Optional[Dict[str, Any]] = None
 
     @validator("task_type")
     def non_empty_task(cls, value: str) -> str:
@@ -42,19 +41,6 @@ class GraphObject(BaseModel):
         if not value:
             raise ValueError("graph must contain at least one node")
         return value
-
-    @validator("training_strategy", pre=True, always=True)
-    def normalize_training_strategy(cls, value: Any) -> Optional[Dict[str, Any]]:
-        if value is None:
-            return None
-        if isinstance(value, str):
-            name = value.strip()
-            if not name or name.lower() in {"none", "null", "default", "direct graph", "graph"}:
-                return None
-            return {"name": name, "params": {}}
-        if isinstance(value, dict):
-            return value
-        raise ValueError("training_strategy must be null, a strategy name, or an object")
 
     def as_graph_json(self) -> str:
         return self.json()
@@ -75,7 +61,6 @@ class CriticMutationObject(BaseModel):
     node_id: Optional[str] = None
     new_operation: Optional[str] = None
     node: Optional[GraphNodeObject] = None
-    params: Dict[str, Any] = Field(default_factory=dict)
     strategy: Optional[Dict[str, Any]] = None
     rewire_input_of: Optional[str] = None
     input_id: Optional[str] = None
@@ -83,7 +68,7 @@ class CriticMutationObject(BaseModel):
     @validator("type")
     def allowed_type(cls, value: str) -> str:
         value = value.strip()
-        allowed = {"remove", "replace", "add", "set_params", "set_strategy", "clear_strategy", "connect"}
+        allowed = {"remove", "replace", "add", "set_strategy", "connect"}
         if value not in allowed:
             raise ValueError(f"unsupported mutation type: {value}")
         return value
@@ -103,8 +88,6 @@ class CriticMutationObject(BaseModel):
             payload["new_operation"] = self.new_operation
         if self.node is not None:
             payload["node"] = self.node.dict()
-        if self.params:
-            payload["params"] = self.params
         if self.strategy:
             payload["strategy"] = self.strategy
         if self.rewire_input_of:
@@ -217,7 +200,6 @@ def normalize_propose_graph_arguments(args: Dict[str, Any]) -> Dict[str, Any]:
         candidate = {
             "task_type": args.get("task_type"),
             "nodes": args.get("nodes"),
-            "training_strategy": args.get("training_strategy", args.get("strategy")),
         }
         args["graph_json"] = GraphObject.parse_obj(candidate).as_graph_json()
     return {"graph_json": args["graph_json"]}

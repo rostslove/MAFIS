@@ -30,8 +30,7 @@ Return only one strict JSON object:
     "task_type": "classification",
     "nodes": [
       {"id": "model", "operation": "operation_from_catalog", "params": {}, "inputs": []}
-    ],
-    "training_strategy": null
+    ]
   },
   "analysis": "why this graph fits the evidence",
   "reasoning": "why these operations/params were selected from the catalog"
@@ -39,7 +38,9 @@ Return only one strict JSON object:
 
 Use only operations listed in available_operations. Every input must be an
 existing node id, or [] for raw data. The graph must be a DAG with exactly one
-root model node. Use training_strategy only when the payload policy allows it.
+root model node. The graph passed to Fedot.Industrial as `initial_assumption` is
+finetuned by AutoML. Industrial strategies (federated_automl, sampling_strategy)
+are execution modes selected outside the graph; do not include them in the JSON.
 Return JSON only."""
 
     STRUCTURED_PROMPT = SYSTEM_PROMPT
@@ -141,7 +142,6 @@ Return JSON only."""
 
             last_analysis = proposal.analysis
             last_reasoning = proposal.reasoning
-            self._enforce_training_strategy_policy(proposal, prev_feedback, prev_graph, diagnostics)
 
             proposed = await self.call_mcp_tool("propose_graph", {"graph_json": proposal.graph.as_graph_json()})
             if isinstance(proposed, dict) and proposed.get("valid") and proposed.get("graph"):
@@ -171,29 +171,7 @@ Return JSON only."""
                 )
         return None, "", last_analysis, last_reasoning, diagnostics
 
-    def _enforce_training_strategy_policy(self, proposal, prev_feedback, prev_graph, diagnostics) -> None:
-        if not proposal.graph.training_strategy or self._training_strategy_allowed(prev_feedback, prev_graph):
-            return
-        proposal.graph.training_strategy = None
-        diagnostics.append(
-            {
-                "agent": "Architect",
-                "kind": "training_strategy_removed",
-                "summary": "Architect proposed a training strategy without an explicit request or Critic recommendation.",
-                "technical_message": (
-                    "training_strategy was reset to null. Strategies are execution modes and "
-                    "must be selected by the user, preserved from the previous graph, or recommended by Critic."
-                ),
-                "recommendations": [
-                    "Keep graph.training_strategy null unless strategy use is explicitly requested.",
-                    "Use Critic set_strategy feedback when a Fedot.Industrial strategy should be selected.",
-                ],
-                "recoverable": True,
-            }
-        )
-
     def _build_structured_prompt(self, dc: DataContext, profile, operations, prev_fb, prev_graph) -> str:
-        strategy_allowed = self._training_strategy_allowed(prev_fb, prev_graph)
         payload = {
             "task": dc.task_type,
             "is_time_series": dc.is_time_series,
@@ -204,15 +182,8 @@ Return JSON only."""
             "available_operations": operations,
             "previous_graph": prev_graph,
             "feedback": None,
-            "training_strategy_policy": {
-                "default": "null",
-                "allowed_now": strategy_allowed,
-                "rule": (
-                    "Use a training strategy only if previous_graph already has one "
-                    "or Critic suggested a set_strategy mutation."
-                ),
-                "schema": {"name": "strategy_name", "params": {}},
-            },
+            "industrial_strategy_in_use": dc.industrial_strategy or "tabular",
+            "industrial_strategy_params": dict(dc.industrial_strategy_params or {}),
         }
         if prev_fb:
             payload["feedback"] = {
@@ -224,24 +195,14 @@ Return JSON only."""
             }
         return (
             "Create one valid graph proposal for this payload.\n"
+            "The graph you produce becomes Fedot.Industrial `initial_assumption` and is polished by AutoML finetune.\n"
             "available_operations.catalog[].industrial_search_space contains Fedot.Industrial-supported parameter ranges.\n"
             "available_operations.industrial_templates contains Fedot.Industrial-native graph patterns.\n"
-            "available_operations.training_strategies_catalog contains selectable execution strategies.\n"
+            "available_operations.industrial_strategies_catalog describes selectable execution strategies "
+            "(tabular/federated_automl/sampling_strategy). Strategies are picked by the user outside the graph; "
+            "do not include them in your JSON.\n"
             "For graph node inputs, use [] for raw data and otherwise use only existing node ids.\n"
             "Return strict JSON literals: null/true/false, not Python None/True/False.\n"
             "Return only the GraphProposal JSON object.\n"
             f"{json.dumps(payload, ensure_ascii=False)}"
-        )
-
-    @staticmethod
-    def _training_strategy_allowed(prev_fb, prev_graph) -> bool:
-        if isinstance(prev_graph, dict) and prev_graph.get("training_strategy"):
-            return True
-        if not prev_fb:
-            return False
-        mutations = getattr(prev_fb, "suggested_mutations", []) or []
-        return any(
-            (mutation or {}).get("type") == "set_strategy"
-            for mutation in mutations
-            if isinstance(mutation, dict)
         )

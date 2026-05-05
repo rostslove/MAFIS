@@ -43,6 +43,8 @@ class DataContext:
     forecast_length: Optional[int] = None
     primary_metric: Optional[str] = None
     test_size: float = 0.2
+    industrial_strategy: str = "tabular"
+    industrial_strategy_params: Dict[str, Any] = field(default_factory=dict)
     iteration_history: List[IterationRecord] = field(default_factory=list)
 
     @property
@@ -56,6 +58,7 @@ class ArchitectResult:
     mermaid: str = ""
     analysis: str = ""
     reasoning: str = ""
+    proposed_strategy_params: Dict[str, Any] = field(default_factory=dict)
     diagnostics: List[Dict[str, Any]] = field(default_factory=list)
     tool_calls: List[ToolCall] = field(default_factory=list)
 
@@ -65,6 +68,7 @@ class ArchitectResult:
             "mermaid": self.mermaid,
             "analysis": self.analysis,
             "reasoning": self.reasoning,
+            "proposed_strategy_params": self.proposed_strategy_params,
             "diagnostics": self.diagnostics,
             "tool_calls": [tc.to_dict() for tc in self.tool_calls],
         }
@@ -77,7 +81,10 @@ class EngineerResult:
     train_metrics: Dict[str, Any] = field(default_factory=dict)
     test_metrics: Dict[str, Any] = field(default_factory=dict)
     split_info: Dict[str, Any] = field(default_factory=dict)
-    training_strategy: Dict[str, Any] = field(default_factory=dict)
+    assumption_graph: Dict[str, Any] = field(default_factory=dict)
+    assumption_mermaid: str = ""
+    industrial_strategy: str = "tabular"
+    industrial_strategy_params: Dict[str, Any] = field(default_factory=dict)
     graph_error: str = ""
     target_info: Dict[str, Any] = field(default_factory=dict)
     training_notes: List[str] = field(default_factory=list)
@@ -91,7 +98,10 @@ class EngineerResult:
             "train_metrics": self.train_metrics,
             "test_metrics": self.test_metrics,
             "split_info": self.split_info,
-            "training_strategy": self.training_strategy,
+            "assumption_graph": self.assumption_graph,
+            "assumption_mermaid": self.assumption_mermaid,
+            "industrial_strategy": self.industrial_strategy,
+            "industrial_strategy_params": self.industrial_strategy_params,
             "graph_error": self.graph_error,
             "target_info": self.target_info,
             "training_notes": self.training_notes,

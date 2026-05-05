@@ -39,7 +39,17 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
                 result.train_metrics = graph_run.get("train_metrics", {}) or {}
                 result.test_metrics = graph_run.get("test_metrics", {}) or {}
                 result.split_info = graph_run.get("split_info", {}) or {}
-                result.training_strategy = graph_run.get("training_strategy", {}) or {}
+                result.assumption_graph = graph_run.get("assumption_graph", {}) or {}
+                result.assumption_mermaid = graph_run.get("assumption_mermaid", "") or ""
+                result.industrial_strategy = (
+                    graph_run.get("industrial_strategy")
+                    or data_context.industrial_strategy
+                    or "tabular"
+                )
+                result.industrial_strategy_params = (
+                    graph_run.get("industrial_strategy_params", {})
+                    or dict(data_context.industrial_strategy_params or {})
+                )
                 result.graph_error = graph_run.get("error", "") or ""
                 result.target_info = graph_run.get("target_info", {}) or result.target_info
                 result.training_notes.extend(graph_run.get("training_notes", []) or [])
@@ -81,9 +91,10 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
         trained = await self._train_direct(graph_json, dc)
         if trained.get("error"):
             trained = await self._recover_by_skipping_node(graph_json, dc, trained)
-        if trained.get("training_strategy"):
+        strategy_name = trained.get("industrial_strategy") or dc.industrial_strategy
+        if strategy_name and strategy_name != "tabular":
             trained.setdefault("training_notes", []).append(
-                "Fedot.Industrial training strategy executed its own internal search. "
+                f"Fedot.Industrial executed the '{strategy_name}' strategy with its own internal search. "
                 "MAFIS did not run separate node-level hyperparameter tuning."
             )
         return trained
@@ -94,6 +105,8 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
             "csv_path": dc.csv_path,
             "target_column": dc.target_column,
             "test_size": dc.test_size,
+            "industrial_strategy": dc.industrial_strategy or "tabular",
+            "industrial_strategy_params": dict(dc.industrial_strategy_params or {}),
         }
         if dc.primary_metric:
             args["primary_metric"] = dc.primary_metric
@@ -112,7 +125,7 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
     ) -> Dict[str, Any]:
         """Try bypass recovery for crashes in optional graph nodes."""
         graph = self._parse_graph_json(graph_json)
-        if not graph or graph.get("training_strategy"):
+        if not graph:
             return failed_run
 
         root_id = self._root_id(graph.get("nodes", []))

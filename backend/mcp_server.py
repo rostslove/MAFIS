@@ -21,7 +21,6 @@ if _backend_dir not in sys.path:
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 
 from data_profiler import DataProfiler
@@ -140,209 +139,317 @@ def _strategy_data_type(task_type: str) -> str:
     return "time_series" if task_type in ("ts_classification", "ts_regression") else "table"
 
 
-def _is_table_strategy(data_type: str) -> bool:
-    return str(data_type or "").lower() in {"table", "tabular"}
+def _graph_to_pipeline_builder(graph: PipelineGraph):
+    """Convert a PipelineGraph into a Fedot PipelineBuilder usable as
+    ``initial_assumption`` / ``model_to_tune`` for Fedot.Industrial."""
+    from fedot.core.pipelines.pipeline_builder import PipelineBuilder
 
+    builder = PipelineBuilder()
+    nodes_by_id = {n.id: n for n in graph.nodes}
+    root_id = graph.root_id()
+    root = nodes_by_id[root_id]
 
-def _default_strategy_operations(problem: str, data_type: str) -> List[str]:
-    if not _is_table_strategy(data_type):
-        return []
-    if problem == "classification":
-        preferred = ["rf", "xgboost", "logit", "dt", "lgbm", "catboost"]
-        return [operation for operation in preferred if operation in OPERATIONS.get("classification", {}).get("models", [])]
-    if problem == "regression":
-        preferred = ["treg", "xgbreg", "ridge", "lasso", "dtreg", "lgbmreg", "sgdr", "catboostreg"]
-        return [operation for operation in preferred if operation in OPERATIONS.get("regression", {}).get("models", [])]
-    return []
-
-
-def _load_strategy_arrays(csv_path: str, target_column: str, task_type: str) -> tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
-    csv_path = normalize_csv_path(csv_path)
-    df = pd.read_csv(csv_path)
-    if target_column not in df.columns:
-        raise ValueError(f"Target column '{target_column}' not in CSV")
-
-    features_df = df.drop(columns=[target_column])
-    encoded_df = pd.get_dummies(features_df, dummy_na=True)
-    encoded_df = encoded_df.apply(pd.to_numeric, errors="coerce").fillna(0)
-    if encoded_df.shape[1] == 0:
-        raise ValueError(
-            "No feature columns found after removing the target column. "
-            "Choose another target or upload a dataset with feature columns."
+    if not root.inputs:
+        builder.add_node(
+            operation_type=root.operation,
+            branch_idx=0,
+            params=dict(root.params) if root.params else None,
         )
+        return builder
 
-    target_info = _target_info(csv_path, target_column, task_type)
-    X = encoded_df.values.astype(float)
-    y = df[target_column].values
+    # Each direct input of the root spawns its own branch; the chain back to a
+    # leaf becomes the body of that branch.
+    for branch_idx, head_input_id in enumerate(root.inputs):
+        chain: List[Any] = []
+        current_id = head_input_id
+        while True:
+            current = nodes_by_id[current_id]
+            chain.insert(0, current)
+            if not current.inputs:
+                break
+            if len(current.inputs) > 1:
+                raise ValueError(
+                    f"Node '{current.id}' has multiple inputs but is not the root; "
+                    "fan-in joins are only supported at the root."
+                )
+            current_id = current.inputs[0]
+        for node in chain:
+            builder.add_node(
+                operation_type=node.operation,
+                branch_idx=branch_idx,
+                params=dict(node.params) if node.params else None,
+            )
 
-    if task_type in ("classification", "ts_classification"):
-        encoder = LabelEncoder()
-        y = encoder.fit_transform(pd.Series(y).astype(str).values)
-        target_info["fedot_receives_raw_target"] = False
-        target_info["reference_encoded"] = True
-        target_info["reference_encoding"] = {str(label): int(code) for code, label in enumerate(encoder.classes_)}
+    if len(root.inputs) == 1:
+        builder.add_node(
+            operation_type=root.operation,
+            branch_idx=0,
+            params=dict(root.params) if root.params else None,
+        )
     else:
+        builder.join_branches(
+            operation_type=root.operation,
+            params=dict(root.params) if root.params else None,
+        )
+    return builder
+
+
+def _pipeline_to_graph_dict(pipeline, task_type: str) -> Dict[str, Any]:
+    """Read a fitted Fedot Pipeline back into our PipelineGraph dict form so
+    the UI can show the polished assumption graph after finetune."""
+    if pipeline is None or not hasattr(pipeline, "root_node"):
+        return {}
+    nodes_dict: Dict[int, Dict[str, Any]] = {}
+
+    def _safe_params(node) -> Dict[str, Any]:
         try:
-            y = y.astype(float)
-        except ValueError as exc:
-            raise ValueError(
-                "Regression target contains non-numeric values. "
-                "Choose classification or convert the target to numbers."
-            ) from exc
-    return X, np.asarray(y), target_info
+            params = getattr(node, "parameters", None) or {}
+        except Exception:
+            params = {}
+        return {str(k): v for k, v in params.items() if not callable(v)}
+
+    def _walk(node) -> str:
+        node_key = id(node)
+        if node_key in nodes_dict:
+            return nodes_dict[node_key]["id"]
+        nid = f"node_{len(nodes_dict)}"
+        # Reserve slot before recursion so we don't loop on cycles
+        nodes_dict[node_key] = {"id": nid, "operation": "", "params": {}, "inputs": []}
+        parents = list(getattr(node, "nodes_from", []) or [])
+        parent_ids = [_walk(parent) for parent in parents]
+        operation_obj = getattr(node, "operation", None)
+        operation_name = (
+            getattr(operation_obj, "operation_type", None)
+            or getattr(node, "name", None)
+            or ""
+        )
+        nodes_dict[node_key].update({
+            "id": nid,
+            "operation": str(operation_name),
+            "params": _safe_params(node),
+            "inputs": parent_ids,
+        })
+        return nid
+
+    try:
+        _walk(pipeline.root_node)
+    except Exception:
+        return {}
+
+    return {
+        "task_type": task_type,
+        "nodes": list(nodes_dict.values()),
+    }
 
 
-def _split_strategy_arrays(X: np.ndarray, y: np.ndarray, task_type: str, test_size: float):
-    stratify = None
-    if task_type in ("classification", "ts_classification"):
-        labels, counts = np.unique(y, return_counts=True)
-        if len(labels) > 1 and int(counts.min()) >= 2:
-            stratify = y
-    return train_test_split(X, y, test_size=test_size, random_state=42, stratify=stratify)
-
-
-def _make_strategy_input(features: np.ndarray, target: np.ndarray, task_type: str):
-    from fedot.core.data.data import InputData
-    from fedot.core.repository.dataset_types import DataTypesEnum
-    from fedot.core.repository.tasks import Task, TaskTypesEnum
-
-    problem = _task_problem(task_type)
-    fedot_task = Task(TaskTypesEnum.classification if problem == "classification" else TaskTypesEnum.regression)
-    X = np.asarray(features, dtype=float)
-    data_type = DataTypesEnum.table
-    # RAFEnsembler always builds image-like branch data sources internally.
-    # Keep tabular tasks 2D so sklearn/FEDOT table models stay cheap; use a
-    # singleton channel only for fixed-window time-series strategy runs.
-    if task_type in ("ts_classification", "ts_regression") and X.ndim == 2:
-        X = X.reshape(X.shape[0], 1, X.shape[1])
-        data_type = DataTypesEnum.image
-    y = np.asarray(target)
-    if problem == "classification":
-        y = y.reshape(-1, 1)
-    else:
-        y = y.astype(float).reshape(-1)
-    return InputData(
-        idx=np.arange(X.shape[0]),
-        features=X,
-        target=y,
-        task=fedot_task,
-        data_type=data_type,
+def _build_api_config(
+    task_type: str,
+    forecast_length: Optional[int],
+    primary_metric: Optional[str],
+    industrial_strategy: str,
+    industrial_strategy_params: Optional[Dict[str, Any]],
+    timeout: int,
+) -> Dict[str, Any]:
+    """Assemble the four-section api_config that FedotIndustrial expects."""
+    from fedot_ind.core.repository.config_repository import (
+        DEFAULT_AUTOML_LEARNING_CONFIG,
+        DEFAULT_CLF_AUTOML_CONFIG,
+        DEFAULT_REG_AUTOML_CONFIG,
+        DEFAULT_TSF_AUTOML_CONFIG,
+        DEFAULT_COMPUTE_CONFIG,
     )
 
+    problem = _task_problem(task_type)
+    fedot_problem = "ts_forecasting" if task_type == "ts_forecasting" else problem
 
-def _predict_raf_ensemble(solver, input_data, problem: str) -> np.ndarray:
-    """Predict with RAFEnsembler's decomposed branches and head model.
+    industrial_config: Dict[str, Any] = {"problem": fedot_problem}
+    if task_type == "ts_forecasting":
+        industrial_config["task_params"] = {"forecast_length": forecast_length or 14}
 
-    The upstream RAFEnsembler.predict path calls the decomposed pipeline with a
-    single default data source, while its branch preprocessors were fitted on
-    data_source_img/{i}. Fedot.Industrial's own strategy code predicts branches
-    first and then feeds their outputs to the head; mirror that behavior here.
-    """
-    branch_nodes = list(getattr(solver.current_pipeline.root_node, "nodes_from", []) or [])
-    if not branch_nodes:
-        return np.asarray(solver.current_pipeline.predict(input_data, "labels").predict)
-
-    branch_outputs = [np.asarray(branch.predict(input_data).predict) for branch in branch_nodes]
-    if problem == "classification":
-        branch_labels = []
-        for output in branch_outputs:
-            if output.ndim < 2:
-                output = np.array([output, 1 - output]).T
-            branch_labels.append(np.argmax(output, axis=1).reshape(-1, 1))
-        head_features = np.hstack(branch_labels)
-        output_mode = "labels"
+    strategy = (industrial_strategy or "tabular").strip().lower()
+    if strategy == "tabular":
+        industrial_config["strategy"] = "tabular"
+    elif strategy in ("federated_automl", "sampling_strategy"):
+        merged_params = {
+            "problem": fedot_problem,
+            "data_type": _strategy_data_type(task_type),
+            "timeout": int(timeout),
+        }
+        if isinstance(industrial_strategy_params, dict):
+            merged_params.update({
+                str(k): v for k, v in industrial_strategy_params.items() if v is not None
+            })
+        industrial_config["learning_strategy"] = strategy
+        industrial_config["strategy"] = strategy
+        industrial_config["strategy_params"] = merged_params
     else:
-        head_features = np.hstack([output.reshape(-1, 1) for output in branch_outputs])
-        output_mode = "default"
+        # Unknown strategy label - fall back to tabular path so the run still completes.
+        industrial_config["strategy"] = "tabular"
 
-    head_input = deepcopy(input_data)
-    n_samples, n_channels = head_features.shape
-    head_input.idx = np.arange(n_samples)
-    head_input.features = head_features.reshape(n_samples, n_channels, 1)
+    if task_type == "ts_forecasting":
+        automl_config = dict(DEFAULT_TSF_AUTOML_CONFIG)
+        automl_config["task_params"] = {"forecast_length": forecast_length or 14}
+    elif problem == "classification":
+        automl_config = dict(DEFAULT_CLF_AUTOML_CONFIG)
+    else:
+        automl_config = dict(DEFAULT_REG_AUTOML_CONFIG)
 
-    head_model = deepcopy(solver.current_pipeline.root_node)
-    head_model.nodes_from = []
-    return np.asarray(head_model.predict(head_input, output_mode).predict)
+    learning_loss = primary_metric if primary_metric else (
+        "rmse" if problem == "regression" or task_type == "ts_forecasting" else "accuracy"
+    )
+    learning_config = {
+        "learning_strategy": "from_scratch",
+        "learning_strategy_params": {**DEFAULT_AUTOML_LEARNING_CONFIG, "timeout": int(timeout)},
+        "optimisation_loss": {"quality_loss": learning_loss},
+    }
+
+    return {
+        "industrial_config": industrial_config,
+        "automl_config": automl_config,
+        "learning_config": learning_config,
+        "compute_config": dict(DEFAULT_COMPUTE_CONFIG),
+    }
 
 
-def _train_strategy_graph(
+def _input_to_tuple(data) -> tuple:
+    return (np.asarray(data.features), np.asarray(data.target))
+
+
+def _train_via_finetune(
     graph: PipelineGraph,
     csv_path: str,
     target_column: str,
+    forecast_length: Optional[int],
     primary_metric: Optional[str],
     test_size: float,
+    industrial_strategy: str,
+    industrial_strategy_params: Optional[Dict[str, Any]],
+    timeout: int,
 ) -> Dict[str, Any]:
-    if not graph.training_strategy:
-        raise ValueError("Graph has no training_strategy")
-    if graph.training_strategy.get("name") != "federated_automl":
-        raise ValueError(f"Unsupported training strategy: {graph.training_strategy.get('name')}")
-    if graph.task_type == "ts_forecasting":
-        raise ValueError("federated_automl is not exposed for ts_forecasting")
+    """Run the architect-approved graph as ``initial_assumption`` through
+    Fedot.Industrial's finetune flow.
 
-    from fedot_ind.core.ensemble.random_automl_forest import RAFEnsembler
+    The graph is treated as a hypothesis; FedotIndustrial.finetune polishes its
+    hyperparameters and returns a fitted solver we then score on the held-out
+    test split.
+    """
+    from fedot_ind.api.main import FedotIndustrial
 
-    ts = min(max(float(test_size) if test_size is not None else 0.2, 0.05), 0.5)
-    X, y, target_info = _load_strategy_arrays(csv_path, target_column, graph.task_type)
-    X_train, X_test, y_train, y_test = _split_strategy_arrays(X, y, graph.task_type, ts)
-    train = _make_strategy_input(X_train, y_train, graph.task_type)
-    test = _make_strategy_input(X_test, y_test, graph.task_type)
+    input_data = load_input_data(csv_path, target_column, graph.task_type, forecast_length)
+    train, test = split_input_data(input_data, test_size=test_size)
 
-    strategy = graph.training_strategy
-    params = dict(strategy.get("params", {}) or {})
-    problem = _task_problem(graph.task_type)
-    data_type = params.get("data_type") or _strategy_data_type(graph.task_type)
-    params.update({
-        "problem": problem,
-        "data_type": data_type,
-        "timeout": float(params.get("timeout", 10) or 10),
-        "n_jobs": int(params.get("n_jobs", 1) or 1),
-    })
-    if not params.get("available_operations"):
-        operations = _default_strategy_operations(problem, data_type)
-        if operations:
-            params["available_operations"] = operations
-    if primary_metric:
-        params["metric"] = primary_metric
+    api_config = _build_api_config(
+        task_type=graph.task_type,
+        forecast_length=forecast_length,
+        primary_metric=primary_metric,
+        industrial_strategy=industrial_strategy,
+        industrial_strategy_params=industrial_strategy_params,
+        timeout=timeout,
+    )
 
-    n_train = int(train.features.shape[0])
-    requested_splits = int(params.pop("n_splits", 5) or 5)
-    n_splits = max(2, min(requested_splits, n_train)) if n_train >= 2 else 1
-    batch_size = max(1, int(np.ceil(n_train / n_splits)))
-    report_params = dict(params)
+    industrial = FedotIndustrial(**api_config)
+    builder = _graph_to_pipeline_builder(graph)
+    industrial.finetune(
+        train_data=_input_to_tuple(train),
+        tuning_params={"tuning_iterations": 5},
+        model_to_tune=builder,
+        return_only_fitted=False,
+    )
 
-    solver = RAFEnsembler(composing_params=dict(params), n_splits=n_splits, batch_size=batch_size)
-    solver.fit(train)
-    train_preds = _predict_raf_ensemble(solver, train, problem).reshape(-1)
-    test_preds = _predict_raf_ensemble(solver, test, problem).reshape(-1)
-    train_metrics = compute_metrics(graph.task_type, y_train, train_preds, primary_metric)
-    test_metrics = compute_metrics(graph.task_type, y_test, test_preds, primary_metric)
+    fitted_pipeline = industrial.manager.solver
+    test_preds = np.asarray(industrial.predict(_input_to_tuple(test))).reshape(-1)
+    train_preds = np.asarray(industrial.predict(_input_to_tuple(train))).reshape(-1)
+    industrial.shutdown()
 
-    _store_run(solver, graph, train, test_preds)
+    train_metrics = compute_metrics(graph.task_type, train.target, train_preds, primary_metric)
+    test_metrics = compute_metrics(graph.task_type, test.target, test_preds, primary_metric)
+
+    assumption_graph = _pipeline_to_graph_dict(fitted_pipeline, graph.task_type)
+    try:
+        assumption_mermaid = (
+            PipelineGraph.from_dict(assumption_graph).to_mermaid() if assumption_graph else ""
+        )
+    except Exception:
+        assumption_mermaid = ""
+
+    _store_run(fitted_pipeline, graph, train, test_preds)
+    target_info = _target_info(csv_path, target_column, graph.task_type)
+
+    notes = [
+        "Engineer ran Fedot.Industrial finetune over the architect's graph as the initial assumption.",
+    ]
+    if industrial_strategy and industrial_strategy != "tabular":
+        notes.append(
+            f"industrial_strategy='{industrial_strategy}' was attached to the run via industrial_config."
+        )
+    else:
+        notes.append("industrial_strategy='tabular' - default Fedot context was used (no industrial strategy).")
+
     return {
         "score": test_metrics["primary_score"],
         "metrics": test_metrics,
         "train_metrics": train_metrics,
         "test_metrics": test_metrics,
-        "split_info": {"test_size": ts, "n_train": len(y_train), "n_test": len(y_test)},
-        "graph": graph.to_dict(),
-        "training_strategy": {
-            "name": strategy.get("name"),
-            "params": report_params,
-            "n_splits": n_splits,
-            "batch_size": batch_size,
-            "head": "xgboost" if problem == "classification" else "treg",
+        "split_info": {
+            "test_size": test_size,
+            "n_train": input_sample_count(train),
+            "n_test": input_sample_count(test),
         },
+        "graph": graph.to_dict(),
+        "assumption_graph": assumption_graph,
+        "assumption_mermaid": assumption_mermaid,
+        "industrial_strategy": industrial_strategy or "tabular",
+        "industrial_strategy_params": industrial_strategy_params or {},
         "target_info": target_info,
-        "training_notes": [
-            "Fedot.Industrial federated_automl strategy was used instead of direct graph execution.",
-            "The displayed graph is the approved architecture contract; RAFEnsembler internally trains AutoML branches on worker folds and joins them with a head model.",
-            f"Strategy split: {n_splits} branch models, batch_size={batch_size}, head={'xgboost' if problem == 'classification' else 'treg'}.",
-            (
-                "data_type=table constrained available_operations to tabular FEDOT models."
-                if _is_table_strategy(data_type)
-                else "data_type=time_series allows Fedot.Industrial TS feature extraction and heavier industrial operations."
-            ),
-        ],
+        "training_notes": notes,
+    }
+
+
+def _train_direct(
+    graph: PipelineGraph,
+    csv_path: str,
+    target_column: str,
+    forecast_length: Optional[int],
+    primary_metric: Optional[str],
+    test_size: float,
+) -> Dict[str, Any]:
+    """Fallback path: fit the graph as-is without Fedot.Industrial finetune."""
+    input_data = load_input_data(csv_path, target_column, graph.task_type, forecast_length)
+    train, val = split_input_data(input_data, test_size=test_size)
+
+    pipeline = graph.to_fedot_pipeline()
+    pipeline.fit(train)
+    train_preds = _predict_pipeline(pipeline, train, graph.task_type)
+    test_preds = _predict_pipeline(pipeline, val, graph.task_type)
+
+    train_metrics = compute_metrics(graph.task_type, train.target, train_preds, primary_metric)
+    test_metrics = compute_metrics(graph.task_type, val.target, test_preds, primary_metric)
+    _store_run(pipeline, graph, input_data, test_preds)
+
+    target_info = _target_info(csv_path, target_column, graph.task_type)
+    notes = ["Engineer used the direct-fit fallback (Fedot.Industrial finetune unavailable)."]
+    if target_info.get("fedot_receives_raw_target") and target_info.get("reference_encoded"):
+        notes.append(
+            "Fedot graph received the raw string classification target; reference mapping is shown only for readable diagnostics."
+        )
+
+    return {
+        "score": test_metrics["primary_score"],
+        "metrics": test_metrics,
+        "train_metrics": train_metrics,
+        "test_metrics": test_metrics,
+        "split_info": {
+            "test_size": test_size,
+            "n_train": input_sample_count(train),
+            "n_test": input_sample_count(val),
+        },
+        "graph": graph.to_dict(),
+        "assumption_graph": graph.to_dict(),
+        "assumption_mermaid": graph.to_mermaid(),
+        "industrial_strategy": "tabular",
+        "industrial_strategy_params": {},
+        "target_info": target_info,
+        "training_notes": notes,
     }
 
 
@@ -399,8 +506,8 @@ def get_available_operations(task_type: str) -> str:
         "models": ops["models"],
         "catalog": get_operation_catalog(task_type),
         "metrics": METRICS_BY_TASK.get(task_type, []),
-        "training_strategies_catalog": get_training_strategies(task_type),
-        "training_strategies": get_training_strategy_hints(task_type),
+        "industrial_strategies_catalog": get_training_strategies(task_type),
+        "industrial_strategy_hints": get_training_strategy_hints(task_type),
         "default_graph": DEFAULT_GRAPHS.get(task_type, []),
         "industrial_templates": INDUSTRIAL_GRAPH_TEMPLATES.get(task_type, []),
     })
@@ -428,7 +535,11 @@ def propose_graph(graph_json: str) -> str:
 
 @mcp.tool()
 def mutate_graph(graph_json: str, mutation_json: str) -> str:
-    """Apply a mutation: type=add|remove|replace|set_params|connect plus details. Returns the new graph."""
+    """Apply a graph-only mutation: type=add|remove|replace|connect plus details. Returns the new graph.
+
+    Strategy mutations (set_strategy/clear_strategy) are no longer applied to the
+    graph - they target DataContext.industrial_strategy at the orchestrator level.
+    """
     try:
         graph = PipelineGraph.from_dict(json.loads(graph_json))
         mutation = json.loads(mutation_json)
@@ -466,8 +577,24 @@ def train_graph(
     forecast_length: Optional[int] = None,
     primary_metric: Optional[str] = None,
     test_size: float = 0.2,
+    industrial_strategy: str = "tabular",
+    industrial_strategy_params: Optional[Dict[str, Any]] = None,
+    finetune_timeout: int = 5,
 ) -> str:
-    """Train a pipeline graph as-is on the data. Returns score and per-task metrics on the held-out test split."""
+    """Treat the graph as Fedot.Industrial's initial assumption and run finetune.
+
+    Behavior:
+    - Loads the CSV, splits into train/test.
+    - Converts the graph into a PipelineBuilder usable as ``model_to_tune``.
+    - Runs ``FedotIndustrial.finetune`` with ``industrial_strategy`` (when not
+      ``tabular``) and the optional ``industrial_strategy_params`` attached to
+      ``industrial_config``.
+    - Falls back to a direct fit only when finetune raises an exception, so the
+      iteration still produces a score.
+
+    Returns score, metrics, the post-finetune assumption graph, and the
+    industrial strategy actually used during the run.
+    """
     try:
         csv_path = normalize_csv_path(csv_path)
         graph = PipelineGraph.from_dict(json.loads(graph_json))
@@ -477,45 +604,43 @@ def train_graph(
 
         ts = float(test_size) if test_size is not None else 0.2
         ts = min(max(ts, 0.05), 0.5)
+        timeout = max(1, int(finetune_timeout or 5))
 
-        if graph.uses_training_strategy():
-            return json.dumps(_train_strategy_graph(graph, csv_path, target_column, primary_metric, ts))
-
-        input_data = load_input_data(csv_path, target_column, graph.task_type, forecast_length)
-        train, val = split_input_data(input_data, test_size=ts)
-
-        pipeline = graph.to_fedot_pipeline()
-        pipeline.fit(train)
-        train_preds = _predict_pipeline(pipeline, train, graph.task_type)
-        test_preds = _predict_pipeline(pipeline, val, graph.task_type)
-
-        train_metrics = compute_metrics(graph.task_type, train.target, train_preds, primary_metric)
-        test_metrics = compute_metrics(graph.task_type, val.target, test_preds, primary_metric)
-        _store_run(pipeline, graph, input_data, test_preds)
-
-        target_info = _target_info(csv_path, target_column, graph.task_type)
-        training_notes = []
-        if target_info.get("fedot_receives_raw_target") and target_info.get("reference_encoded"):
-            training_notes.append(
-                "Fedot graph received the raw string classification target; reference mapping is shown only for readable diagnostics."
+        try:
+            result = _train_via_finetune(
+                graph=graph,
+                csv_path=csv_path,
+                target_column=target_column,
+                forecast_length=forecast_length,
+                primary_metric=primary_metric,
+                test_size=ts,
+                industrial_strategy=industrial_strategy or "tabular",
+                industrial_strategy_params=industrial_strategy_params,
+                timeout=timeout,
             )
-
-        return json.dumps({
-            "score": test_metrics["primary_score"],
-            "metrics": test_metrics,
-            "train_metrics": train_metrics,
-            "test_metrics": test_metrics,
-            "split_info": {
-                "test_size": ts,
-                "n_train": input_sample_count(train),
-                "n_test": input_sample_count(val),
-            },
-            "graph": graph.to_dict(),
-            "n_train": input_sample_count(train),
-            "n_val": input_sample_count(val),
-            "target_info": target_info,
-            "training_notes": training_notes,
-        })
+            return json.dumps(result)
+        except Exception as finetune_exc:
+            logger.exception("Finetune flow failed; falling back to direct fit")
+            try:
+                fallback = _train_direct(
+                    graph=graph,
+                    csv_path=csv_path,
+                    target_column=target_column,
+                    forecast_length=forecast_length,
+                    primary_metric=primary_metric,
+                    test_size=ts,
+                )
+                fallback["training_notes"].insert(
+                    0,
+                    f"Finetune flow raised '{finetune_exc}'. Engineer fell back to direct fit.",
+                )
+                return json.dumps(fallback)
+            except Exception as fallback_exc:
+                logger.exception("Direct-fit fallback also failed")
+                return json.dumps({
+                    "score": 0,
+                    "error": f"finetune failed ({finetune_exc}); direct fallback failed ({fallback_exc})",
+                })
     except Exception as e:
         logger.exception("train_graph failed")
         return json.dumps({"score": 0, "error": str(e)})
@@ -536,13 +661,6 @@ def validate_graph(
         ok, msg = graph.validate()
         if not ok:
             return json.dumps({"error": f"Invalid graph: {msg}"})
-
-        if graph.uses_training_strategy():
-            return json.dumps({
-                "skipped": "Cross-validation for training strategies is skipped to avoid repeatedly running nested AutoML ensembles.",
-                "primary_metric": primary_metric,
-                "primary_score_direction": "higher_is_better",
-            })
 
         input_data = load_input_data(csv_path, target_column, graph.task_type, forecast_length)
 
@@ -594,18 +712,6 @@ def get_node_importance(
     try:
         csv_path = normalize_csv_path(csv_path)
         graph = PipelineGraph.from_dict(json.loads(graph_json))
-        if graph.uses_training_strategy():
-            return json.dumps({
-                "skipped": "Node ablation is unavailable for strategy graphs.",
-                "node_importance": {},
-                "diagnostics": [{
-                    "agent": "Critic",
-                    "kind": "strategy_node_importance_skipped",
-                    "summary": "Strategy internals are generated by Fedot.Industrial, so node ablation on the display graph would be misleading.",
-                    "recommendations": ["Use train/test metrics and history comparison to judge the strategy run."],
-                    "recoverable": True,
-                }],
-            })
         input_data = load_input_data(csv_path, target_column, graph.task_type, forecast_length)
         train, val = split_input_data(input_data)
 

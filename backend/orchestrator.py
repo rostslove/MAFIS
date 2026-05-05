@@ -64,6 +64,8 @@ async def run_orchestration_stream(
     forecast_length: Optional[int] = None,
     primary_metric: Optional[str] = None,
     test_size: float = 0.2,
+    industrial_strategy: str = "tabular",
+    industrial_strategy_params: Optional[Dict[str, Any]] = None,
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """Evaluate one user-approved graph and yield SSE-friendly events."""
     del fedot_url, initial_fedot_config
@@ -92,6 +94,8 @@ async def run_orchestration_stream(
         forecast_length=forecast_length,
         primary_metric=primary_metric,
         test_size=test_size,
+        industrial_strategy=(industrial_strategy or "tabular"),
+        industrial_strategy_params=dict(industrial_strategy_params or {}),
     )
     yield _event(
         "status",
@@ -100,6 +104,19 @@ async def run_orchestration_stream(
     yield _event("status", message=f"Train/test split: test_size={test_size:.2f}")
     if primary_metric:
         yield _event("status", message=f"Primary metric: {primary_metric}")
+    if data_context.industrial_strategy and data_context.industrial_strategy != "tabular":
+        yield _event(
+            "status",
+            message=(
+                f"Industrial execution strategy: {data_context.industrial_strategy}. "
+                "Fedot.Industrial will run the strategy-specific training path."
+            ),
+        )
+    else:
+        yield _event(
+            "status",
+            message="Industrial execution strategy: tabular (default Fedot AutoML on the proposed graph).",
+        )
 
     mcp_client: Optional[MCPToolClient] = None
     try:
@@ -162,13 +179,21 @@ async def run_orchestration_stream(
                 )
 
                 yield _event("agent_start", agent="Engineer", iteration=iteration, step="2/3")
-                strategy_name = (architect_result.graph.get("training_strategy") or {}).get("name") or ""
-                if strategy_name:
+                strategy_name = data_context.industrial_strategy or "tabular"
+                if strategy_name and strategy_name != "tabular":
                     yield _event(
                         "status",
                         message=(
                             f"Engineer is running Fedot.Industrial strategy '{strategy_name}'. "
-                            "This can take longer than direct graph execution."
+                            "Finetune of the assumption graph can take longer than direct graph execution."
+                        ),
+                    )
+                else:
+                    yield _event(
+                        "status",
+                        message=(
+                            "Engineer is finetuning the proposed graph through Fedot.Industrial AutoML "
+                            "(tabular execution mode)."
                         ),
                     )
                 engineer_task = asyncio.create_task(
@@ -180,13 +205,13 @@ async def run_orchestration_stream(
                     if engineer_task.done():
                         break
                     elapsed = int(time.monotonic() - engineer_started)
-                    if strategy_name:
+                    if strategy_name and strategy_name != "tabular":
                         message = (
-                            f"Still training '{strategy_name}'. Fedot.Industrial may be fitting "
+                            f"Still running '{strategy_name}'. Fedot.Industrial may be fitting "
                             "several internal branch pipelines."
                         )
                     else:
-                        message = "Still training and scoring the approved graph."
+                        message = "Still finetuning the assumption graph through Fedot.Industrial AutoML."
                     yield _event(
                         "agent_progress",
                         agent="Engineer",
@@ -252,6 +277,10 @@ async def run_orchestration_stream(
                     winner=critic_result.winner,
                     graph=architect_result.graph,
                     mermaid=architect_result.mermaid,
+                    assumption_graph=engineer_result.assumption_graph,
+                    assumption_mermaid=engineer_result.assumption_mermaid,
+                    industrial_strategy=engineer_result.industrial_strategy,
+                    industrial_strategy_params=engineer_result.industrial_strategy_params,
                     diagnostics=engineer_result.diagnostics + critic_result.diagnostics,
                 )
 
@@ -305,6 +334,8 @@ async def run_orchestration(
     forecast_length: Optional[int] = None,
     primary_metric: Optional[str] = None,
     test_size: float = 0.2,
+    industrial_strategy: str = "tabular",
+    industrial_strategy_params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Collect streaming events and return the final result."""
     final_result: Dict[str, Any] = {"status": "failed", "error": "No result"}
@@ -319,6 +350,8 @@ async def run_orchestration(
         forecast_length=forecast_length,
         primary_metric=primary_metric,
         test_size=test_size,
+        industrial_strategy=industrial_strategy,
+        industrial_strategy_params=industrial_strategy_params,
     ):
         if evt.get("event") == "complete":
             final_result = evt.get("result", final_result)
@@ -335,6 +368,8 @@ async def propose_architecture(
     current_graph: Optional[Dict[str, Any]] = None,
     forecast_length: Optional[int] = None,
     primary_metric: Optional[str] = None,
+    industrial_strategy: str = "tabular",
+    industrial_strategy_params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """One-shot Architect interaction for the frontend graph approval flow."""
     csv_path = normalize_csv_path(csv_path)
@@ -349,6 +384,8 @@ async def propose_architecture(
         profile=profile,
         forecast_length=forecast_length,
         primary_metric=primary_metric,
+        industrial_strategy=(industrial_strategy or "tabular"),
+        industrial_strategy_params=dict(industrial_strategy_params or {}),
     )
 
     mcp_client = await _connect_mcp()
@@ -397,12 +434,16 @@ async def propose_revision_from_critic(
     forecast_length: Optional[int] = None,
     primary_metric: Optional[str] = None,
     selected_mutations: Optional[list] = None,
+    industrial_strategy: str = "tabular",
+    industrial_strategy_params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Create a new draft graph from explicit Critic feedback; user must approve it.
 
     ``selected_mutations`` lets the frontend pass the subset the user picked via
-    checkboxes. Architect receives those mutations as LLM context and returns the
-    revised graph; this function no longer revises the graph itself."""
+    checkboxes. Architect receives the graph-level mutations as LLM context and
+    returns the revised graph. ``set_strategy`` mutations do not modify the
+    graph: they are applied to the DataContext (industrial_strategy and params)
+    and surfaced back to the caller so the frontend can confirm the switch."""
     csv_path = normalize_csv_path(csv_path)
     if task_type not in SUPPORTED_TASKS:
         return {"error": f"Unknown task type: {task_type}"}
@@ -419,6 +460,12 @@ async def propose_revision_from_critic(
         else critic_feedback.get("suggested_mutations", []) or []
     )
 
+    graph_mutations, applied_strategy, applied_strategy_params = _split_graph_and_strategy_mutations(
+        selected_feedback_mutations,
+        fallback_strategy=industrial_strategy,
+        fallback_params=industrial_strategy_params,
+    )
+
     data_context = DataContext(
         csv_path=csv_path,
         target_column=target_column,
@@ -426,13 +473,15 @@ async def propose_revision_from_critic(
         profile=profile,
         forecast_length=forecast_length,
         primary_metric=primary_metric,
+        industrial_strategy=(applied_strategy or "tabular"),
+        industrial_strategy_params=dict(applied_strategy_params or {}),
     )
     feedback = CriticFeedback(
         winner=critic_feedback.get("winner", "needs_revision"),
         assessment=critic_feedback.get("assessment", ""),
         strengths=critic_feedback.get("strengths", []) or [],
         weaknesses=critic_feedback.get("weaknesses", []) or [],
-        suggested_mutations=selected_feedback_mutations,
+        suggested_mutations=graph_mutations,
         improvement_plan=critic_feedback.get("improvement_plan", []) or [],
         should_stop=False,
     )
@@ -463,6 +512,8 @@ async def propose_revision_from_critic(
             "reasoning": result.reasoning,
             "diagnostics": result.diagnostics,
             "applied_mutations": selected_feedback_mutations,
+            "industrial_strategy": data_context.industrial_strategy,
+            "industrial_strategy_params": dict(data_context.industrial_strategy_params or {}),
             "requires_approval": True,
             "tool_calls": [tc.to_dict() for tc in result.tool_calls],
         }
@@ -477,6 +528,36 @@ async def propose_revision_from_critic(
         "diagnostics": [],
         "tool_calls": [],
     }
+
+
+def _split_graph_and_strategy_mutations(
+    mutations: list,
+    fallback_strategy: str = "tabular",
+    fallback_params: Optional[Dict[str, Any]] = None,
+):
+    """Separate set_strategy mutations from graph-mutation list.
+
+    The last set_strategy in the list wins; its strategy/params override the
+    fallback values supplied by the caller. Returns (graph_mutations,
+    strategy_name, strategy_params)."""
+    graph_mutations = []
+    chosen_strategy = (fallback_strategy or "tabular")
+    chosen_params: Dict[str, Any] = dict(fallback_params or {})
+    for mutation in mutations or []:
+        if not isinstance(mutation, dict):
+            continue
+        if mutation.get("type") == "set_strategy":
+            strategy = mutation.get("strategy")
+            if isinstance(strategy, dict):
+                name = strategy.get("name")
+                if isinstance(name, str) and name.strip():
+                    chosen_strategy = name.strip()
+                params = strategy.get("params")
+                if isinstance(params, dict):
+                    chosen_params = dict(params)
+            continue
+        graph_mutations.append(mutation)
+    return graph_mutations, chosen_strategy, chosen_params
 
 
 def mutate_graph_locally(graph: Dict[str, Any], mutation: Dict[str, Any]) -> Dict[str, Any]:
@@ -510,8 +591,8 @@ def _engineer_summary(engineer_result: EngineerResult) -> str:
         value_text = f"{float(value):.4f}"
     except (TypeError, ValueError):
         value_text = str(value)
-    strategy = engineer_result.training_strategy.get("name") if engineer_result.training_strategy else ""
-    prefix = f"{strategy}; " if strategy else ""
+    strategy = engineer_result.industrial_strategy or "tabular"
+    prefix = f"{strategy}; " if strategy and strategy != "tabular" else ""
     return f"{prefix}{metric}: {value_text}; ranking score: {engineer_result.graph_score:.4f}"
 
 

@@ -33,18 +33,21 @@ Return one strict JSON object with exactly this shape:
     {"type": "remove", "node_id": "existing_node_id"},
     {"type": "replace", "node_id": "existing_node_id", "new_operation": "allowed_operation"},
     {"type": "add", "node": {"id": "new_node_id", "operation": "allowed_operation", "params": {}, "inputs": []}, "rewire_input_of": "existing_node_id"},
-    {"type": "set_params", "node_id": "existing_node_id", "params": {}},
-    {"type": "set_strategy", "strategy": {"name": "allowed_strategy", "params": {}}},
-    {"type": "clear_strategy"}
+    {"type": "connect", "node_id": "existing_node_id", "input_id": "existing_node_id"},
+    {"type": "set_strategy", "strategy": {"name": "allowed_industrial_strategy", "params": {}}}
   ],
   "improvement_plan": ["short next step"],
   "should_stop": false
 }
 
-Use only evidence from the payload. Use only operations and strategies listed in
-allowed_catalog. If the graph failed, focus on recovery mutations. If the graph
-is good enough and no revision is needed, return suggested_mutations=[] and
-should_stop=true. Return JSON only."""
+Mutations of type remove/replace/add/connect modify the pipeline graph itself.
+The `set_strategy` mutation does NOT touch the graph; it asks the user to switch
+Fedot.Industrial execution strategy (tabular/federated_automl/sampling_strategy)
+on the next iteration. The user must approve any strategy switch through the UI.
+Use only operations and strategies listed in allowed_catalog. If the graph
+failed, focus on recovery mutations. If the graph is good enough and no
+revision is needed, return suggested_mutations=[] and should_stop=true.
+Return JSON only."""
 
     def __init__(self, name: str = "Critic", mcp_client=None):
         super().__init__(name=name, mcp_client=mcp_client)
@@ -263,8 +266,11 @@ should_stop=true. Return JSON only."""
         return {
             "preprocessing": list(ops.get("preprocessing", []) or []),
             "models": list(ops.get("models", []) or []),
-            "training_strategies": [
-                item.get("name")
+            "industrial_strategies": [
+                {
+                    "name": item.get("name"),
+                    "description": item.get("description", ""),
+                }
                 for item in get_training_strategies(task_type)
                 if isinstance(item, dict) and item.get("name")
             ],
@@ -303,7 +309,7 @@ should_stop=true. Return JSON only."""
         if not isinstance(mutation, dict):
             return "mutation is not an object"
         kind = mutation.get("type")
-        allowed_kinds = {"remove", "replace", "add", "set_params", "set_strategy", "clear_strategy", "connect"}
+        allowed_kinds = {"remove", "replace", "add", "connect", "set_strategy"}
         if kind not in allowed_kinds:
             return f"unsupported mutation type '{kind}'"
 
@@ -314,7 +320,7 @@ should_stop=true. Return JSON only."""
             + (OPERATIONS.get(dc.task_type, {}) or {}).get("models", [])
         )
 
-        if kind in {"remove", "replace", "set_params", "connect"} and mutation.get("node_id") not in node_ids:
+        if kind in {"remove", "replace", "connect"} and mutation.get("node_id") not in node_ids:
             return f"node_id '{mutation.get('node_id')}' does not exist"
         if kind == "replace" and mutation.get("new_operation") not in allowed_operations:
             return f"operation '{mutation.get('new_operation')}' is not allowed for task '{dc.task_type}'"
@@ -328,8 +334,6 @@ should_stop=true. Return JSON only."""
                 return f"operation '{node.get('operation')}' is not allowed for task '{dc.task_type}'"
         if kind == "connect" and mutation.get("input_id") not in node_ids:
             return f"input_id '{mutation.get('input_id')}' does not exist"
-        if kind == "set_params" and not isinstance(mutation.get("params", {}), dict):
-            return "set_params requires params object"
         if kind == "set_strategy":
             strategy = mutation.get("strategy") or {}
             strategy_name = strategy.get("name") if isinstance(strategy, dict) else None
@@ -340,6 +344,8 @@ should_stop=true. Return JSON only."""
             }
             if strategy_name not in allowed_strategy_names:
                 return f"strategy '{strategy_name}' is not allowed for task '{dc.task_type}'"
+            # set_strategy does not touch the graph; skip graph re-validation.
+            return ""
 
         try:
             candidate = PipelineGraph.from_dict(graph).apply_mutation(mutation)

@@ -47,9 +47,9 @@ TOOL_DESCRIPTIONS = {
     "get_data_profile": "Profile dataset shape, target distribution and factual data issues",
     "get_available_operations": "Return atomic graph operations allowed for a task type",
     "propose_graph": "Validate a graph candidate and return Mermaid markup",
-    "mutate_graph": "Apply add/remove/replace/set_params/connect mutations to a graph",
+    "mutate_graph": "Apply add/remove/replace/connect mutations to a graph",
     "visualize_graph": "Render graph JSON to Mermaid markup",
-    "train_graph": "Fit and score a graph exactly as proposed, using training_strategy when selected",
+    "train_graph": "Pass the proposed graph to Fedot.Industrial as initial_assumption and finetune it under the selected industrial strategy",
     "validate_graph": "Cross-validate a graph",
     "get_node_importance": "Estimate node contribution by ablation",
     "explain_graph": "Explain the last trained graph if model internals expose importances",
@@ -89,8 +89,8 @@ async def get_config(request):
         "operations": OPERATIONS,
         "operation_catalog": {task: get_operation_catalog(task) for task in SUPPORTED_TASKS},
         "operation_descriptions": OPERATION_DESCRIPTIONS,
-        "training_strategies": {task: get_training_strategies(task) for task in SUPPORTED_TASKS},
-        "training_strategy_hints": {task: get_training_strategy_hints(task) for task in SUPPORTED_TASKS},
+        "industrial_strategies": {task: get_training_strategies(task) for task in SUPPORTED_TASKS},
+        "industrial_strategy_hints": {task: get_training_strategy_hints(task) for task in SUPPORTED_TASKS},
         "fedot_industrial_strategy_catalog": get_fedot_industrial_strategy_catalog(),
         "default_graphs": DEFAULT_GRAPHS,
         "industrial_graph_templates": INDUSTRIAL_GRAPH_TEMPLATES,
@@ -122,8 +122,17 @@ async def get_tools(request):
     })
 
 
+def _payload_strategy(payload: Dict[str, Any]):
+    name = payload.get("industrial_strategy") or "tabular"
+    params = payload.get("industrial_strategy_params") or {}
+    if not isinstance(params, dict):
+        params = {}
+    return str(name), params
+
+
 async def architect_chat(request):
     payload = await _json_body(request)
+    strategy_name, strategy_params = _payload_strategy(payload)
     try:
         result = await propose_architecture(
             csv_path=payload.get("csv_path", ""),
@@ -133,6 +142,8 @@ async def architect_chat(request):
             current_graph=payload.get("current_graph"),
             forecast_length=payload.get("forecast_length"),
             primary_metric=payload.get("primary_metric"),
+            industrial_strategy=strategy_name,
+            industrial_strategy_params=strategy_params,
         )
         if result.get("error"):
             return JSONResponse(result, status_code=400)
@@ -144,6 +155,7 @@ async def architect_chat(request):
 
 async def architect_revise(request):
     payload = await _json_body(request)
+    strategy_name, strategy_params = _payload_strategy(payload)
     try:
         result = await propose_revision_from_critic(
             csv_path=payload.get("csv_path", ""),
@@ -155,6 +167,8 @@ async def architect_revise(request):
             forecast_length=payload.get("forecast_length"),
             primary_metric=payload.get("primary_metric"),
             selected_mutations=payload.get("selected_mutations"),
+            industrial_strategy=strategy_name,
+            industrial_strategy_params=strategy_params,
         )
         if result.get("error"):
             return JSONResponse(result, status_code=400)
@@ -183,6 +197,7 @@ def _payload_test_size(payload: Dict[str, Any]) -> float:
 
 async def orchestrate(request):
     payload = await _json_body(request)
+    strategy_name, strategy_params = _payload_strategy(payload)
     try:
         result = await run_orchestration(
             csv_path=payload.get("csv_path", ""),
@@ -193,6 +208,8 @@ async def orchestrate(request):
             forecast_length=payload.get("forecast_length"),
             primary_metric=payload.get("primary_metric"),
             test_size=_payload_test_size(payload),
+            industrial_strategy=strategy_name,
+            industrial_strategy_params=strategy_params,
         )
         return JSONResponse(result)
     except Exception as exc:
@@ -219,6 +236,7 @@ async def benchmark_m4_load(request):
 
 async def orchestrate_stream(request):
     payload = await _json_body(request)
+    strategy_name, strategy_params = _payload_strategy(payload)
 
     async def event_generator():
         try:
@@ -231,6 +249,8 @@ async def orchestrate_stream(request):
                 forecast_length=payload.get("forecast_length"),
                 primary_metric=payload.get("primary_metric"),
                 test_size=_payload_test_size(payload),
+                industrial_strategy=strategy_name,
+                industrial_strategy_params=strategy_params,
             ):
                 yield f"data: {json.dumps(evt, default=str, ensure_ascii=False)}\n\n"
         except Exception as exc:
