@@ -53,6 +53,12 @@ fallback baseline metrics, not as a clean Fedot.Industrial finetune result.
 Preserve and reason from diagnostics. Do not recommend re-adding an operation
 that diagnostics identify as failed/skipped/bypassed unless the payload shows a
 different configuration that directly addresses that failure.
+When diagnostics include kind="failure_localization", treat primary_suspect,
+confidence, evidence, and ruled_out_nodes as factual runtime evidence. Prefer
+mutations that address a high-confidence primary_suspect over nodes that merely
+produced fallback metrics. If runtime_issue is
+fedot_industrial_output_mode_compatibility, explain it as an adapter/runtime
+compatibility issue, not as a model hyperparameter.
 Analyze traceback text when present. If traceback points to categorical encoder,
 one_hot_encoding, label_encoding, categorical_ids, or a similar categorical
 metadata failure, explicitly consider removing the explicit encoder from the

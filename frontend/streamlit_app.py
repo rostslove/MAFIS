@@ -218,9 +218,23 @@ def render_diagnostics(diagnostics: List[Dict[str, Any]], title: str = "Diagnost
             if item.get("problem_nodes"):
                 st.write("Problem nodes")
                 st.dataframe(pd.DataFrame(item["problem_nodes"]), use_container_width=True, hide_index=True)
+            if item.get("primary_suspect"):
+                st.write("Primary suspect")
+                st.dataframe(pd.DataFrame([item["primary_suspect"]]), use_container_width=True, hide_index=True)
+            if item.get("confidence"):
+                st.caption(f"Confidence: {item.get('confidence')}")
+            if item.get("evidence"):
+                st.write("Evidence")
+                for evidence in item.get("evidence", [])[:6]:
+                    st.write(f"- {evidence}")
+            if item.get("ruled_out_nodes"):
+                st.write("Ruled out by recovery attempts")
+                st.dataframe(pd.DataFrame(item["ruled_out_nodes"]), use_container_width=True, hide_index=True)
             if item.get("bypassed_nodes"):
                 st.write("Bypassed nodes")
                 st.dataframe(pd.DataFrame(item["bypassed_nodes"]), use_container_width=True, hide_index=True)
+            if item.get("runtime_issue"):
+                st.caption(f"Runtime issue: `{item.get('runtime_issue')}`")
             if item.get("technical_message"):
                 st.caption("Technical message")
                 st.code(str(item["technical_message"])[:4000])
@@ -256,15 +270,25 @@ def runtime_failure_details(engineer: Dict[str, Any], critic: Dict[str, Any]) ->
     diagnostics = []
     diagnostics.extend(engineer.get("diagnostics", []) or [])
     diagnostics.extend(critic.get("diagnostics", []) or [])
-    selected = {}
+    selected = next(
+        (
+            diagnostic
+            for diagnostic in diagnostics
+            if isinstance(diagnostic, dict) and diagnostic.get("kind") == "failure_localization"
+        ),
+        {},
+    )
     for diagnostic in diagnostics:
         if not isinstance(diagnostic, dict):
             continue
         kind = str(diagnostic.get("kind") or "")
         technical = str(diagnostic.get("technical_message") or "")
+        if selected:
+            break
         if technical == error or kind.endswith("_error") or kind in {
             "runtime_error", "finetune_fallback", "finetune_fallback_after_node_skip",
             "node_skip_recovery_failed", "node_skipped_after_runtime_error",
+            "failure_localization",
         }:
             selected = diagnostic
             break
@@ -292,6 +316,7 @@ def runtime_failure_details(engineer: Dict[str, Any], critic: Dict[str, Any]) ->
             summary = "Training did not complete cleanly. See technical details below."
     recommendations = unique_text(selected.get("recommendations", []) or [])
     problem_nodes = selected.get("problem_nodes") or []
+    evidence = selected.get("evidence") or []
     recovery_attempts = selected.get("recovery_attempts") or []
     fallback_used = str(engineer.get("fallback_used") or "").strip()
     return {
@@ -299,6 +324,7 @@ def runtime_failure_details(engineer: Dict[str, Any], critic: Dict[str, Any]) ->
         "technical": technical,
         "recommendations": recommendations,
         "problem_nodes": problem_nodes,
+        "evidence": evidence,
         "recovery_attempts": recovery_attempts,
         "finetune_error": finetune_error,
         "fallback_used": fallback_used,
@@ -329,8 +355,13 @@ def render_runtime_failure_once(iteration: Dict[str, Any]) -> bool:
             st.write(f"- {recommendation}")
     problem_nodes = details.get("problem_nodes") or []
     if problem_nodes:
-        st.write("Problem nodes (Engineer tried to bypass these)")
+        st.write("Likely problem nodes")
         st.dataframe(pd.DataFrame(problem_nodes), use_container_width=True, hide_index=True)
+    evidence = details.get("evidence") or []
+    if evidence:
+        with st.expander("Why Engineer thinks so", expanded=False):
+            for item in evidence[:6]:
+                st.write(f"- {item}")
     recovery_attempts = details.get("recovery_attempts") or []
     if recovery_attempts:
         with st.expander(f"Recovery attempts ({len(recovery_attempts)})", expanded=False):
@@ -1248,10 +1279,6 @@ def render_critic_feedback(critic: Dict[str, Any], compact_runtime_error: bool =
         st.write("Recovery plan" if compact_runtime_error else "Improvement plan")
         for item in critic["improvement_plan"]:
             st.write(f"- {item}")
-    if critic.get("questions_for_user"):
-        st.info("Critic needs user input before the next graph can be made confidently.")
-        for item in critic["questions_for_user"]:
-            st.write(f"- {item}")
     if critic.get("suggested_mutations"):
         recovery_remove_mode = compact_runtime_error or any(
             isinstance(item, dict)
@@ -1611,8 +1638,13 @@ def results_tab() -> None:
 
     with sub_tabs[4]:
         st.markdown("#### Next Pipeline Decision")
+        critic_questions = critic.get("questions_for_user", []) or []
+        if critic_questions:
+            st.info("Critic needs your input before the next graph can be made confidently.")
+            for question in critic_questions:
+                st.write(f"- {question}")
         msg = st.text_area(
-            "Optional note for Architect",
+            "Answer Critic / note for Architect",
             placeholder=(
                 "Answer Critic questions here, for example: categorical columns are workclass, education, "
                 "marital-status, occupation, relationship, race, sex, native-country."

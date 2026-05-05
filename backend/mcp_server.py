@@ -11,6 +11,7 @@ import logging
 import os
 import sys
 import traceback
+from contextlib import contextmanager
 from copy import deepcopy
 from inspect import Parameter, signature
 from typing import Any, Dict, List, Optional, Union, get_args, get_origin
@@ -126,6 +127,43 @@ def _predict_pipeline(pipeline, data, task_type: str) -> np.ndarray:
         except Exception:
             pass
     return np.asarray(pipeline.predict(data).predict)
+
+
+def _as_2d_if_1d(features):
+    arr = np.asarray(features)
+    if arr.ndim == 1:
+        return arr.reshape(-1, 1)
+    return features
+
+
+@contextmanager
+def _sklearn_preprocessors_accept_1d():
+    """Allow sklearn preprocessors to consume per-feature vectors from Fedot.Industrial."""
+    try:
+        from sklearn.preprocessing import MinMaxScaler, Normalizer, RobustScaler, StandardScaler
+    except Exception:
+        yield
+        return
+
+    patched = []
+
+    def wrap(method):
+        def wrapped(self, X, *args, **kwargs):
+            return method(self, _as_2d_if_1d(X), *args, **kwargs)
+        return wrapped
+
+    try:
+        for cls in (StandardScaler, MinMaxScaler, RobustScaler, Normalizer):
+            for method_name in ("fit", "partial_fit", "transform", "fit_transform", "inverse_transform"):
+                method = getattr(cls, method_name, None)
+                if method is None:
+                    continue
+                patched.append((cls, method_name, method))
+                setattr(cls, method_name, wrap(method))
+        yield
+    finally:
+        for cls, method_name, method in patched:
+            setattr(cls, method_name, method)
 
 
 def _task_problem(task_type: str) -> str:
@@ -350,17 +388,26 @@ def _train_via_finetune(
 
     industrial = FedotIndustrial(**api_config)
     builder = _graph_to_pipeline_builder(graph)
-    industrial.finetune(
-        train_data=_input_to_tuple(train),
-        tuning_params={"tuning_iterations": 5},
-        model_to_tune=builder,
-        return_only_fitted=False,
-    )
+    with _sklearn_preprocessors_accept_1d():
+        try:
+            industrial.finetune(
+                train_data=_input_to_tuple(train),
+                tuning_params={"tuning_iterations": 5},
+                model_to_tune=builder,
+                return_only_fitted=False,
+            )
 
-    fitted_pipeline = industrial.manager.solver
-    test_preds = np.asarray(industrial.predict(_input_to_tuple(test))).reshape(-1)
-    train_preds = np.asarray(industrial.predict(_input_to_tuple(train))).reshape(-1)
-    industrial.shutdown()
+            fitted_pipeline = industrial.manager.solver
+            # Use the fitted FEDOT solver directly. FedotIndustrial.predict()
+            # passes an output_mode argument through some strategy adapters that
+            # do not accept it in this runtime.
+            test_preds = _predict_pipeline(fitted_pipeline, test, graph.task_type).reshape(-1)
+            train_preds = _predict_pipeline(fitted_pipeline, train, graph.task_type).reshape(-1)
+        finally:
+            try:
+                industrial.shutdown()
+            except Exception as shutdown_exc:
+                logger.warning("FedotIndustrial shutdown failed: %s", shutdown_exc)
 
     train_metrics = compute_metrics(graph.task_type, train.target, train_preds, primary_metric)
     test_metrics = compute_metrics(graph.task_type, test.target, test_preds, primary_metric)
@@ -419,9 +466,10 @@ def _train_direct(
     train, val = split_input_data(input_data, test_size=test_size)
 
     pipeline = graph.to_fedot_pipeline()
-    pipeline.fit(train)
-    train_preds = _predict_pipeline(pipeline, train, graph.task_type)
-    test_preds = _predict_pipeline(pipeline, val, graph.task_type)
+    with _sklearn_preprocessors_accept_1d():
+        pipeline.fit(train)
+        train_preds = _predict_pipeline(pipeline, train, graph.task_type)
+        test_preds = _predict_pipeline(pipeline, val, graph.task_type)
 
     train_metrics = compute_metrics(graph.task_type, train.target, train_preds, primary_metric)
     test_metrics = compute_metrics(graph.task_type, val.target, test_preds, primary_metric)
@@ -694,8 +742,9 @@ def validate_graph(
             val = slice_input_data(input_data, np.flatnonzero(~mask))
 
             pipeline = graph.to_fedot_pipeline()
-            pipeline.fit(train)
-            preds = _predict_pipeline(pipeline, val, graph.task_type)
+            with _sklearn_preprocessors_accept_1d():
+                pipeline.fit(train)
+                preds = _predict_pipeline(pipeline, val, graph.task_type)
             m = compute_metrics(graph.task_type, val.target, preds, primary_metric)
             scores.append(m["primary_score"])
 
@@ -733,13 +782,14 @@ def get_node_importance(
 
         # Reference score: full graph
         full_pipe = graph.to_fedot_pipeline()
-        full_pipe.fit(train)
-        full_score = compute_metrics(
-            graph.task_type,
-            val.target,
-            _predict_pipeline(full_pipe, val, graph.task_type),
-            primary_metric,
-        )["primary_score"]
+        with _sklearn_preprocessors_accept_1d():
+            full_pipe.fit(train)
+            full_score = compute_metrics(
+                graph.task_type,
+                val.target,
+                _predict_pipeline(full_pipe, val, graph.task_type),
+                primary_metric,
+            )["primary_score"]
 
         importances: Dict[str, float] = {}
         for node in graph.nodes:
@@ -752,13 +802,14 @@ def get_node_importance(
                 if not ok:
                     continue
                 pipe = ablated.to_fedot_pipeline()
-                pipe.fit(train)
-                score = compute_metrics(
-                    graph.task_type,
-                    val.target,
-                    _predict_pipeline(pipe, val, graph.task_type),
-                    primary_metric,
-                )["primary_score"]
+                with _sklearn_preprocessors_accept_1d():
+                    pipe.fit(train)
+                    score = compute_metrics(
+                        graph.task_type,
+                        val.target,
+                        _predict_pipeline(pipe, val, graph.task_type),
+                        primary_metric,
+                    )["primary_score"]
                 importances[node.id] = round(full_score - score, 4)
             except Exception as e:
                 importances[node.id] = None
