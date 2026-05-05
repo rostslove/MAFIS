@@ -87,6 +87,7 @@ class EngineerResult:
     industrial_strategy_params: Dict[str, Any] = field(default_factory=dict)
     graph_error: str = ""
     finetune_error: str = ""
+    finetune_traceback: str = ""
     fallback_used: str = ""
     target_info: Dict[str, Any] = field(default_factory=dict)
     training_notes: List[str] = field(default_factory=list)
@@ -106,6 +107,7 @@ class EngineerResult:
             "industrial_strategy_params": self.industrial_strategy_params,
             "graph_error": self.graph_error,
             "finetune_error": self.finetune_error,
+            "finetune_traceback": self.finetune_traceback,
             "fallback_used": self.fallback_used,
             "target_info": self.target_info,
             "training_notes": self.training_notes,
@@ -122,6 +124,7 @@ class CriticFeedback:
     weaknesses: List[str] = field(default_factory=list)
     suggested_mutations: List[Dict[str, Any]] = field(default_factory=list)
     improvement_plan: List[str] = field(default_factory=list)
+    questions_for_user: List[str] = field(default_factory=list)
     should_stop: bool = False
     node_importance: Dict[str, float] = field(default_factory=dict)
     explanation: Dict[str, Any] = field(default_factory=dict)
@@ -137,6 +140,7 @@ class CriticFeedback:
             "weaknesses": self.weaknesses,
             "suggested_mutations": self.suggested_mutations,
             "improvement_plan": self.improvement_plan,
+            "questions_for_user": self.questions_for_user,
             "should_stop": self.should_stop,
             "node_importance": self.node_importance,
             "explanation": self.explanation,

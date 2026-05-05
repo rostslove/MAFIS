@@ -22,9 +22,13 @@ class DataProfiler:
         # Convert to numpy if needed
         if isinstance(X, pd.DataFrame):
             feature_names = list(X.columns)
-            X_arr = X.select_dtypes(include=[np.number]).values
+            numeric_columns = list(X.select_dtypes(include=[np.number]).columns)
+            categorical_columns = list(X.select_dtypes(exclude=[np.number]).columns)
+            X_arr = X[numeric_columns].values if numeric_columns else np.empty((len(X), 0))
         else:
             feature_names = [f"feature_{i}" for i in range(X.shape[1])]
+            numeric_columns = feature_names
+            categorical_columns = []
             X_arr = np.asarray(X, dtype=float)
 
         if isinstance(y, pd.Series):
@@ -40,6 +44,8 @@ class DataProfiler:
             "n_samples": n_samples,
             "n_features": n_features,
             "feature_names": feature_names[:20],  # first 20 for display
+            "numeric_feature_names": numeric_columns[:30],
+            "categorical_feature_names": categorical_columns[:30],
             "sample_feature_ratio": round(n_samples / max(n_features, 1), 1),
         }
 
@@ -92,6 +98,7 @@ class DataProfiler:
                 feature_stats["categorical_count"] = len(cardinalities)
                 feature_stats["max_categorical_cardinality"] = max(cardinalities.values()) if cardinalities else 0
                 feature_stats["high_cardinality_categoricals"] = sum(1 for c in cardinalities.values() if c > 50)
+                feature_stats["categorical_cardinalities"] = dict(list(cardinalities.items())[:30])
 
         profile["feature_stats"] = feature_stats
 

@@ -103,13 +103,14 @@ class CriticFeedbackObject(BaseModel):
     weaknesses: List[str] = Field(default_factory=list)
     suggested_mutations: List[CriticMutationObject] = Field(default_factory=list)
     improvement_plan: List[str] = Field(default_factory=list)
+    questions_for_user: List[str] = Field(default_factory=list)
     should_stop: bool = False
 
     @validator("assessment", pre=True, always=True)
     def stringify_assessment(cls, value: Any) -> str:
         return "" if value is None else str(value).strip()
 
-    @validator("strengths", "weaknesses", "improvement_plan", pre=True, always=True)
+    @validator("strengths", "weaknesses", "improvement_plan", "questions_for_user", pre=True, always=True)
     def string_list(cls, value: Any) -> List[str]:
         if value is None:
             return []

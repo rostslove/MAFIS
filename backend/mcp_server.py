@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import sys
+import traceback
 from copy import deepcopy
 from inspect import Parameter, signature
 from typing import Any, Dict, List, Optional, Union, get_args, get_origin
@@ -623,6 +624,7 @@ def train_graph(
         except Exception as finetune_exc:
             logger.exception("Finetune flow failed; recording error and trying direct fit")
             finetune_error = repr(finetune_exc)
+            finetune_traceback = traceback.format_exc()
             try:
                 fallback = _train_direct(
                     graph=graph,
@@ -637,11 +639,13 @@ def train_graph(
                     f"Fedot.Industrial finetune raised: {finetune_error}. Direct-fit fallback metrics were produced as a baseline.",
                 )
                 fallback["finetune_error"] = finetune_error
+                fallback["finetune_traceback"] = finetune_traceback
                 fallback["fallback_used"] = "direct_fit"
                 fallback["fallback_reason"] = "Fedot.Industrial finetune raised before producing a fitted solver."
                 return json.dumps(fallback)
             except Exception as fallback_exc:
                 logger.exception("Direct-fit fallback also failed")
+                fallback_traceback = traceback.format_exc()
                 return json.dumps({
                     "score": 0,
                     "error": (
@@ -649,7 +653,9 @@ def train_graph(
                         f"direct-fit fallback also failed: {fallback_exc!r}."
                     ),
                     "finetune_error": finetune_error,
+                    "finetune_traceback": finetune_traceback,
                     "fallback_error": repr(fallback_exc),
+                    "fallback_traceback": fallback_traceback,
                 })
     except Exception as e:
         logger.exception("train_graph failed")

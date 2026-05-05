@@ -37,6 +37,7 @@ Return one strict JSON object with exactly this shape:
     {"type": "set_strategy", "strategy": {"name": "allowed_industrial_strategy", "params": {}}}
   ],
   "improvement_plan": ["short next step"],
+  "questions_for_user": ["short question when user input would materially improve the next graph"],
   "should_stop": false
 }
 
@@ -47,6 +48,19 @@ on the next iteration. The user must approve any strategy switch through the UI.
 Use only operations and strategies listed in allowed_catalog. If the graph
 failed, focus on recovery mutations. If the graph is good enough and no
 revision is needed, return suggested_mutations=[] and should_stop=true.
+If engineer_result.finetune_error or fallback_used is present, treat metrics as
+fallback baseline metrics, not as a clean Fedot.Industrial finetune result.
+Preserve and reason from diagnostics. Do not recommend re-adding an operation
+that diagnostics identify as failed/skipped/bypassed unless the payload shows a
+different configuration that directly addresses that failure.
+Analyze traceback text when present. If traceback points to categorical encoder,
+one_hot_encoding, label_encoding, categorical_ids, or a similar categorical
+metadata failure, explicitly consider removing the explicit encoder from the
+graph. For CatBoost-like models, remember that the model can often handle
+categorical features without a separate one-hot node if categorical columns are
+known. If the correct categorical columns are unclear, put a concrete question
+in questions_for_user asking the user to confirm/pass those column names for
+Architect; do not invent unknown categorical column names.
 Return JSON only."""
 
     def __init__(self, name: str = "Critic", mcp_client=None):
@@ -125,6 +139,7 @@ Return JSON only."""
             feedback.assessment = llm_feedback.assessment
             feedback.strengths = llm_feedback.strengths
             feedback.weaknesses = llm_feedback.weaknesses
+            feedback.questions_for_user = llm_feedback.questions_for_user
             feedback.diagnostics = diagnostics
             feedback.explanation = explanation if isinstance(explanation, dict) else {}
             feedback.node_importance = (
@@ -228,6 +243,7 @@ Return JSON only."""
                 "split_info": engineer.split_info,
                 "graph_error": engineer.graph_error,
                 "finetune_error": engineer.finetune_error,
+                "finetune_traceback": engineer.finetune_traceback[-6000:],
                 "fallback_used": engineer.fallback_used,
                 "training_notes": engineer.training_notes,
                 "diagnostics": engineer.diagnostics,
@@ -375,7 +391,13 @@ Return JSON only."""
     ) -> bool:
         if not requested:
             return False
-        if engineer.graph_error or engineer.graph_score <= 0 or has_recovery:
+        if (
+            engineer.graph_error
+            or engineer.finetune_error
+            or engineer.fallback_used
+            or engineer.graph_score <= 0
+            or has_recovery
+        ):
             return False
         if suggested_mutations:
             return False

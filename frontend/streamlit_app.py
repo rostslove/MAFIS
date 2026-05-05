@@ -33,7 +33,6 @@ METRIC_METADATA_KEYS = {
     "primary_score",
     "primary_score_direction",
 }
-ZERO_SCORE_FAILURE_METRICS = {"accuracy", "f1", "precision", "recall", "roc_auc"}
 
 
 def shared_data_dir() -> Path:
@@ -219,6 +218,9 @@ def render_diagnostics(diagnostics: List[Dict[str, Any]], title: str = "Diagnost
             if item.get("problem_nodes"):
                 st.write("Problem nodes")
                 st.dataframe(pd.DataFrame(item["problem_nodes"]), use_container_width=True, hide_index=True)
+            if item.get("bypassed_nodes"):
+                st.write("Bypassed nodes")
+                st.dataframe(pd.DataFrame(item["bypassed_nodes"]), use_container_width=True, hide_index=True)
             if item.get("technical_message"):
                 st.caption("Technical message")
                 st.code(str(item["technical_message"])[:4000])
@@ -247,11 +249,7 @@ def runtime_failure_details(engineer: Dict[str, Any], critic: Dict[str, Any]) ->
     error = str(engineer.get("graph_error") or "").strip()
     finetune_error = str(engineer.get("finetune_error") or "").strip()
     if not error and finetune_error:
-        metrics = engineer.get("test_metrics", {}) or engineer.get("graph_metrics", {}) or {}
-        primary_metric = str(metrics.get("primary_metric") or "").strip()
-        primary_value = metrics.get("primary_metric_value", engineer.get("graph_score", 0))
-        if primary_metric in ZERO_SCORE_FAILURE_METRICS and (_numeric_or_none(primary_value) or 0) <= 0:
-            error = f"Fedot.Industrial finetune failed: {finetune_error}"
+        error = f"Fedot.Industrial finetune failed: {finetune_error}"
     if not error:
         return {}
 
@@ -265,7 +263,8 @@ def runtime_failure_details(engineer: Dict[str, Any], critic: Dict[str, Any]) ->
         kind = str(diagnostic.get("kind") or "")
         technical = str(diagnostic.get("technical_message") or "")
         if technical == error or kind.endswith("_error") or kind in {
-            "runtime_error", "node_skip_recovery_failed", "node_skipped_after_runtime_error",
+            "runtime_error", "finetune_fallback", "finetune_fallback_after_node_skip",
+            "node_skip_recovery_failed", "node_skipped_after_runtime_error",
         }:
             selected = diagnostic
             break
@@ -303,6 +302,7 @@ def runtime_failure_details(engineer: Dict[str, Any], critic: Dict[str, Any]) ->
         "recovery_attempts": recovery_attempts,
         "finetune_error": finetune_error,
         "fallback_used": fallback_used,
+        "severity": "error" if engineer.get("graph_error") else "warning",
     }
 
 
@@ -313,7 +313,10 @@ def render_runtime_failure_once(iteration: Dict[str, Any]) -> bool:
     if not details:
         return False
 
-    st.error(details["summary"])
+    if details.get("severity") == "error":
+        st.error(details["summary"])
+    else:
+        st.warning(details["summary"])
     fallback_used = details.get("fallback_used")
     if fallback_used:
         st.warning(
@@ -1245,10 +1248,18 @@ def render_critic_feedback(critic: Dict[str, Any], compact_runtime_error: bool =
         st.write("Recovery plan" if compact_runtime_error else "Improvement plan")
         for item in critic["improvement_plan"]:
             st.write(f"- {item}")
+    if critic.get("questions_for_user"):
+        st.info("Critic needs user input before the next graph can be made confidently.")
+        for item in critic["questions_for_user"]:
+            st.write(f"- {item}")
     if critic.get("suggested_mutations"):
         recovery_remove_mode = compact_runtime_error or any(
             isinstance(item, dict)
-            and item.get("kind") in {"node_skipped_after_runtime_error", "node_skip_recovery_failed"}
+            and item.get("kind") in {
+                "node_skipped_after_runtime_error",
+                "node_skip_recovery_failed",
+                "finetune_fallback_after_node_skip",
+            }
             for item in (critic.get("diagnostics", []) or [])
         )
         if recovery_remove_mode:
@@ -1541,12 +1552,7 @@ def results_tab() -> None:
     primary_value = metrics.get("primary_metric_value", engineer.get("graph_score", 0))
     fallback_used = engineer.get("fallback_used", "")
     finetune_error = engineer.get("finetune_error", "")
-    primary_float = _numeric_or_none(primary_value)
-    has_runtime_failure = bool(engineer.get("graph_error")) or (
-        bool(finetune_error)
-        and primary_metric in ZERO_SCORE_FAILURE_METRICS
-        and (primary_float is None or primary_float <= 0)
-    )
+    has_runtime_failure = bool(engineer.get("graph_error")) or bool(finetune_error)
 
     # Header summary: always visible.
     col1, col2, col3 = st.columns(3)
@@ -1607,7 +1613,10 @@ def results_tab() -> None:
         st.markdown("#### Next Pipeline Decision")
         msg = st.text_area(
             "Optional note for Architect",
-            placeholder="Example: prefer a simpler model, avoid heavy operations, or apply only the model replacement.",
+            placeholder=(
+                "Answer Critic questions here, for example: categorical columns are workclass, education, "
+                "marital-status, occupation, relationship, race, sex, native-country."
+            ),
             height=90,
         )
         col_apply, col_keep = st.columns(2)

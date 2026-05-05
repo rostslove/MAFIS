@@ -52,32 +52,12 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
                 )
                 result.graph_error = graph_run.get("error", "") or ""
                 result.finetune_error = graph_run.get("finetune_error", "") or ""
+                result.finetune_traceback = graph_run.get("finetune_traceback", "") or ""
                 result.fallback_used = graph_run.get("fallback_used", "") or ""
                 result.target_info = graph_run.get("target_info", {}) or result.target_info
                 result.training_notes.extend(graph_run.get("training_notes", []) or [])
                 result.diagnostics.extend(self._extract_diagnostics(graph_run))
-                # Always surface the underlying training error (with the original
-                # finetune exception, if any) as a diagnostic so the UI can
-                # display the technical message without relying on the Critic
-                # to echo it.
-                if result.graph_error and not any(
-                    isinstance(item, dict)
-                    and item.get("technical_message") == result.graph_error
-                    for item in result.diagnostics
-                ):
-                    result.diagnostics.append({
-                        "agent": "Engineer",
-                        "kind": "runtime_error",
-                        "summary": (
-                            "Fedot.Industrial finetune raised an exception during training."
-                            if result.finetune_error
-                            else "Engineer could not finish training the proposed graph."
-                        ),
-                        "technical_message": result.graph_error,
-                        "finetune_error": result.finetune_error,
-                        "fallback_used": result.fallback_used,
-                        "recoverable": True,
-                    })
+                self._append_training_diagnostic(result)
                 result.diagnostics = self._unique_diagnostics(result.diagnostics)
                 if result.graph_error:
                     result.graph_metrics["error"] = result.graph_error
@@ -162,6 +142,7 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
 
         original_error = self._failure_message(failed_run)
         attempts: List[Dict[str, Any]] = []
+        best_fallback: Dict[str, Any] | None = None
         for node in candidates:
             recovered_graph = self._graph_with_node_skipped(graph, str(node["id"]))
             recovered_json = json.dumps(recovered_graph, ensure_ascii=False)
@@ -169,7 +150,7 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
             if not isinstance(recovered, dict):
                 recovered = {"score": 0, "error": "train_graph returned no data"}
 
-            if not self._should_attempt_node_recovery(recovered):
+            if self._recovery_resolved(failed_run, recovered):
                 diagnostic = self._nodes_skipped_diagnostic([node], original_error, recovered_graph)
                 recovered.setdefault("diagnostics", [])
                 recovered["diagnostics"] = (
@@ -193,10 +174,18 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
                 )
                 return recovered
 
+            best_fallback = self._best_fallback_candidate(
+                current=best_fallback,
+                recovered=recovered,
+                nodes=[node],
+                recovered_graph=recovered_graph,
+            )
             attempts.append({
                 "id": node.get("id"),
                 "operation": node.get("operation"),
                 "error": self._failure_message(recovered),
+                "score": self._primary_score(recovered),
+                "fallback_used": recovered.get("fallback_used", ""),
             })
 
         if len(candidates) > 1:
@@ -215,7 +204,7 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
                 "error": self._failure_message(recovered),
             })
 
-            if not self._should_attempt_node_recovery(recovered):
+            if self._recovery_resolved(failed_run, recovered):
                 diagnostic = self._nodes_skipped_diagnostic(candidates, original_error, recovered_graph)
                 recovered.setdefault("diagnostics", [])
                 recovered["diagnostics"] = (
@@ -240,6 +229,39 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
                     ", ".join(str(node.get("id")) for node in candidates),
                 )
                 return recovered
+            best_fallback = self._best_fallback_candidate(
+                current=best_fallback,
+                recovered=recovered,
+                nodes=candidates,
+                recovered_graph=recovered_graph,
+            )
+
+        if best_fallback:
+            recovered = best_fallback["run"]
+            diagnostic = self._fallback_only_diagnostic(
+                best_fallback["nodes"],
+                original_error,
+                best_fallback["graph"],
+            )
+            recovered.setdefault("diagnostics", [])
+            recovered["diagnostics"] = (
+                list(failed_run.get("diagnostics", []) or [])
+                + [diagnostic]
+                + list(recovered.get("diagnostics", []) or [])
+            )
+            recovered.setdefault("training_notes", [])
+            skipped = ", ".join(
+                f"'{node.get('id')}' ({node.get('operation')})"
+                for node in best_fallback["nodes"]
+            )
+            recovered["training_notes"].append(
+                f"Engineer found direct-fit fallback metrics after bypassing {skipped}, "
+                "but Fedot.Industrial finetune still failed. Treat this as a baseline, not a clean recovery."
+            )
+            recovered["fallback_from_error"] = True
+            recovered["original_error"] = original_error
+            recovered["effective_graph"] = best_fallback["graph"]
+            return recovered
 
         problem_nodes = [
             {"id": node.get("id"), "operation": node.get("operation")}
@@ -381,6 +403,41 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
             "recovered": True,
         }
 
+    @staticmethod
+    def _fallback_only_diagnostic(
+        nodes: List[Dict[str, Any]],
+        original_error: str,
+        recovered_graph: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        bypassed_nodes = [
+            {"id": node.get("id"), "operation": node.get("operation")}
+            for node in nodes
+        ]
+        if len(bypassed_nodes) == 1:
+            summary = (
+                f"Engineer got direct-fit fallback metrics after bypassing "
+                f"'{bypassed_nodes[0].get('id')}' ({bypassed_nodes[0].get('operation')}), "
+                "but Fedot.Industrial finetune still failed."
+            )
+        else:
+            skipped = ", ".join(
+                f"'{node.get('id')}' ({node.get('operation')})" for node in bypassed_nodes
+            )
+            summary = (
+                f"Engineer got direct-fit fallback metrics after bypassing {skipped}, "
+                "but Fedot.Industrial finetune still failed."
+            )
+        return {
+            "agent": "Engineer",
+            "kind": "finetune_fallback_after_node_skip",
+            "summary": summary,
+            "technical_message": original_error[:2000],
+            "bypassed_nodes": bypassed_nodes,
+            "effective_graph": recovered_graph,
+            "recoverable": True,
+            "recovered": False,
+        }
+
     @classmethod
     def _should_attempt_node_recovery(cls, payload: Dict[str, Any]) -> bool:
         if not isinstance(payload, dict):
@@ -429,6 +486,36 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
                 return str(metrics.get("primary_metric"))
         return ""
 
+    @classmethod
+    def _recovery_resolved(cls, original: Dict[str, Any], recovered: Dict[str, Any]) -> bool:
+        if not isinstance(recovered, dict) or recovered.get("error"):
+            return False
+        if original.get("finetune_error"):
+            return not recovered.get("finetune_error") and not recovered.get("fallback_used")
+        return not cls._should_attempt_node_recovery(recovered)
+
+    @classmethod
+    def _best_fallback_candidate(
+        cls,
+        current: Dict[str, Any] | None,
+        recovered: Dict[str, Any],
+        nodes: List[Dict[str, Any]],
+        recovered_graph: Dict[str, Any],
+    ) -> Dict[str, Any] | None:
+        if not isinstance(recovered, dict) or recovered.get("error"):
+            return current
+        if not (recovered.get("finetune_error") or recovered.get("fallback_used")):
+            return current
+        score = cls._primary_score(recovered)
+        if current and score <= current.get("score", 0):
+            return current
+        return {
+            "score": score,
+            "run": recovered,
+            "nodes": nodes,
+            "graph": recovered_graph,
+        }
+
     @staticmethod
     def _failure_message(payload: Dict[str, Any]) -> str:
         if not isinstance(payload, dict):
@@ -440,6 +527,43 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
         if payload.get("fallback_error"):
             return f"Direct-fit fallback failed: {payload.get('fallback_error')}"
         return "Training returned unusable metrics"
+
+    @staticmethod
+    def _append_training_diagnostic(result: EngineerResult) -> None:
+        """Surface factual training path issues even when fallback metrics exist."""
+        if result.graph_error:
+            technical_message = result.graph_error
+            kind = "runtime_error"
+            summary = (
+                "Fedot.Industrial finetune raised an exception during training."
+                if result.finetune_error
+                else "Engineer could not finish training the proposed graph."
+            )
+        elif result.finetune_error:
+            technical_message = f"Fedot.Industrial finetune failed: {result.finetune_error}"
+            kind = "finetune_fallback"
+            summary = (
+                "Fedot.Industrial finetune failed, so Engineer reported direct-fit fallback metrics."
+            )
+        else:
+            return
+
+        if any(
+            isinstance(item, dict) and item.get("technical_message") == technical_message
+            for item in result.diagnostics
+        ):
+            return
+
+        result.diagnostics.append({
+            "agent": "Engineer",
+            "kind": kind,
+            "summary": summary,
+            "technical_message": technical_message,
+            "finetune_error": result.finetune_error,
+            "finetune_traceback": result.finetune_traceback[-6000:],
+            "fallback_used": result.fallback_used,
+            "recoverable": True,
+        })
 
     @staticmethod
     def _extract_diagnostics(payload: Dict[str, Any]) -> List[Dict[str, Any]]:

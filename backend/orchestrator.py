@@ -483,6 +483,7 @@ async def propose_revision_from_critic(
         weaknesses=critic_feedback.get("weaknesses", []) or [],
         suggested_mutations=graph_mutations,
         improvement_plan=critic_feedback.get("improvement_plan", []) or [],
+        questions_for_user=critic_feedback.get("questions_for_user", []) or [],
         should_stop=False,
         diagnostics=critic_feedback.get("diagnostics", []) or [],
     )

@@ -193,6 +193,7 @@ Return JSON only."""
                 "weaknesses": prev_fb.weaknesses,
                 "suggested_mutations": prev_fb.suggested_mutations,
                 "improvement_plan": prev_fb.improvement_plan,
+                "questions_for_user": prev_fb.questions_for_user,
                 "diagnostics": prev_fb.diagnostics,
             }
         return (
