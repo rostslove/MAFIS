@@ -499,10 +499,110 @@ def result_metric_value(result: Dict[str, Any]) -> tuple[str, Any]:
     return str(metric), value
 
 
+def result_score(result: Dict[str, Any]) -> float | None:
+    _, value = result_metric_value(result)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def compact_metrics(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    compact: Dict[str, Any] = {}
+    for key, value in (metrics or {}).items():
+        if key == "error":
+            compact[key] = str(value)[:300]
+        elif key in METRIC_METADATA_KEYS:
+            compact[key] = value
+        else:
+            number = _numeric_or_none(value)
+            if number is not None:
+                compact[key] = number
+    return compact
+
+
+def compact_result_for_agent(result: Dict[str, Any], source: str = "", saved_at: str = "", label: str = "") -> Dict[str, Any]:
+    item = latest_iteration(result)
+    if not item:
+        return {}
+    engineer = item.get("engineer", {}) or {}
+    architect = item.get("architect", {}) or {}
+    critic = item.get("critic", {}) or {}
+    metric, value = result_metric_value(result)
+    train_metrics = compact_metrics(engineer.get("train_metrics", {}) or {})
+    test_metrics = compact_metrics(engineer.get("test_metrics", {}) or engineer.get("graph_metrics", {}) or {})
+    graph = architect.get("graph") or engineer.get("assumption_graph") or {}
+    return {
+        "source": source,
+        "saved_at": saved_at,
+        "label": label or result_label(result),
+        "score": _numeric_or_none(value),
+        "primary_metric": metric,
+        "train_metrics": train_metrics,
+        "test_metrics": test_metrics,
+        "critic_decision": critic.get("winner", ""),
+        "graph": graph,
+        "summary": (result.get("report", {}) or {}).get("summary", ""),
+    }
+
+
+def previous_evaluations_for_agent() -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    current = compact_result_for_agent(
+        st.session_state.get("result") or {},
+        source="current_before_new_run",
+        label="Current before new run",
+    )
+    if current:
+        rows.append(current)
+    for entry in st.session_state.get("evaluation_history", []) or []:
+        compact = compact_result_for_agent(
+            entry.get("result", {}) or {},
+            source=entry.get("reason", "previous"),
+            saved_at=entry.get("saved_at", ""),
+            label=entry.get("label", ""),
+        )
+        if compact:
+            rows.append(compact)
+    best = compact_result_for_agent(
+        st.session_state.get("best_result") or {},
+        source="saved_best",
+        saved_at=st.session_state.get("best_saved_at", ""),
+        label=st.session_state.get("best_label", "Saved best"),
+    )
+    if best:
+        rows.append(best)
+    return rows[:10]
+
+
+def update_best_result(candidate: Dict[str, Any]) -> None:
+    candidate_score = result_score(candidate)
+    if candidate_score is None:
+        return
+    best = st.session_state.get("best_result") or {}
+    best_score = result_score(best)
+    if best_score is None or candidate_score > best_score:
+        st.session_state.best_result = copy.deepcopy(candidate)
+        st.session_state.best_saved_at = pd.Timestamp.now().strftime("%H:%M:%S")
+        st.session_state.best_label = result_label(candidate)
+
+
+def best_graph_from_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    best_eval = result.get("best_evaluation", {}) or {}
+    if isinstance(best_eval.get("graph"), dict) and best_eval["graph"]:
+        return best_eval["graph"]
+    best_result = st.session_state.get("best_result") or {}
+    item = latest_iteration(best_result)
+    if item:
+        return (item.get("architect", {}) or {}).get("graph", {}) or (item.get("engineer", {}) or {}).get("assumption_graph", {})
+    return {}
+
+
 def archive_current_result(reason: str) -> None:
     current = st.session_state.get("result")
     if not current or not latest_iteration(current):
         return
+    update_best_result(current)
     history = st.session_state.setdefault("evaluation_history", [])
     history.insert(0, {
         "saved_at": pd.Timestamp.now().strftime("%H:%M:%S"),
@@ -684,6 +784,51 @@ def render_explain_graph_assessment(explanation: Dict[str, Any]) -> None:
                 use_container_width=True,
                 hide_index=True,
             )
+
+
+def render_best_graph_assessment(result: Dict[str, Any]) -> None:
+    comparison = result.get("current_vs_best", {}) or (result.get("report", {}) or {}).get("current_vs_best", {}) or {}
+    best_eval = result.get("best_evaluation", {}) or (result.get("report", {}) or {}).get("best_evaluation", {}) or {}
+    best_graph = best_graph_from_result(result)
+    best_score = _numeric_or_none(comparison.get("best_score") or best_eval.get("score"))
+    current_score = _numeric_or_none(comparison.get("current_score"))
+    metric = comparison.get("primary_metric") or best_eval.get("primary_metric") or result.get("primary_metric") or "score"
+
+    if best_score is None and not best_graph:
+        st.caption("No saved best graph is available yet.")
+        return
+
+    st.write("Saved Best Graph")
+    cols = st.columns(3)
+    cols[0].metric(f"Best {metric}", format_number(best_score) if best_score is not None else "-")
+    if current_score is not None:
+        delta = current_score - best_score if best_score is not None else None
+        cols[1].metric(f"Current {metric}", format_number(current_score))
+        cols[2].metric("Current vs best", format_number(delta) if delta is not None else "-")
+        if delta is not None and delta < 0:
+            st.warning(
+                f"The latest run is below the saved best by {format_number(abs(delta))} {metric}. "
+                "Keep the saved best graph unless there is a non-metric reason to prefer the current run."
+            )
+    if best_eval.get("label") or best_eval.get("saved_at"):
+        st.caption(
+            "Best source: "
+            + " - ".join(str(part) for part in [best_eval.get("label"), best_eval.get("saved_at")] if part)
+        )
+
+    if best_graph:
+        render_graph(best_graph, show_details=False)
+        rows = graph_rows(best_graph)
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        if st.button("Restore Saved Best Graph", use_container_width=True, key="restore_saved_best_graph"):
+            st.session_state.graph = best_graph
+            st.session_state.approved_graph = best_graph
+            st.session_state.mermaid = ""
+            st.session_state.approved_mermaid = ""
+            st.session_state.graph_approved = True
+            st.success("Saved best graph restored as the approved graph.")
+            st.rerun()
 
 
 def industrial_strategies_for_task(config: Dict[str, Any], task_type: str) -> List[Dict[str, Any]]:
@@ -969,7 +1114,9 @@ def stream_run(payload: Dict[str, Any]) -> None:
                 lines.append(f"ERROR: {event.get('message')}")
             elif event_type == "complete":
                 archive_current_result("Previous full evaluation")
-                st.session_state.result = event.get("result", {})
+                completed_result = event.get("result", {})
+                st.session_state.result = completed_result
+                update_best_result(completed_result)
                 progress_value = 1.0
                 progress.progress(1.0)
                 lines.append("Run completed.")
@@ -1338,6 +1485,7 @@ def evaluation_panel() -> None:
             {
                 "iterations": 1,
                 "initial_graph": approved_graph,
+                "previous_evaluations": previous_evaluations_for_agent(),
             }
         )
         try:
@@ -1826,6 +1974,8 @@ def report_tab() -> None:
 
     st.divider()
     st.markdown("#### Visual Assessment")
+    render_best_graph_assessment(result)
+    st.divider()
     render_model_assessment(engineer)
     st.divider()
     render_explain_graph_assessment(critic.get("explanation", {}) or {})

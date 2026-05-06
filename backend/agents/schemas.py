@@ -158,6 +158,9 @@ class ScribeReport:
     results: str = ""
     recommendations: List[str] = field(default_factory=list)
     best_graph_mermaid: str = ""
+    best_graph: Dict[str, Any] = field(default_factory=dict)
+    best_evaluation: Dict[str, Any] = field(default_factory=dict)
+    current_vs_best: Dict[str, Any] = field(default_factory=dict)
     full_response: str = ""
     tool_calls: List[ToolCall] = field(default_factory=list)
 
@@ -169,6 +172,9 @@ class ScribeReport:
             "results": self.results,
             "recommendations": self.recommendations,
             "best_graph_mermaid": self.best_graph_mermaid,
+            "best_graph": self.best_graph,
+            "best_evaluation": self.best_evaluation,
+            "current_vs_best": self.current_vs_best,
             "full_response": self.full_response,
             "tool_calls": [tc.to_dict() for tc in self.tool_calls],
         }

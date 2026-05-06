@@ -210,6 +210,7 @@ async def orchestrate(request):
             test_size=_payload_test_size(payload),
             industrial_strategy=strategy_name,
             industrial_strategy_params=strategy_params,
+            previous_evaluations=payload.get("previous_evaluations") or [],
         )
         return JSONResponse(result)
     except Exception as exc:
@@ -251,6 +252,7 @@ async def orchestrate_stream(request):
                 test_size=_payload_test_size(payload),
                 industrial_strategy=strategy_name,
                 industrial_strategy_params=strategy_params,
+                previous_evaluations=payload.get("previous_evaluations") or [],
             ):
                 yield f"data: {json.dumps(evt, default=str, ensure_ascii=False)}\n\n"
         except Exception as exc:

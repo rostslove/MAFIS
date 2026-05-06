@@ -3,7 +3,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, AsyncGenerator, Dict, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import pandas as pd
 
@@ -66,6 +66,7 @@ async def run_orchestration_stream(
     test_size: float = 0.2,
     industrial_strategy: str = "tabular",
     industrial_strategy_params: Optional[Dict[str, Any]] = None,
+    previous_evaluations: Optional[List[Dict[str, Any]]] = None,
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """Evaluate one user-approved graph and yield SSE-friendly events."""
     del fedot_url, initial_fedot_config
@@ -293,7 +294,16 @@ async def run_orchestration_stream(
                 yield _event("error", message=f"Evaluation failed: {str(exc)[:200]}")
 
         yield _event("agent_start", agent="Scribe", iteration=0, step="final")
-        scribe_result = await scribe.execute(all_results, data_context)
+        previous_evaluations = _normalize_previous_evaluations(previous_evaluations or [])
+        best_evaluation = _get_best_evaluation(all_results, previous_evaluations)
+        current_vs_best = _compare_current_to_best(all_results, best_evaluation)
+        scribe_result = await scribe.execute(
+            all_results,
+            data_context,
+            previous_evaluations=previous_evaluations,
+            best_evaluation=best_evaluation,
+            current_vs_best=current_vs_best,
+        )
         yield _event(
             "agent_done",
             agent="Scribe",
@@ -312,6 +322,9 @@ async def run_orchestration_stream(
             "profile": profile,
             "iterations": all_results,
             "best_iteration": _get_best_iteration(all_results),
+            "previous_evaluations": previous_evaluations,
+            "best_evaluation": best_evaluation,
+            "current_vs_best": current_vs_best,
             "summary": _create_summary(all_results, task_type),
             "report": scribe_result.to_dict(),
             "mcp_tools": mcp_tools,
@@ -336,6 +349,7 @@ async def run_orchestration(
     test_size: float = 0.2,
     industrial_strategy: str = "tabular",
     industrial_strategy_params: Optional[Dict[str, Any]] = None,
+    previous_evaluations: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Collect streaming events and return the final result."""
     final_result: Dict[str, Any] = {"status": "failed", "error": "No result"}
@@ -352,6 +366,7 @@ async def run_orchestration(
         test_size=test_size,
         industrial_strategy=industrial_strategy,
         industrial_strategy_params=industrial_strategy_params,
+        previous_evaluations=previous_evaluations,
     ):
         if evt.get("event") == "complete":
             final_result = evt.get("result", final_result)
@@ -633,6 +648,122 @@ def _get_best_iteration(all_results):
             best_score = score
             best = item
     return best or (all_results[-1] if all_results else {})
+
+
+def _metric_value_from_evaluation(item: Dict[str, Any]) -> Optional[float]:
+    if not isinstance(item, dict):
+        return None
+    if item.get("score") is not None:
+        try:
+            return float(item.get("score"))
+        except (TypeError, ValueError):
+            pass
+    engineer = item.get("engineer", {}) or {}
+    metrics = engineer.get("test_metrics", {}) or engineer.get("graph_metrics", {}) or {}
+    value = metrics.get("primary_metric_value", engineer.get("graph_score"))
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _metric_name_from_evaluation(item: Dict[str, Any], fallback: str = "score") -> str:
+    if not isinstance(item, dict):
+        return fallback
+    if item.get("primary_metric"):
+        return str(item.get("primary_metric"))
+    engineer = item.get("engineer", {}) or {}
+    metrics = engineer.get("test_metrics", {}) or engineer.get("graph_metrics", {}) or {}
+    return str(metrics.get("primary_metric") or fallback)
+
+
+def _graph_from_evaluation(item: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(item, dict):
+        return {}
+    if isinstance(item.get("graph"), dict):
+        return item["graph"]
+    architect = item.get("architect", {}) or {}
+    engineer = item.get("engineer", {}) or {}
+    return architect.get("graph") or engineer.get("assumption_graph") or {}
+
+
+def _compact_current_evaluation(item: Dict[str, Any], source: str = "current") -> Dict[str, Any]:
+    engineer = item.get("engineer", {}) or {}
+    metrics = engineer.get("test_metrics", {}) or engineer.get("graph_metrics", {}) or {}
+    train_metrics = engineer.get("train_metrics", {}) or {}
+    return {
+        "source": source,
+        "iteration": item.get("iteration"),
+        "label": item.get("label") or source,
+        "score": _metric_value_from_evaluation(item),
+        "primary_metric": _metric_name_from_evaluation(item, "score"),
+        "test_metrics": metrics,
+        "train_metrics": train_metrics,
+        "critic_decision": (item.get("critic", {}) or {}).get("winner", ""),
+        "graph": _graph_from_evaluation(item),
+        "summary": item.get("summary", ""),
+    }
+
+
+def _normalize_previous_evaluations(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    normalized = []
+    for idx, item in enumerate(items or []):
+        if not isinstance(item, dict):
+            continue
+        score = _metric_value_from_evaluation(item)
+        if score is None:
+            continue
+        normalized.append({
+            "source": item.get("source") or item.get("reason") or f"previous_{idx + 1}",
+            "saved_at": item.get("saved_at", ""),
+            "label": item.get("label", ""),
+            "score": score,
+            "primary_metric": _metric_name_from_evaluation(item, "score"),
+            "test_metrics": item.get("test_metrics", {}) or {},
+            "train_metrics": item.get("train_metrics", {}) or {},
+            "critic_decision": item.get("critic_decision", ""),
+            "graph": _graph_from_evaluation(item),
+            "summary": item.get("summary", ""),
+        })
+    return normalized[:10]
+
+
+def _get_best_evaluation(current_results: List[Dict[str, Any]], previous_evaluations: List[Dict[str, Any]]) -> Dict[str, Any]:
+    candidates = list(previous_evaluations or [])
+    candidates.extend(
+        _compact_current_evaluation(item, source="current_run")
+        for item in current_results
+        if isinstance(item, dict) and "error" not in item
+    )
+    best, best_score = {}, None
+    for item in candidates:
+        score = _metric_value_from_evaluation(item)
+        if score is None:
+            continue
+        if best_score is None or score > best_score:
+            best_score = score
+            best = item
+    return best
+
+
+def _compare_current_to_best(current_results: List[Dict[str, Any]], best_evaluation: Dict[str, Any]) -> Dict[str, Any]:
+    current = _compact_current_evaluation(_get_best_iteration(current_results), source="current_run")
+    current_score = _metric_value_from_evaluation(current)
+    best_score = _metric_value_from_evaluation(best_evaluation)
+    if current_score is None or best_score is None:
+        return {"status": "unavailable"}
+    delta = current_score - best_score
+    return {
+        "status": "current_is_best" if delta >= 0 else "current_below_best",
+        "primary_metric": current.get("primary_metric") or best_evaluation.get("primary_metric") or "score",
+        "current_score": current_score,
+        "best_score": best_score,
+        "delta": delta,
+        "current_label": current.get("label", "current"),
+        "best_label": best_evaluation.get("label") or best_evaluation.get("source") or "best",
+        "best_source": best_evaluation.get("source", ""),
+        "best_saved_at": best_evaluation.get("saved_at", ""),
+    }
 
 
 def _engineer_summary(engineer_result: EngineerResult) -> str:
