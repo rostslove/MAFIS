@@ -173,6 +173,17 @@ def root_node_id(graph: Dict[str, Any]) -> str:
     return roots[0] if roots else ""
 
 
+def root_node_ids(graph: Dict[str, Any]) -> List[str]:
+    nodes = graph.get("nodes", [])
+    ids = {node.get("id") for node in nodes if node.get("id")}
+    children = {inp for node in nodes for inp in node.get("inputs", [])}
+    return [node_id for node_id in ids - children if node_id]
+
+
+def adopt_graph_draft(graph: Dict[str, Any]) -> None:
+    set_graph({"graph": graph, "mermaid": ""}, approved=False)
+
+
 def require_dataset() -> bool:
     if not st.session_state.get("csv_path") or "df" not in st.session_state:
         st.info("Upload a CSV file to start, or use the Benchmarks tab to run M4 without uploading a dataset.")
@@ -219,12 +230,46 @@ def render_diagnostics(diagnostics: List[Dict[str, Any]], title: str = "Diagnost
             attempts = item.get("recovery_attempts") or []
             if attempts:
                 with st.expander(f"Training attempts ({len(attempts)})", expanded=False):
-                    st.dataframe(pd.DataFrame(attempts), use_container_width=True, hide_index=True)
+                    st.dataframe(
+                        pd.DataFrame(compact_training_attempt_rows(attempts)),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
             if item.get("runtime_issue"):
                 st.caption(f"Runtime issue: `{item.get('runtime_issue')}`")
             if item.get("technical_message"):
                 st.caption("Technical message")
                 st.code(str(item["technical_message"])[:4000])
+
+
+def compact_training_attempt_rows(attempts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    phase_labels = {
+        "finetune_fit": "finetune fit",
+        "finetune_predict": "finetune predict",
+        "direct_fit": "direct-fit fallback",
+        "train_graph": "train graph",
+        "completed": "completed",
+    }
+    for attempt in attempts:
+        if not isinstance(attempt, dict):
+            continue
+        error = (
+            attempt.get("error")
+            or attempt.get("technical_message")
+            or attempt.get("finetune_error")
+            or attempt.get("fallback_error")
+            or ""
+        )
+        rows.append({
+            "attempt": attempt.get("variant") or "attempt",
+            "remaining graph": attempt.get("remaining_graph", ""),
+            "stage": phase_labels.get(attempt.get("phase", ""), attempt.get("phase", "")),
+            "score": attempt.get("score", ""),
+            "fallback": attempt.get("fallback_used") or "",
+            "error": str(error)[:300],
+        })
+    return rows
 
 
 def unique_text(items: List[str]) -> List[str]:
@@ -359,7 +404,11 @@ def render_runtime_failure_once(iteration: Dict[str, Any]) -> bool:
     recovery_attempts = details.get("recovery_attempts") or []
     if recovery_attempts:
         with st.expander(f"Training attempts ({len(recovery_attempts)})", expanded=False):
-            st.dataframe(pd.DataFrame(recovery_attempts), use_container_width=True, hide_index=True)
+            st.dataframe(
+                pd.DataFrame(compact_training_attempt_rows(recovery_attempts)),
+                use_container_width=True,
+                hide_index=True,
+            )
     if details.get("technical"):
         # Open by default so the user immediately sees what actually broke.
         with st.expander("Technical exception (full message)", expanded=True):
@@ -950,20 +999,67 @@ def architect_tab(config: Dict[str, Any]) -> None:
 def graph_editor_tab(config: Dict[str, Any]) -> None:
     st.subheader("Graph Editor")
     graph = st.session_state.get("graph", {})
-    if not graph:
-        st.info("Ask Architect for a graph, then edit it here.")
-        st.write("Available atomic operations")
-        render_operation_catalog(config, st.session_state.get("task_type", "classification"), "editor_empty")
-        return
-
-    task_type = graph.get("task_type", st.session_state.get("task_type", "classification"))
+    task_type = (
+        graph.get("task_type", st.session_state.get("task_type", "classification"))
+        if graph
+        else st.session_state.get("task_type", "classification")
+    )
     operations = config.get("operations", {}).get(task_type, {})
     preprocessing_ops = operations.get("preprocessing", [])
     model_ops = operations.get("models", [])
+
+    if not graph:
+        st.info("Ask Architect for a graph, or create a draft manually here.")
+        if model_ops:
+            with st.form("create_graph_draft"):
+                prep_options = ["(none)"] + list(preprocessing_ops or [])
+                prep_op = st.selectbox("Preprocessing", prep_options, key="create_graph_preprocessing")
+                model_op = st.selectbox("Model", model_ops, key="create_graph_model")
+                create_clicked = st.form_submit_button("Create draft graph")
+                if create_clicked:
+                    nodes: List[Dict[str, Any]] = []
+                    model_inputs: List[str] = []
+                    if prep_op != "(none)":
+                        nodes.append({
+                            "id": "preprocessing",
+                            "operation": prep_op,
+                            "params": {},
+                            "inputs": [],
+                        })
+                        model_inputs = ["preprocessing"]
+                    nodes.append({
+                        "id": "model",
+                        "operation": model_op,
+                        "params": {},
+                        "inputs": model_inputs,
+                    })
+                    adopt_graph_draft({"task_type": task_type, "nodes": nodes})
+                    st.success("Draft graph created.")
+                    st.rerun()
+        else:
+            st.warning("No model operations are exposed for this task.")
+        st.write("Available atomic operations")
+        render_operation_catalog(config, task_type, "editor_empty")
+        return
+
     root_id = root_node_id(graph)
     nodes = graph.get("nodes", [])
-    current_model = next((node for node in nodes if node.get("id") == root_id), {})
-    preprocessing_nodes = [node for node in nodes if node.get("id") != root_id]
+    model_op_set = set(model_ops or [])
+    preprocessing_op_set = set(preprocessing_ops or [])
+    current_model = next(
+        (
+            node
+            for node in nodes
+            if node.get("id") == root_id
+            and (
+                node.get("operation") in model_op_set
+                or node.get("operation") not in preprocessing_op_set
+            )
+        ),
+        {},
+    )
+    current_model_id = current_model.get("id", "")
+    preprocessing_nodes = [node for node in nodes if node.get("id") != current_model_id]
 
     status_col, approve_col, discard_col = st.columns([2, 1, 1])
     status_col.caption("Approved" if st.session_state.get("graph_approved") else "Draft")
@@ -1014,7 +1110,7 @@ def graph_editor_tab(config: Dict[str, Any]) -> None:
                         update_node(current_preprocessing.get("id", ""), prep_op)
                     if remove_clicked:
                         mutate_graph({"type": "remove", "node_id": current_preprocessing.get("id", "")})
-            elif preprocessing_ops:
+            elif preprocessing_ops and current_model:
                 root_inputs = current_model.get("inputs", [])
                 with st.form("add_preprocessing"):
                     new_id = st.text_input("Node id", value="preprocessing")
@@ -1030,6 +1126,8 @@ def graph_editor_tab(config: Dict[str, Any]) -> None:
                             },
                             "rewire_input_of": root_id,
                         })
+            elif preprocessing_ops:
+                st.caption("Add a model first, then insert preprocessing before it.")
             else:
                 st.caption("No preprocessing operations are exposed for this task.")
 
@@ -1046,6 +1144,30 @@ def graph_editor_tab(config: Dict[str, Any]) -> None:
                     submitted = st.form_submit_button("Apply model")
                     if submitted:
                         update_node(root_id, model_op)
+            elif model_ops:
+                existing_ids = [node.get("id", "") for node in nodes]
+                default_model_id = "model" if "model" not in existing_ids else "model_new"
+                input_options = [node_id for node_id in existing_ids if node_id]
+                default_inputs = [node_id for node_id in root_node_ids(graph) if node_id in input_options]
+                with st.form("add_model"):
+                    new_id = st.text_input("Node id", value=default_model_id, key="add_model_id")
+                    model_op = st.selectbox("Operation", model_ops, key="add_model_op")
+                    selected_inputs = st.multiselect(
+                        "Inputs",
+                        input_options,
+                        default=default_inputs,
+                        key="add_model_inputs",
+                    )
+                    submitted = st.form_submit_button("Add model")
+                    if submitted:
+                        mutate_graph({
+                            "type": "add",
+                            "node": {
+                                "id": new_id,
+                                "operation": model_op,
+                                "inputs": selected_inputs,
+                            },
+                        })
             else:
                 st.caption("No model operations returned by backend config.")
 

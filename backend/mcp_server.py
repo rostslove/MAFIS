@@ -379,12 +379,25 @@ def _train_via_finetune(
     builder = _graph_to_pipeline_builder(graph)
     with _sklearn_preprocessors_accept_1d():
         try:
-            industrial.finetune(
-                train_data=_input_to_tuple(train),
-                tuning_params={"tuning_iterations": 5},
-                model_to_tune=builder,
-                return_only_fitted=False,
-            )
+            finetune_kwargs = {
+                "tuning_params": {"tuning_iterations": 5},
+                "model_to_tune": builder,
+                "return_only_fitted": False,
+            }
+            try:
+                industrial.finetune(
+                    train_data=train,
+                    is_fedot_datatype=True,
+                    **finetune_kwargs,
+                )
+            except TypeError as exc:
+                message = str(exc)
+                if "is_fedot_datatype" not in message or "unexpected" not in message:
+                    raise
+                industrial.finetune(
+                    train_data=_input_to_tuple(train),
+                    **finetune_kwargs,
+                )
 
             fitted_pipeline = industrial.manager.solver
             # Use the fitted FEDOT solver directly. FedotIndustrial.predict()

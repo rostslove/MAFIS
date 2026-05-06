@@ -239,6 +239,11 @@ Return JSON only."""
         node_importance: Dict[str, Any],
         diagnostics: List[Dict[str, Any]],
     ) -> Tuple[CriticFeedbackObject, str, bool]:
+        compact_engineer_diagnostics = self._compact_diagnostics(engineer.diagnostics)
+        compact_collected_diagnostics = self._compact_diagnostics(diagnostics)
+        compact_validation = dict(validation)
+        if isinstance(compact_validation.get("diagnostics"), list):
+            compact_validation["diagnostics"] = self._compact_diagnostics(compact_validation["diagnostics"])
         payload = {
             "task_type": dc.task_type,
             "primary_metric": dc.primary_metric,
@@ -253,16 +258,18 @@ Return JSON only."""
                 "split_info": engineer.split_info,
                 "graph_error": engineer.graph_error,
                 "finetune_error": engineer.finetune_error,
-                "finetune_traceback": engineer.finetune_traceback[-6000:],
+                "finetune_traceback": self._truncate_text(engineer.finetune_traceback, 2500),
                 "fallback_used": engineer.fallback_used,
                 "training_notes": engineer.training_notes,
-                "diagnostics": engineer.diagnostics,
-                "runtime_attempts_summary": self._runtime_attempts_summary(engineer.diagnostics),
+                "diagnostics": compact_engineer_diagnostics,
+                "runtime_attempts_summary": self._compact_runtime_attempts_summary(
+                    self._runtime_attempts_summary(engineer.diagnostics)
+                ),
             },
-            "validation": validation,
+            "validation": compact_validation,
             "explanation": explanation,
             "node_importance": node_importance,
-            "collected_diagnostics": diagnostics,
+            "collected_diagnostics": compact_collected_diagnostics,
             "iteration_history": [
                 {
                     "iteration": item.iteration,
@@ -296,6 +303,73 @@ Return JSON only."""
             "preprocessing": list(ops.get("preprocessing", []) or []),
             "models": list(ops.get("models", []) or []),
         }
+
+    @staticmethod
+    def _truncate_text(value: Any, limit: int = 500) -> str:
+        text = str(value or "")
+        return text if len(text) <= limit else text[: limit - 3] + "..."
+
+    @classmethod
+    def _compact_attempts(cls, attempts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        compact: List[Dict[str, Any]] = []
+        for attempt in attempts or []:
+            if not isinstance(attempt, dict):
+                continue
+            compact.append({
+                "variant": attempt.get("variant") or attempt.get("id") or "",
+                "remaining_graph": attempt.get("remaining_graph", ""),
+                "phase": attempt.get("phase", ""),
+                "error_signature": attempt.get("error_signature", ""),
+                "error": cls._truncate_text(attempt.get("error", ""), 260),
+                "score": attempt.get("score", 0),
+                "fallback_used": attempt.get("fallback_used", ""),
+            })
+            if len(compact) >= 6:
+                break
+        return compact
+
+    @classmethod
+    def _compact_runtime_attempts_summary(cls, diagnostic: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(diagnostic, dict) or not diagnostic:
+            return {}
+        compact = {
+            "kind": diagnostic.get("kind", ""),
+            "summary": diagnostic.get("summary", ""),
+            "technical_message": cls._truncate_text(diagnostic.get("technical_message", ""), 500),
+            "recovery_attempts": cls._compact_attempts(diagnostic.get("recovery_attempts", []) or []),
+            "recommendations": list(diagnostic.get("recommendations", []) or [])[:4],
+            "recoverable": diagnostic.get("recoverable", True),
+        }
+        if diagnostic.get("runtime_issue"):
+            compact["runtime_issue"] = diagnostic.get("runtime_issue")
+        return compact
+
+    @classmethod
+    def _compact_diagnostics(cls, diagnostics: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        compact: List[Dict[str, Any]] = []
+        for item in diagnostics or []:
+            if not isinstance(item, dict):
+                continue
+            row: Dict[str, Any] = {
+                "agent": item.get("agent", ""),
+                "kind": item.get("kind", ""),
+                "summary": item.get("summary", ""),
+                "technical_message": cls._truncate_text(item.get("technical_message", ""), 500),
+                "recommendations": list(item.get("recommendations", []) or [])[:4],
+                "recoverable": item.get("recoverable", True),
+            }
+            if item.get("runtime_issue"):
+                row["runtime_issue"] = item.get("runtime_issue")
+            if item.get("problem_nodes"):
+                row["problem_nodes"] = item.get("problem_nodes")
+            if item.get("primary_suspect"):
+                row["primary_suspect"] = item.get("primary_suspect")
+            if item.get("recovery_attempts"):
+                row["recovery_attempts"] = cls._compact_attempts(item.get("recovery_attempts", []) or [])
+            compact.append(row)
+            if len(compact) >= 8:
+                break
+        return compact
 
     def _validated_llm_mutations(
         self,

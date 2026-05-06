@@ -143,7 +143,9 @@ def _tabular_feature_metadata(df: pd.DataFrame, target: str) -> Tuple[pd.DataFra
     for column in numeric_columns:
         feature_df[column] = pd.to_numeric(feature_df[column], errors="coerce")
     for column in categorical_columns:
-        feature_df[column] = feature_df[column].astype("string").fillna("__missing__").astype(str)
+        values = feature_df[column].astype("string").fillna("__missing__")
+        codes, _ = pd.factorize(values, sort=True)
+        feature_df[column] = codes.astype(float)
 
     return feature_df, numeric_columns, categorical_columns
 
@@ -153,16 +155,16 @@ def _input_data_metadata_kwargs(
     numeric_columns: List[str],
     categorical_columns: List[str],
 ) -> Dict[str, Any]:
-    feature_names = list(features.columns)
-    categorical_idx = [feature_names.index(column) for column in categorical_columns if column in feature_names]
-    numerical_idx = [feature_names.index(column) for column in numeric_columns if column in feature_names]
+    feature_name_list = list(features.columns)
+    categorical_idx = [feature_name_list.index(column) for column in categorical_columns if column in feature_name_list]
+    numerical_idx = [feature_name_list.index(column) for column in numeric_columns if column in feature_name_list]
     kwargs: Dict[str, Any] = {
-        "features_names": feature_names,
+        "features_names": np.asarray(feature_name_list, dtype=object),
         "categorical_idx": np.asarray(categorical_idx, dtype=int),
         "numerical_idx": np.asarray(numerical_idx, dtype=int),
     }
     if categorical_idx:
-        kwargs["categorical_features"] = features.iloc[:, categorical_idx].to_numpy(dtype=object)
+        kwargs["categorical_features"] = features.iloc[:, categorical_idx].to_numpy(dtype=float)
     return kwargs
 
 
@@ -179,7 +181,7 @@ def _metadata_kwargs_from_input(input_data: InputData, sample_indices=None) -> D
     if categorical_features is None and supplementary is not None:
         categorical_features = getattr(supplementary, "categorical_features", None)
     if categorical_features is not None:
-        categorical_features = np.asarray(categorical_features, dtype=object)
+        categorical_features = np.asarray(categorical_features)
         if sample_indices is not None and len(categorical_features) == input_sample_count(input_data):
             categorical_features = categorical_features[np.asarray(sample_indices)]
         kwargs["categorical_features"] = categorical_features
@@ -1203,10 +1205,7 @@ def load_input_data(
         X = numeric_feature_df.to_numpy(dtype=float)
     else:
         metadata_kwargs = _input_data_metadata_kwargs(feature_df, numeric_columns, categorical_columns)
-        if categorical_columns:
-            X = feature_df.to_numpy(dtype=object)
-        else:
-            X = feature_df.to_numpy(dtype=float)
+        X = feature_df.to_numpy(dtype=float)
 
     if task_type in ("classification", "ts_classification"):
         task = Task(TaskTypesEnum.classification)

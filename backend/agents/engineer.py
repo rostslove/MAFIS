@@ -603,6 +603,14 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
             recommendations.append(
                 "Treat the finetune result as failed at prediction time; direct-fit metrics are only fallback baseline metrics."
             )
+        if "object_array_to_tensor" in signatures:
+            recommendations.append(
+                "Encode categorical feature values numerically before Fedot.Industrial finetune while preserving categorical column metadata for graph preprocessors."
+            )
+        if "feature_names_indexing" in signatures:
+            recommendations.append(
+                "Pass feature names as an indexable array in FEDOT InputData metadata before relying on direct-fit fallback."
+            )
         return recommendations
 
     @classmethod
@@ -723,6 +731,16 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
             global_evidence.append(
                 "Fedot predict failed because pipeline preprocessing state for source 'default' was missing after finetune."
             )
+        if "numpy.object_" in combined or "can't convert np.ndarray of type" in combined or "torch.from_numpy" in combined:
+            runtime_issue = "fedot_industrial_object_array_conversion"
+            global_evidence.append(
+                "Fedot.Industrial data conversion failed before graph fitting because tabular features contained an object dtype array."
+            )
+        if "only integer scalar arrays can be converted to a scalar index" in combined:
+            runtime_issue = "fedot_feature_names_metadata_indexing"
+            global_evidence.append(
+                "Direct-fit fallback failed while FEDOT indexed feature names metadata with a NumPy array."
+            )
 
         original_signature = cls._error_signature(error_text)
         ruled_out_nodes: List[Dict[str, Any]] = []
@@ -789,6 +807,10 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
     @staticmethod
     def _error_signature(message: str) -> str:
         text = str(message or "").lower()
+        if "numpy.object_" in text or "can't convert np.ndarray of type" in text or "torch.from_numpy" in text:
+            return "object_array_to_tensor"
+        if "only integer scalar arrays can be converted to a scalar index" in text:
+            return "feature_names_indexing"
         if "categorical_ids" in text or "categorical_encoders.py" in text or "no attribute 'size'" in text:
             return "categorical_encoder_metadata"
         if (
