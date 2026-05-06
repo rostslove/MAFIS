@@ -2,7 +2,7 @@
 
 import json
 import logging
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from .base_agent import BaseAgent, extract_json_block
 from .schemas import ArchitectResult, CriticFeedback, DataContext
@@ -29,18 +29,21 @@ Return only one strict JSON object:
   "graph": {
     "task_type": "classification",
     "nodes": [
-      {"id": "model", "operation": "operation_from_catalog", "params": {}, "inputs": []}
+      {"id": "model", "operation": "operation_from_catalog", "inputs": []}
     ]
   },
   "analysis": "why this graph fits the evidence",
-  "reasoning": "why these operations/params were selected from the catalog"
+  "reasoning": "why these operations and connections were selected from the catalog"
 }
 
 Use only operations listed in available_operations. Every input must be an
 existing node id, or [] for raw data. The graph must be a DAG with exactly one
 root model node. The graph passed to Fedot.Industrial as `initial_assumption` is
-finetuned by AutoML. Industrial strategies (federated_automl, sampling_strategy)
-are execution modes selected outside the graph; do not include them in the JSON.
+finetuned by AutoML. Do not propose node parameters, model hyperparameters, or
+operation search-space values; node params must be omitted or empty and are
+ignored by the backend. Industrial strategies (federated_automl,
+sampling_strategy) are execution modes selected outside the graph; do not
+include them in the JSON.
 Return JSON only."""
 
     STRUCTURED_PROMPT = SYSTEM_PROMPT
@@ -102,6 +105,7 @@ Return JSON only."""
             },
         )
         operations = await self.call_mcp_tool("get_available_operations", {"task_type": data_context.task_type})
+        operations = self._structure_only_operations(operations)
 
         repair_notes = ""
         last_analysis = ""
@@ -199,7 +203,8 @@ Return JSON only."""
         return (
             "Create one valid graph proposal for this payload.\n"
             "The graph you produce becomes Fedot.Industrial `initial_assumption` and is polished by AutoML finetune.\n"
-            "available_operations.catalog[].industrial_search_space contains Fedot.Industrial-supported parameter ranges.\n"
+            "Choose only operations and graph topology. Do not choose hyperparameters or node params; "
+            "Fedot.Industrial owns parameter tuning during finetune.\n"
             "available_operations.industrial_templates contains Fedot.Industrial-native graph patterns.\n"
             "available_operations.industrial_strategies_catalog describes selectable execution strategies "
             "(tabular/federated_automl/sampling_strategy). Strategies are picked by the user outside the graph; "
@@ -209,3 +214,52 @@ Return JSON only."""
             "Return only the GraphProposal JSON object.\n"
             f"{json.dumps(payload, ensure_ascii=False)}"
         )
+
+    @staticmethod
+    def _structure_only_operations(operations: Dict[str, Any]) -> Dict[str, Any]:
+        """Remove parameter/search-space hints before sending the catalog to Architect."""
+        if not isinstance(operations, dict):
+            return {}
+        cleaned = dict(operations)
+        catalog = cleaned.get("catalog")
+        if isinstance(catalog, dict):
+            cleaned_catalog: Dict[str, Any] = {}
+            for group, items in catalog.items():
+                if not isinstance(items, list):
+                    cleaned_catalog[group] = items
+                    continue
+                cleaned_catalog[group] = [
+                    {
+                        key: value
+                        for key, value in item.items()
+                        if key not in {"param_hints", "industrial_search_space"}
+                    }
+                    for item in items
+                    if isinstance(item, dict)
+                ]
+            cleaned["catalog"] = cleaned_catalog
+        if isinstance(cleaned.get("default_graph"), list):
+            cleaned["default_graph"] = [
+                {key: value for key, value in node.items() if key != "params"}
+                for node in cleaned["default_graph"]
+                if isinstance(node, dict)
+            ]
+        if isinstance(cleaned.get("industrial_templates"), list):
+            templates = []
+            for template in cleaned["industrial_templates"]:
+                if not isinstance(template, dict):
+                    continue
+                item = dict(template)
+                graph = item.get("graph")
+                if isinstance(graph, dict) and isinstance(graph.get("nodes"), list):
+                    item["graph"] = {
+                        **graph,
+                        "nodes": [
+                            {key: value for key, value in node.items() if key != "params"}
+                            for node in graph["nodes"]
+                            if isinstance(node, dict)
+                        ],
+                    }
+                templates.append(item)
+            cleaned["industrial_templates"] = templates
+        return cleaned

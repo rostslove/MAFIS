@@ -192,7 +192,6 @@ def _graph_to_pipeline_builder(graph: PipelineGraph):
         builder.add_node(
             operation_type=root.operation,
             branch_idx=0,
-            params=dict(root.params) if root.params else None,
         )
         return builder
 
@@ -216,19 +215,16 @@ def _graph_to_pipeline_builder(graph: PipelineGraph):
             builder.add_node(
                 operation_type=node.operation,
                 branch_idx=branch_idx,
-                params=dict(node.params) if node.params else None,
             )
 
     if len(root.inputs) == 1:
         builder.add_node(
             operation_type=root.operation,
             branch_idx=0,
-            params=dict(root.params) if root.params else None,
         )
     else:
         builder.join_branches(
             operation_type=root.operation,
-            params=dict(root.params) if root.params else None,
         )
     return builder
 
@@ -239,13 +235,6 @@ def _pipeline_to_graph_dict(pipeline, task_type: str) -> Dict[str, Any]:
     if pipeline is None or not hasattr(pipeline, "root_node"):
         return {}
     nodes_dict: Dict[int, Dict[str, Any]] = {}
-
-    def _safe_params(node) -> Dict[str, Any]:
-        try:
-            params = getattr(node, "parameters", None) or {}
-        except Exception:
-            params = {}
-        return {str(k): v for k, v in params.items() if not callable(v)}
 
     def _walk(node) -> str:
         node_key = id(node)
@@ -265,7 +254,7 @@ def _pipeline_to_graph_dict(pipeline, task_type: str) -> Dict[str, Any]:
         nodes_dict[node_key].update({
             "id": nid,
             "operation": str(operation_name),
-            "params": _safe_params(node),
+            "params": {},
             "inputs": parent_ids,
         })
         return nid
@@ -568,7 +557,7 @@ def get_available_operations(task_type: str) -> str:
 
 @mcp.tool()
 def propose_graph(graph_json: str) -> str:
-    """Validate and register a pipeline graph. Input is JSON: {task_type, nodes:[{id, operation, params, inputs}]}."""
+    """Validate and register a structure-only graph. Node params are ignored."""
     try:
         graph = PipelineGraph.from_dict(json.loads(graph_json))
         ok, msg = graph.validate()
@@ -584,11 +573,7 @@ def propose_graph(graph_json: str) -> str:
 
 @mcp.tool()
 def mutate_graph(graph_json: str, mutation_json: str) -> str:
-    """Apply a graph-only mutation: type=add|remove|replace|connect plus details. Returns the new graph.
-
-    Strategy mutations (set_strategy/clear_strategy) are no longer applied to the
-    graph - they target DataContext.industrial_strategy at the orchestrator level.
-    """
+    """Apply a graph-only mutation: type=add|remove|replace|connect plus details."""
     try:
         graph = PipelineGraph.from_dict(json.loads(graph_json))
         mutation = json.loads(mutation_json)

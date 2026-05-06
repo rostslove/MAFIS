@@ -653,7 +653,7 @@ def mutation_rows(mutations: List[Dict[str, Any]]) -> List[Dict[str, str]]:
                 "action": "replace",
                 "node": mutation.get("node_id", ""),
                 "target": mutation.get("new_operation", ""),
-                "details": format_params(mutation.get("params", {}) or {}),
+                "details": "",
             })
         elif kind == "add":
             node = mutation.get("node", {}) or {}
@@ -662,14 +662,6 @@ def mutation_rows(mutations: List[Dict[str, Any]]) -> List[Dict[str, str]]:
                 "node": node.get("id", ""),
                 "target": node.get("operation", ""),
                 "details": f"before {mutation.get('rewire_input_of', '')}".strip(),
-            })
-        elif kind == "set_strategy":
-            strategy = mutation.get("strategy", {}) or {}
-            rows.append({
-                "action": "switch industrial strategy",
-                "node": "execution mode",
-                "target": strategy.get("name", ""),
-                "details": format_params(strategy.get("params", {}) or {}),
             })
         elif kind == "remove":
             rows.append({
@@ -722,16 +714,13 @@ def mutate_graph(mutation: Dict[str, Any]) -> None:
         st.error(f"Mutation failed: {exc}")
 
 
-def update_node(node_id: str, current_operation: str, new_operation: str, params: Dict[str, Any]) -> None:
-    # Both operation change and same-operation parameter edits are expressed as
-    # 'replace': graph mutations no longer support set_params on its own — the
-    # graph just becomes Fedot.Industrial's `initial_assumption`, and the engine
-    # handles parameter polishing during finetune.
+def update_node(node_id: str, new_operation: str) -> None:
+    # Graph edits are structural only. Fedot.Industrial handles parameter
+    # polishing during finetune.
     mutate_graph({
         "type": "replace",
         "node_id": node_id,
         "new_operation": new_operation,
-        "params": params,
     })
 
 
@@ -919,7 +908,7 @@ def architect_tab(config: Dict[str, Any]) -> None:
             st.dataframe(pd.DataFrame(strategy_catalog_rows), use_container_width=True, hide_index=True)
             st.caption(
                 "Strategies are picked outside the graph. Use the sidebar to switch strategy "
-                "before evaluating, or apply Critic's `set_strategy` suggestion in the Feedback tab."
+                "before evaluating."
             )
 
         message = st.text_area(
@@ -1024,24 +1013,11 @@ def graph_editor_tab(config: Dict[str, Any]) -> None:
                 with st.form("edit_preprocessing"):
                     prep_index = available_preprocessing_ops.index(current_preprocessing.get("operation"))
                     prep_op = st.selectbox("Operation", available_preprocessing_ops, index=prep_index)
-                    prep_params_text = st.text_area(
-                        "Parameters",
-                        value=json.dumps(current_preprocessing.get("params", {}) or {}, ensure_ascii=False, indent=2),
-                        height=100,
-                    )
                     apply_prep, remove_prep = st.columns([1, 1])
                     apply_clicked = apply_prep.form_submit_button("Apply")
                     remove_clicked = remove_prep.form_submit_button("Remove")
                     if apply_clicked:
-                        try:
-                            update_node(
-                                current_preprocessing.get("id", ""),
-                                current_preprocessing.get("operation", ""),
-                                prep_op,
-                                json.loads(prep_params_text or "{}"),
-                            )
-                        except json.JSONDecodeError as exc:
-                            st.error(f"Invalid preprocessing parameters: {exc}")
+                        update_node(current_preprocessing.get("id", ""), prep_op)
                     if remove_clicked:
                         mutate_graph({"type": "remove", "node_id": current_preprocessing.get("id", "")})
             elif preprocessing_ops:
@@ -1049,23 +1025,17 @@ def graph_editor_tab(config: Dict[str, Any]) -> None:
                 with st.form("add_preprocessing"):
                     new_id = st.text_input("Node id", value="preprocessing")
                     prep_op = st.selectbox("Operation", preprocessing_ops, key="add_preprocessing_op")
-                    prep_params_text = st.text_area("Parameters", value="{}", height=100)
                     add_clicked = st.form_submit_button("Add preprocessing")
                     if add_clicked:
-                        try:
-                            params = json.loads(prep_params_text or "{}")
-                            mutate_graph({
-                                "type": "add",
-                                "node": {
-                                    "id": new_id,
-                                    "operation": prep_op,
-                                    "params": params,
-                                    "inputs": root_inputs,
-                                },
-                                "rewire_input_of": root_id,
-                            })
-                        except json.JSONDecodeError as exc:
-                            st.error(f"Invalid preprocessing parameters: {exc}")
+                        mutate_graph({
+                            "type": "add",
+                            "node": {
+                                "id": new_id,
+                                "operation": prep_op,
+                                "inputs": root_inputs,
+                            },
+                            "rewire_input_of": root_id,
+                        })
             else:
                 st.caption("No preprocessing operations are exposed for this task.")
 
@@ -1079,22 +1049,9 @@ def graph_editor_tab(config: Dict[str, Any]) -> None:
                     st.text_input("Node id", value=root_id, disabled=True)
                     model_index = available_model_ops.index(current_model.get("operation"))
                     model_op = st.selectbox("Operation", available_model_ops, index=model_index, key="model_editor_op")
-                    model_params_text = st.text_area(
-                        "Parameters",
-                        value=json.dumps(current_model.get("params", {}) or {}, ensure_ascii=False, indent=2),
-                        height=100,
-                    )
                     submitted = st.form_submit_button("Apply model")
                     if submitted:
-                        try:
-                            update_node(
-                                root_id,
-                                current_model.get("operation", ""),
-                                model_op,
-                                json.loads(model_params_text or "{}"),
-                            )
-                        except json.JSONDecodeError as exc:
-                            st.error(f"Invalid model parameters: {exc}")
+                        update_node(root_id, model_op)
             else:
                 st.caption("No model operations returned by backend config.")
 
@@ -1330,27 +1287,18 @@ def request_architect_revision(iteration: Dict[str, Any], message: str = "") -> 
     set_graph(result, approved=False)
     st.session_state.architect_tool_calls = result.get("tool_calls", [])
 
-    # Backend may switch the industrial strategy in response to a set_strategy mutation.
     new_strategy = result.get("industrial_strategy")
     if new_strategy:
         st.session_state.industrial_strategy = new_strategy
         st.session_state.industrial_strategy_params = dict(result.get("industrial_strategy_params") or {})
 
-    strategy_changes = [m for m in selected if isinstance(m, dict) and m.get("type") == "set_strategy"]
-    graph_changes = [m for m in selected if isinstance(m, dict) and m.get("type") != "set_strategy"]
-    if strategy_changes:
-        names = ", ".join(
-            (m.get("strategy") or {}).get("name", "") for m in strategy_changes if isinstance(m.get("strategy"), dict)
-        )
-        st.info(
-            f"Industrial strategy switched to: {names}. The next evaluation will use this strategy."
-        )
+    graph_changes = [m for m in selected if isinstance(m, dict)]
     if graph_changes:
         st.success(
             f"Architect prepared a new draft from {len(graph_changes)} graph mutation(s). "
             "Approve it to make it the active pipeline."
         )
-    elif not strategy_changes:
+    else:
         st.success(
             "Architect prepared a new draft (no mutations selected; LLM-driven revision). "
             "Approve it to make it the active pipeline."

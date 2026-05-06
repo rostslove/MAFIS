@@ -441,9 +441,8 @@ async def propose_revision_from_critic(
 
     ``selected_mutations`` lets the frontend pass the subset the user picked via
     checkboxes. Architect receives the graph-level mutations as LLM context and
-    returns the revised graph. ``set_strategy`` mutations do not modify the
-    graph: they are applied to the DataContext (industrial_strategy and params)
-    and surfaced back to the caller so the frontend can confirm the switch."""
+    returns the revised graph. Strategy changes are selected outside Critic and
+    outside the graph."""
     csv_path = normalize_csv_path(csv_path)
     if task_type not in SUPPORTED_TASKS:
         return {"error": f"Unknown task type: {task_type}"}
@@ -537,11 +536,11 @@ def _split_graph_and_strategy_mutations(
     fallback_strategy: str = "tabular",
     fallback_params: Optional[Dict[str, Any]] = None,
 ):
-    """Separate set_strategy mutations from graph-mutation list.
+    """Filter Critic suggestions down to graph node mutations.
 
-    The last set_strategy in the list wins; its strategy/params override the
-    fallback values supplied by the caller. Returns (graph_mutations,
-    strategy_name, strategy_params)."""
+    Critic is graph-structural only. Strategy switches and node params are
+    ignored here; strategy selection lives in the dedicated UI controls.
+    Returns (graph_mutations, strategy_name, strategy_params)."""
     graph_mutations = []
     chosen_strategy = (fallback_strategy or "tabular")
     chosen_params: Dict[str, Any] = dict(fallback_params or {})
@@ -549,16 +548,13 @@ def _split_graph_and_strategy_mutations(
         if not isinstance(mutation, dict):
             continue
         if mutation.get("type") == "set_strategy":
-            strategy = mutation.get("strategy")
-            if isinstance(strategy, dict):
-                name = strategy.get("name")
-                if isinstance(name, str) and name.strip():
-                    chosen_strategy = name.strip()
-                params = strategy.get("params")
-                if isinstance(params, dict):
-                    chosen_params = dict(params)
             continue
-        graph_mutations.append(mutation)
+        cleaned = dict(mutation)
+        cleaned.pop("params", None)
+        node = cleaned.get("node")
+        if isinstance(node, dict):
+            cleaned["node"] = {k: v for k, v in node.items() if k != "params"}
+        graph_mutations.append(cleaned)
     return graph_mutations, chosen_strategy, chosen_params
 
 

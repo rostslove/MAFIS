@@ -32,9 +32,8 @@ Return one strict JSON object with exactly this shape:
   "suggested_mutations": [
     {"type": "remove", "node_id": "existing_node_id"},
     {"type": "replace", "node_id": "existing_node_id", "new_operation": "allowed_operation"},
-    {"type": "add", "node": {"id": "new_node_id", "operation": "allowed_operation", "params": {}, "inputs": []}, "rewire_input_of": "existing_node_id"},
-    {"type": "connect", "node_id": "existing_node_id", "input_id": "existing_node_id"},
-    {"type": "set_strategy", "strategy": {"name": "allowed_industrial_strategy", "params": {}}}
+    {"type": "add", "node": {"id": "new_node_id", "operation": "allowed_operation", "inputs": []}, "rewire_input_of": "existing_node_id"},
+    {"type": "connect", "node_id": "existing_node_id", "input_id": "existing_node_id"}
   ],
   "improvement_plan": ["short next step"],
   "questions_for_user": ["short question when user input would materially improve the next graph"],
@@ -42,12 +41,13 @@ Return one strict JSON object with exactly this shape:
 }
 
 Mutations of type remove/replace/add/connect modify the pipeline graph itself.
-The `set_strategy` mutation does NOT touch the graph; it asks the user to switch
-Fedot.Industrial execution strategy (tabular/federated_automl/sampling_strategy)
-on the next iteration. The user must approve any strategy switch through the UI.
-Use only operations and strategies listed in allowed_catalog. If the graph
-failed, focus on recovery mutations. If the graph is good enough and no
-revision is needed, return suggested_mutations=[] and should_stop=true.
+Critic may only edit graph nodes and connections. Do not suggest hyperparameters,
+node params, model params, strategy changes, or set_strategy mutations. If a
+model-parameter error appears in diagnostics, describe it as a graph execution
+issue and propose only a structural recovery when appropriate. Use only
+operations listed in allowed_catalog. If the graph failed, focus on recovery
+mutations. If the graph is good enough and no revision is needed, return
+suggested_mutations=[] and should_stop=true.
 If engineer_result.finetune_error or fallback_used is present, treat metrics as
 fallback baseline metrics, not as a clean Fedot.Industrial finetune result.
 Preserve and reason from diagnostics. Do not recommend re-adding an operation
@@ -284,20 +284,12 @@ Return JSON only."""
 
     @staticmethod
     def _allowed_catalog(task_type: str) -> Dict[str, Any]:
-        from graph_engine import OPERATIONS, get_training_strategies
+        from graph_engine import OPERATIONS
 
         ops = OPERATIONS.get(task_type, {})
         return {
             "preprocessing": list(ops.get("preprocessing", []) or []),
             "models": list(ops.get("models", []) or []),
-            "industrial_strategies": [
-                {
-                    "name": item.get("name"),
-                    "description": item.get("description", ""),
-                }
-                for item in get_training_strategies(task_type)
-                if isinstance(item, dict) and item.get("name")
-            ],
         }
 
     def _validated_llm_mutations(
@@ -327,21 +319,20 @@ Return JSON only."""
                 continue
             if mutation not in validated:
                 validated.append(mutation)
-            if mutation.get("type") != "set_strategy":
-                try:
-                    current_graph = PipelineGraph.from_dict(current_graph).apply_mutation(mutation).to_dict()
-                except Exception:
-                    pass
+            try:
+                current_graph = PipelineGraph.from_dict(current_graph).apply_mutation(mutation).to_dict()
+            except Exception:
+                pass
         return validated[:3]
 
     @staticmethod
     def _mutation_validation_error(mutation: Dict[str, Any], graph: Dict[str, Any], dc: DataContext) -> str:
-        from graph_engine import OPERATIONS, PipelineGraph, get_training_strategies
+        from graph_engine import OPERATIONS, PipelineGraph
 
         if not isinstance(mutation, dict):
             return "mutation is not an object"
         kind = mutation.get("type")
-        allowed_kinds = {"remove", "replace", "add", "connect", "set_strategy"}
+        allowed_kinds = {"remove", "replace", "add", "connect"}
         if kind not in allowed_kinds:
             return f"unsupported mutation type '{kind}'"
 
@@ -366,18 +357,6 @@ Return JSON only."""
                 return f"operation '{node.get('operation')}' is not allowed for task '{dc.task_type}'"
         if kind == "connect" and mutation.get("input_id") not in node_ids:
             return f"input_id '{mutation.get('input_id')}' does not exist"
-        if kind == "set_strategy":
-            strategy = mutation.get("strategy") or {}
-            strategy_name = strategy.get("name") if isinstance(strategy, dict) else None
-            allowed_strategy_names = {
-                item.get("name")
-                for item in get_training_strategies(dc.task_type)
-                if isinstance(item, dict)
-            }
-            if strategy_name not in allowed_strategy_names:
-                return f"strategy '{strategy_name}' is not allowed for task '{dc.task_type}'"
-            # set_strategy does not touch the graph; skip graph re-validation.
-            return ""
 
         try:
             candidate = PipelineGraph.from_dict(graph).apply_mutation(mutation)

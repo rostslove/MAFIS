@@ -24,6 +24,11 @@ class GraphNodeObject(BaseModel):
             raise ValueError("must be non-empty")
         return value
 
+    @validator("params", pre=True, always=True)
+    def strip_node_params(cls, value: Any) -> Dict[str, Any]:
+        del value
+        return {}
+
 
 class GraphObject(BaseModel):
     task_type: str
@@ -68,7 +73,7 @@ class CriticMutationObject(BaseModel):
     @validator("type")
     def allowed_type(cls, value: str) -> str:
         value = value.strip()
-        allowed = {"remove", "replace", "add", "set_strategy", "connect"}
+        allowed = {"remove", "replace", "add", "connect"}
         if value not in allowed:
             raise ValueError(f"unsupported mutation type: {value}")
         return value
@@ -125,10 +130,15 @@ class CriticFeedbackObject(BaseModel):
         if value is None:
             return []
         if isinstance(value, dict):
-            return [value]
+            return [value] if value.get("type") in {"remove", "replace", "add", "connect"} else []
         if not isinstance(value, list):
             raise ValueError("suggested_mutations must be a list")
-        return [item for item in value if isinstance(item, dict)]
+        allowed = {"remove", "replace", "add", "connect"}
+        return [
+            item
+            for item in value
+            if isinstance(item, dict) and item.get("type") in allowed
+        ]
 
     def mutations_as_dicts(self) -> List[Dict[str, Any]]:
         return [mutation.as_mutation_dict() for mutation in self.suggested_mutations]

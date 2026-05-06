@@ -882,6 +882,8 @@ def get_operation_catalog(task_type: str) -> Dict[str, List[Dict[str, Any]]]:
 class GraphNode:
     id: str
     operation: str
+    # MAFIS graphs are structural assumptions only. Fedot.Industrial owns
+    # operation/model hyperparameter tuning during finetune.
     params: Dict[str, Any] = field(default_factory=dict)
     inputs: List[str] = field(default_factory=list)
 
@@ -901,7 +903,12 @@ class PipelineGraph:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "PipelineGraph":
-        nodes = [GraphNode(**n) for n in d.get("nodes", [])]
+        nodes = []
+        for raw_node in d.get("nodes", []):
+            spec = dict(raw_node)
+            spec["params"] = {}
+            spec["inputs"] = list(spec.get("inputs", []) or [])
+            nodes.append(GraphNode(**spec))
         task_type = d.get("task_type", "classification")
         return cls(task_type=task_type, nodes=nodes)
 
@@ -993,11 +1000,6 @@ class PipelineGraph:
         for spec in self._topo_sorted():
             parents = [nodes_by_id[i] for i in spec.inputs] or None
             fedot_node = PipelineNode(operation_type=spec.operation, nodes_from=parents)
-            if spec.params:
-                try:
-                    fedot_node.parameters = spec.params
-                except Exception:
-                    pass
             nodes_by_id[spec.id] = fedot_node
         return Pipeline(nodes_by_id[self.root_id()])
 
@@ -1027,7 +1029,7 @@ class PipelineGraph:
             nodes.append(GraphNode(
                 id=spec["id"],
                 operation=spec["operation"],
-                params=spec.get("params", {}),
+                params={},
                 inputs=spec.get("inputs", []),
             ))
             # Optionally re-route an existing node to consume the new node
@@ -1062,12 +1064,8 @@ class PipelineGraph:
             new_op = mutation["new_operation"]
             for n in nodes:
                 if n.id == nid:
-                    old_op = n.operation
                     n.operation = new_op
-                    if "params" in mutation:
-                        n.params = mutation["params"]
-                    elif old_op != new_op:
-                        n.params = {}
+                    n.params = {}
 
         elif op == "connect":
             nid = mutation["node_id"]
@@ -1075,11 +1073,6 @@ class PipelineGraph:
             for n in nodes:
                 if n.id == nid and new_input not in n.inputs:
                     n.inputs.append(new_input)
-
-        elif op in ("set_strategy", "clear_strategy"):
-            # Strategy mutations are no longer part of the graph; the orchestrator
-            # applies them to DataContext.industrial_strategy. Return graph unchanged.
-            return PipelineGraph(task_type=self.task_type, nodes=nodes)
 
         else:
             raise ValueError(f"Unknown mutation type: {op}")
