@@ -93,9 +93,25 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
             return result
 
     async def _train_graph(self, graph_json: str, dc: DataContext) -> dict:
-        trained = await self._train_direct(graph_json, dc)
+        trained = await self._train_direct(graph_json, dc, allow_direct_fallback=False)
         if self._should_attempt_node_recovery(trained):
             trained = await self._recover_by_skipping_node(graph_json, dc, trained)
+        if self._needs_direct_fallback(trained):
+            fallback = await self._train_direct(graph_json, dc, allow_direct_fallback=True)
+            if isinstance(fallback, dict):
+                fallback["diagnostics"] = (
+                    list(trained.get("diagnostics", []) or [])
+                    + list(fallback.get("diagnostics", []) or [])
+                )
+                fallback["training_notes"] = (
+                    list(trained.get("training_notes", []) or [])
+                    + [
+                        "Engineer ran direct-fit fallback only after Fedot.Industrial structural recovery attempts were exhausted."
+                    ]
+                    + list(fallback.get("training_notes", []) or [])
+                )
+                fallback["fallback_after_structural_recovery"] = True
+                trained = fallback
         strategy_name = trained.get("industrial_strategy") or dc.industrial_strategy
         if strategy_name and strategy_name != "tabular":
             trained.setdefault("training_notes", []).append(
@@ -104,7 +120,12 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
             )
         return trained
 
-    async def _train_direct(self, graph_json: str, dc: DataContext) -> dict:
+    async def _train_direct(
+        self,
+        graph_json: str,
+        dc: DataContext,
+        allow_direct_fallback: bool = True,
+    ) -> dict:
         args = {
             "graph_json": graph_json,
             "csv_path": dc.csv_path,
@@ -112,6 +133,7 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
             "test_size": dc.test_size,
             "industrial_strategy": dc.industrial_strategy or "tabular",
             "industrial_strategy_params": dict(dc.industrial_strategy_params or {}),
+            "allow_direct_fallback": allow_direct_fallback,
         }
         if dc.primary_metric:
             args["primary_metric"] = dc.primary_metric
@@ -147,7 +169,7 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
         for node in candidates:
             recovered_graph = self._graph_with_node_skipped(graph, str(node["id"]))
             recovered_json = json.dumps(recovered_graph, ensure_ascii=False)
-            recovered = await self._train_direct(recovered_json, dc)
+            recovered = await self._train_direct(recovered_json, dc, allow_direct_fallback=False)
             if not isinstance(recovered, dict):
                 recovered = {"score": 0, "error": "train_graph returned no data"}
 
@@ -205,7 +227,7 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
                 [str(node["id"]) for node in candidates if node.get("id")],
             )
             recovered_json = json.dumps(recovered_graph, ensure_ascii=False)
-            recovered = await self._train_direct(recovered_json, dc)
+            recovered = await self._train_direct(recovered_json, dc, allow_direct_fallback=False)
             if not isinstance(recovered, dict):
                 recovered = {"score": 0, "error": "train_graph returned no data"}
 
@@ -276,6 +298,44 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
             )
 
         if best_fallback:
+            original_score = self._primary_score(failed_run)
+            if failed_run.get("fallback_used") and original_score > 0 and original_score >= best_fallback.get("score", 0):
+                diagnostic = self._fallback_only_diagnostic(
+                    best_fallback["nodes"],
+                    original_error,
+                    best_fallback["graph"],
+                )
+                attempts_summary = self._runtime_attempts_summary_diagnostic(
+                    graph=graph,
+                    original_run=failed_run,
+                    attempts=attempts,
+                )
+                localization = self._failure_localization_diagnostic(
+                    graph=graph,
+                    run=failed_run,
+                    attempts=attempts,
+                )
+                extra_diagnostics = [diagnostic]
+                if attempts_summary:
+                    extra_diagnostics.append(attempts_summary)
+                if localization:
+                    extra_diagnostics.append(localization)
+                failed_run.setdefault("diagnostics", [])
+                failed_run["diagnostics"] = (
+                    list(failed_run.get("diagnostics", []) or [])
+                    + extra_diagnostics
+                )
+                skipped = ", ".join(
+                    f"'{node.get('id')}' ({node.get('operation')})"
+                    for node in best_fallback["nodes"]
+                )
+                failed_run.setdefault("training_notes", [])
+                failed_run["training_notes"].append(
+                    f"Engineer also tried bypassing {skipped}, but did not find a cleaner "
+                    "Fedot.Industrial finetune result; keeping the original fallback metrics."
+                )
+                return failed_run
+
             recovered = best_fallback["run"]
             diagnostic = self._fallback_only_diagnostic(
                 best_fallback["nodes"],
@@ -877,6 +937,8 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
             return True
         if not payload.get("finetune_error"):
             return False
+        if payload.get("fallback_used"):
+            return True
 
         primary_value = cls._primary_score(payload)
         metrics_missing = not any(
@@ -935,7 +997,7 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
     ) -> Dict[str, Any] | None:
         if not isinstance(recovered, dict) or recovered.get("error"):
             return current
-        if not (recovered.get("finetune_error") or recovered.get("fallback_used")):
+        if not recovered.get("fallback_used"):
             return current
         score = cls._primary_score(recovered)
         if current and score <= current.get("score", 0):
@@ -946,6 +1008,12 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
             "nodes": nodes,
             "graph": recovered_graph,
         }
+
+    @staticmethod
+    def _needs_direct_fallback(payload: Dict[str, Any]) -> bool:
+        if not isinstance(payload, dict):
+            return True
+        return bool(payload.get("finetune_error") and not payload.get("fallback_used"))
 
     @staticmethod
     def _failure_message(payload: Dict[str, Any]) -> str:

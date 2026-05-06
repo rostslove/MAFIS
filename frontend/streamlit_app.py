@@ -1265,53 +1265,12 @@ def render_engineer_report(
     if engineer.get("graph_error") and show_failure_details:
         st.error(engineer["graph_error"])
 
-    strategy_name = engineer.get("industrial_strategy", "") or ""
-    if strategy_name:
-        strategy_cols = st.columns(2)
-        strategy_cols[0].metric("Strategy", strategy_name)
-        strategy_cols[1].metric(
-            "Mode",
-            "tabular AutoML" if strategy_name == "tabular" else "industrial path",
-        )
-        params = engineer.get("industrial_strategy_params", {}) or {}
-        if params:
-            with st.expander("Strategy params"):
-                st.code(json.dumps(params, ensure_ascii=False, indent=2), language="json")
-
-    assumption_graph = engineer.get("assumption_graph") or {}
-    if assumption_graph and assumption_graph.get("nodes"):
-        with st.expander("Fedot.Industrial polished graph (post-finetune)"):
-            st.caption(
-                "This is the graph Fedot.Industrial returned after AutoML finetune. "
-                "Architect's proposed graph is the assumption that seeds this result."
-            )
-            st.graphviz_chart(graph_to_dot(assumption_graph), use_container_width=True)
-            st.dataframe(
-                pd.DataFrame(graph_rows(assumption_graph)),
-                use_container_width=True,
-                hide_index=True,
-            )
-            assumption_mermaid = engineer.get("assumption_mermaid", "")
-            if assumption_mermaid:
-                st.caption("Mermaid")
-                st.code(assumption_mermaid, language="markdown")
-
-    render_split_info(engineer.get("split_info", {}) or {})
-
     train_metrics = engineer.get("train_metrics", {}) or {}
     test_metrics = engineer.get("test_metrics", {}) or {}
     has_metrics = bool(train_metrics or test_metrics or engineer.get("graph_metrics"))
     has_error = bool(engineer.get("graph_error"))
-    fallback_used = engineer.get("fallback_used", "")
-    finetune_error = engineer.get("finetune_error", "")
 
-    if (has_error or fallback_used or finetune_error) and has_metrics:
-        st.warning(
-            "Metrics below come from the **{path}** fallback path because Fedot.Industrial finetune did not converge. They are a baseline, not the result of a successful tuning run.".format(
-                path=fallback_used or "direct-fit"
-            )
-        )
-    elif has_error and not has_metrics:
+    if has_error and not has_metrics:
         st.caption("Train/test metrics are unavailable because the graph did not finish training.")
 
     if has_metrics and (train_metrics or test_metrics):

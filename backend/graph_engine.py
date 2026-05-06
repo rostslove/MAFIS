@@ -188,6 +188,29 @@ def _metadata_kwargs_from_input(input_data: InputData, sample_indices=None) -> D
     return kwargs
 
 
+def _attach_input_metadata(input_data: InputData, source_data: InputData) -> InputData:
+    """Re-attach tabular metadata that some external splitters drop."""
+    kwargs = _metadata_kwargs_from_input(source_data)
+    categorical_idx = np.asarray(kwargs.get("categorical_idx", []), dtype=int)
+    if categorical_idx.size > 0:
+        features = np.asarray(input_data.features)
+        if features.ndim == 2 and features.shape[1] > int(categorical_idx.max()):
+            kwargs["categorical_features"] = features[:, categorical_idx]
+
+    for key, value in kwargs.items():
+        try:
+            setattr(input_data, key, value)
+        except Exception:
+            pass
+        supplementary = getattr(input_data, "supplementary_data", None)
+        if supplementary is not None:
+            try:
+                setattr(supplementary, key, value)
+            except Exception:
+                pass
+    return input_data
+
+
 def _repo_dict(name: str) -> Dict[str, Any]:
     if fedot_ind_model_repository is None:
         return {}
@@ -1302,13 +1325,14 @@ def split_input_data(input_data: InputData, test_size: float = 0.2) -> Tuple[Inp
         try:
             from fedot_ind.core.repository.industrial_implementations.abstract import split_any_industrial
 
-            return split_any_industrial(
+            train, test = split_any_industrial(
                 input_data,
                 split_ratio=1 - test_size,
                 shuffle=True,
                 stratify=input_data.task.task_type == TaskTypesEnum.classification,
                 random_seed=42,
             )
+            return _attach_input_metadata(train, input_data), _attach_input_metadata(test, input_data)
         except Exception as exc:
             logger.warning("Fedot.Industrial split failed; using local split: %s", exc)
     return _basic_split_input_data(input_data, test_size=test_size)

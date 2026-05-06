@@ -339,10 +339,6 @@ def _build_api_config(
     }
 
 
-def _input_to_tuple(data) -> tuple:
-    return (np.asarray(data.features), np.asarray(data.target))
-
-
 def _train_via_finetune(
     graph: PipelineGraph,
     csv_path: str,
@@ -384,20 +380,10 @@ def _train_via_finetune(
                 "model_to_tune": builder,
                 "return_only_fitted": False,
             }
-            try:
-                industrial.finetune(
-                    train_data=train,
-                    is_fedot_datatype=True,
-                    **finetune_kwargs,
-                )
-            except TypeError as exc:
-                message = str(exc)
-                if "is_fedot_datatype" not in message or "unexpected" not in message:
-                    raise
-                industrial.finetune(
-                    train_data=_input_to_tuple(train),
-                    **finetune_kwargs,
-                )
+            industrial.finetune(
+                train_data=train,
+                **finetune_kwargs,
+            )
 
             fitted_pipeline = industrial.manager.solver
             # Use the fitted FEDOT solver directly. FedotIndustrial.predict()
@@ -627,6 +613,7 @@ def train_graph(
     industrial_strategy: str = "tabular",
     industrial_strategy_params: Optional[Dict[str, Any]] = None,
     finetune_timeout: int = 5,
+    allow_direct_fallback: bool = True,
 ) -> str:
     """Treat the graph as Fedot.Industrial's initial assumption and run finetune.
 
@@ -636,9 +623,9 @@ def train_graph(
     - Runs ``FedotIndustrial.finetune`` with ``industrial_strategy`` (when not
       ``tabular``) and the optional ``industrial_strategy_params`` attached to
       ``industrial_config``.
-    - When finetune raises, attempts a direct fit so we can still expose
-      baseline metrics, and returns ``finetune_error``/``fallback_used`` so the
-      Engineer can decide whether node-skip recovery is needed.
+    - When finetune raises, either returns the finetune failure directly or,
+      if ``allow_direct_fallback`` is true, attempts a direct fit so we can
+      still expose baseline metrics.
 
     Returns score, metrics, the post-finetune assumption graph, and the
     industrial strategy actually used during the run.
@@ -668,9 +655,26 @@ def train_graph(
             )
             return json.dumps(result)
         except Exception as finetune_exc:
-            logger.exception("Finetune flow failed; recording error and trying direct fit")
+            logger.exception("Finetune flow failed")
             finetune_error = repr(finetune_exc)
             finetune_traceback = traceback.format_exc()
+            if not allow_direct_fallback:
+                return json.dumps({
+                    "score": 0,
+                    "metrics": {
+                        "primary_score": 0.0,
+                        "primary_metric": primary_metric or "",
+                        "primary_metric_value": 0.0,
+                        "primary_score_direction": "higher_is_better",
+                    },
+                    "finetune_error": finetune_error,
+                    "finetune_traceback": finetune_traceback,
+                    "fallback_skipped": True,
+                    "training_notes": [
+                        "Fedot.Industrial finetune failed; direct-fit fallback is deferred until structural recovery attempts are exhausted."
+                    ],
+                })
+            logger.info("Trying direct-fit fallback after finetune failure")
             try:
                 fallback = _train_direct(
                     graph=graph,
