@@ -59,14 +59,18 @@ mutations that address a high-confidence primary_suspect over nodes that merely
 produced fallback metrics. If runtime_issue is
 fedot_industrial_output_mode_compatibility, explain it as an adapter/runtime
 compatibility issue, not as a model hyperparameter.
+When diagnostics include kind="runtime_attempts_summary", reason over every
+attempt in recovery_attempts. Do not claim that removing one node cleanly solves
+the graph if another attempt exposes a different structural/runtime error. If
+multiple original nodes produce distinct failures, include the relevant node
+mutations or mention the remaining blocker in improvement_plan.
 Analyze traceback text when present. If traceback points to categorical encoder,
 one_hot_encoding, label_encoding, categorical_ids, or a similar categorical
 metadata failure, explicitly consider removing the explicit encoder from the
-graph. For CatBoost-like models, remember that the model can often handle
-categorical features without a separate one-hot node if categorical columns are
-known. If the correct categorical columns are unclear, put a concrete question
-in questions_for_user asking the user to confirm/pass those column names for
-Architect; do not invent unknown categorical column names.
+graph. Data profile includes automatically detected categorical_feature_names;
+when those names are present, treat categorical columns as known and do not ask
+the user to confirm them. Ask about categorical columns only if the data profile
+does not list them or the traceback shows ambiguous metadata.
 Return JSON only."""
 
     def __init__(self, name: str = "Critic", mcp_client=None):
@@ -253,6 +257,7 @@ Return JSON only."""
                 "fallback_used": engineer.fallback_used,
                 "training_notes": engineer.training_notes,
                 "diagnostics": engineer.diagnostics,
+                "runtime_attempts_summary": self._runtime_attempts_summary(engineer.diagnostics),
             },
             "validation": validation,
             "explanation": explanation,
@@ -408,6 +413,13 @@ Return JSON only."""
                 seen.add(key)
                 unique.append(item)
         return unique
+
+    @staticmethod
+    def _runtime_attempts_summary(diagnostics: List[Dict[str, Any]]) -> Dict[str, Any]:
+        for item in diagnostics or []:
+            if isinstance(item, dict) and item.get("kind") == "runtime_attempts_summary":
+                return item
+        return {}
 
     @staticmethod
     def _has_node_skip_recovery(engineer: EngineerResult) -> bool:

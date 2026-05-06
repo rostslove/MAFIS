@@ -44,6 +44,9 @@ operation search-space values; node params must be omitted or empty and are
 ignored by the backend. Industrial strategies (federated_automl,
 sampling_strategy) are execution modes selected outside the graph; do not
 include them in the JSON.
+For tabular datasets, data_profile.categorical_feature_names are automatically
+passed to FEDOT as categorical metadata, so categorical preprocessing nodes can
+use that metadata without hard-coded column lists.
 Return JSON only."""
 
     STRUCTURED_PROMPT = SYSTEM_PROMPT
@@ -205,6 +208,8 @@ Return JSON only."""
             "The graph you produce becomes Fedot.Industrial `initial_assumption` and is polished by AutoML finetune.\n"
             "Choose only operations and graph topology. Do not choose hyperparameters or node params; "
             "Fedot.Industrial owns parameter tuning during finetune.\n"
+            "For tabular data, automatically detected categorical_feature_names are passed to FEDOT InputData "
+            "as categorical metadata for preprocessing operations.\n"
             "available_operations.industrial_templates contains Fedot.Industrial-native graph patterns.\n"
             "available_operations.industrial_strategies_catalog describes selectable execution strategies "
             "(tabular/federated_automl/sampling_strategy). Strategies are picked by the user outside the graph; "

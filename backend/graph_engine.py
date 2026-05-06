@@ -104,6 +104,88 @@ def _unique(items: List[str]) -> List[str]:
     return result
 
 
+def _input_data(**kwargs) -> InputData:
+    """Build InputData while tolerating older FEDOT constructor signatures."""
+    try:
+        return InputData(**kwargs)
+    except TypeError:
+        extra_keys = {"features_names", "categorical_features", "categorical_idx", "numerical_idx"}
+        base_kwargs = {key: value for key, value in kwargs.items() if key not in extra_keys}
+        data = InputData(**base_kwargs)
+        for key in extra_keys:
+            if key in kwargs:
+                try:
+                    setattr(data, key, kwargs[key])
+                except Exception:
+                    pass
+                supplementary = getattr(data, "supplementary_data", None)
+                if supplementary is not None:
+                    try:
+                        setattr(supplementary, key, kwargs[key])
+                    except Exception:
+                        pass
+        return data
+
+
+def _tabular_feature_metadata(df: pd.DataFrame, target: str) -> Tuple[pd.DataFrame, List[str], List[str]]:
+    feature_df = df.drop(columns=[target]).copy()
+    categorical_columns = [
+        column
+        for column in feature_df.columns
+        if (
+            pd.api.types.is_object_dtype(feature_df[column])
+            or pd.api.types.is_categorical_dtype(feature_df[column])
+            or pd.api.types.is_bool_dtype(feature_df[column])
+        )
+    ]
+    numeric_columns = [column for column in feature_df.columns if column not in categorical_columns]
+
+    for column in numeric_columns:
+        feature_df[column] = pd.to_numeric(feature_df[column], errors="coerce")
+    for column in categorical_columns:
+        feature_df[column] = feature_df[column].astype("string").fillna("__missing__").astype(str)
+
+    return feature_df, numeric_columns, categorical_columns
+
+
+def _input_data_metadata_kwargs(
+    features: pd.DataFrame,
+    numeric_columns: List[str],
+    categorical_columns: List[str],
+) -> Dict[str, Any]:
+    feature_names = list(features.columns)
+    categorical_idx = [feature_names.index(column) for column in categorical_columns if column in feature_names]
+    numerical_idx = [feature_names.index(column) for column in numeric_columns if column in feature_names]
+    kwargs: Dict[str, Any] = {
+        "features_names": feature_names,
+        "categorical_idx": np.asarray(categorical_idx, dtype=int),
+        "numerical_idx": np.asarray(numerical_idx, dtype=int),
+    }
+    if categorical_idx:
+        kwargs["categorical_features"] = features.iloc[:, categorical_idx].to_numpy(dtype=object)
+    return kwargs
+
+
+def _metadata_kwargs_from_input(input_data: InputData, sample_indices=None) -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {}
+    supplementary = getattr(input_data, "supplementary_data", None)
+    for attr in ("features_names", "categorical_idx", "numerical_idx"):
+        value = getattr(input_data, attr, None)
+        if value is None and supplementary is not None:
+            value = getattr(supplementary, attr, None)
+        if value is not None:
+            kwargs[attr] = value
+    categorical_features = getattr(input_data, "categorical_features", None)
+    if categorical_features is None and supplementary is not None:
+        categorical_features = getattr(supplementary, "categorical_features", None)
+    if categorical_features is not None:
+        categorical_features = np.asarray(categorical_features, dtype=object)
+        if sample_indices is not None and len(categorical_features) == input_sample_count(input_data):
+            categorical_features = categorical_features[np.asarray(sample_indices)]
+        kwargs["categorical_features"] = categorical_features
+    return kwargs
+
+
 def _repo_dict(name: str) -> Dict[str, Any]:
     if fedot_ind_model_repository is None:
         return {}
@@ -1097,7 +1179,7 @@ def load_input_data(
     if task_type == "ts_forecasting":
         series = df[target].astype(float).values
         task = Task(TaskTypesEnum.ts_forecasting, TsForecastingParams(forecast_length=forecast_length or 14))
-        return InputData(
+        return _input_data(
             idx=np.arange(len(series)),
             features=series,
             target=series,
@@ -1106,13 +1188,25 @@ def load_input_data(
         )
 
     y = df[target].values
-    numeric_df = df.drop(columns=[target]).select_dtypes(include=[np.number])
-    if numeric_df.shape[1] == 0:
+    feature_df, numeric_columns, categorical_columns = _tabular_feature_metadata(df, target)
+    if feature_df.shape[1] == 0:
         raise ValueError(
-            "No numeric feature columns found after removing the target column. "
-            "Encode categorical features or choose another target."
+            "No feature columns found after removing the target column."
         )
-    X = numeric_df.values.astype(float)
+
+    if task_type in ("ts_classification", "ts_regression"):
+        numeric_feature_df = feature_df[numeric_columns]
+        if numeric_feature_df.shape[1] == 0:
+            raise ValueError(
+                "Time-series tasks require numeric feature columns after removing the target column."
+            )
+        X = numeric_feature_df.to_numpy(dtype=float)
+    else:
+        metadata_kwargs = _input_data_metadata_kwargs(feature_df, numeric_columns, categorical_columns)
+        if categorical_columns:
+            X = feature_df.to_numpy(dtype=object)
+        else:
+            X = feature_df.to_numpy(dtype=float)
 
     if task_type in ("classification", "ts_classification"):
         task = Task(TaskTypesEnum.classification)
@@ -1128,7 +1222,7 @@ def load_input_data(
         task = Task(TaskTypesEnum.regression)
 
     if task_type in ("ts_classification", "ts_regression"):
-        return InputData(
+        return _input_data(
             idx=np.arange(len(X)),
             # Fedot.Industrial channel-independent TS operations expect
             # channel-first tensors; one CSV row is one fixed-window series.
@@ -1138,12 +1232,13 @@ def load_input_data(
             data_type=DataTypesEnum.ts,
         )
 
-    return InputData(
+    return _input_data(
         idx=np.arange(len(X)),
         features=X,
         target=y,
         task=task,
         data_type=DataTypesEnum.table,
+        **metadata_kwargs,
     )
 
 
@@ -1165,13 +1260,14 @@ def slice_input_data(input_data: InputData, sample_indices) -> InputData:
         sliced_features = features[:, indices, :]
     else:
         sliced_features = features[indices]
-    return InputData(
+    return _input_data(
         idx=np.arange(len(indices)),
         features=sliced_features,
         target=np.asarray(input_data.target)[indices],
         task=input_data.task,
         data_type=input_data.data_type,
         supplementary_data=input_data.supplementary_data,
+        **_metadata_kwargs_from_input(input_data, indices),
     )
 
 
@@ -1184,11 +1280,11 @@ def _basic_split_input_data(input_data: InputData, test_size: float = 0.2) -> Tu
     cut = min(max(cut, 1), n - 1)
 
     if input_data.task.task_type == TaskTypesEnum.ts_forecasting:
-        train = InputData(
+        train = _input_data(
             idx=input_data.idx[:cut], features=input_data.features[:cut],
             target=input_data.target[:cut], task=input_data.task, data_type=input_data.data_type,
         )
-        val = InputData(
+        val = _input_data(
             idx=input_data.idx[cut:], features=input_data.features[cut:],
             target=input_data.target[cut:], task=input_data.task, data_type=input_data.data_type,
         )

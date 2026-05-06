@@ -213,26 +213,13 @@ def render_diagnostics(diagnostics: List[Dict[str, Any]], title: str = "Diagnost
             st.warning(item.get("summary", "Runtime diagnostic"))
             recommendations = item.get("recommendations", []) or []
             if recommendations:
+                st.write("Suggested fix")
                 for rec in recommendations:
                     st.write(f"- {rec}")
-            if item.get("problem_nodes"):
-                st.write("Problem nodes")
-                st.dataframe(pd.DataFrame(item["problem_nodes"]), use_container_width=True, hide_index=True)
-            if item.get("primary_suspect"):
-                st.write("Primary suspect")
-                st.dataframe(pd.DataFrame([item["primary_suspect"]]), use_container_width=True, hide_index=True)
-            if item.get("confidence"):
-                st.caption(f"Confidence: {item.get('confidence')}")
-            if item.get("evidence"):
-                st.write("Evidence")
-                for evidence in item.get("evidence", [])[:6]:
-                    st.write(f"- {evidence}")
-            if item.get("ruled_out_nodes"):
-                st.write("Ruled out by recovery attempts")
-                st.dataframe(pd.DataFrame(item["ruled_out_nodes"]), use_container_width=True, hide_index=True)
-            if item.get("bypassed_nodes"):
-                st.write("Bypassed nodes")
-                st.dataframe(pd.DataFrame(item["bypassed_nodes"]), use_container_width=True, hide_index=True)
+            attempts = item.get("recovery_attempts") or []
+            if attempts:
+                with st.expander(f"Training attempts ({len(attempts)})", expanded=False):
+                    st.dataframe(pd.DataFrame(attempts), use_container_width=True, hide_index=True)
             if item.get("runtime_issue"):
                 st.caption(f"Runtime issue: `{item.get('runtime_issue')}`")
             if item.get("technical_message"):
@@ -274,10 +261,19 @@ def runtime_failure_details(engineer: Dict[str, Any], critic: Dict[str, Any]) ->
         (
             diagnostic
             for diagnostic in diagnostics
-            if isinstance(diagnostic, dict) and diagnostic.get("kind") == "failure_localization"
+            if isinstance(diagnostic, dict) and diagnostic.get("kind") == "runtime_attempts_summary"
         ),
         {},
     )
+    if not selected:
+        selected = next(
+            (
+                diagnostic
+                for diagnostic in diagnostics
+                if isinstance(diagnostic, dict) and diagnostic.get("kind") == "failure_localization"
+            ),
+            {},
+        )
     for diagnostic in diagnostics:
         if not isinstance(diagnostic, dict):
             continue
@@ -314,17 +310,24 @@ def runtime_failure_details(engineer: Dict[str, Any], critic: Dict[str, Any]) ->
             )
         else:
             summary = "Training did not complete cleanly. See technical details below."
-    recommendations = unique_text(selected.get("recommendations", []) or [])
-    problem_nodes = selected.get("problem_nodes") or []
-    evidence = selected.get("evidence") or []
-    recovery_attempts = selected.get("recovery_attempts") or []
+    attempt_diagnostic = next(
+        (
+            diagnostic
+            for diagnostic in diagnostics
+            if isinstance(diagnostic, dict) and diagnostic.get("kind") == "runtime_attempts_summary"
+        ),
+        {},
+    )
+    recommendations = unique_text(
+        (selected.get("recommendations", []) or [])
+        + (attempt_diagnostic.get("recommendations", []) or [])
+    )
+    recovery_attempts = selected.get("recovery_attempts") or attempt_diagnostic.get("recovery_attempts") or []
     fallback_used = str(engineer.get("fallback_used") or "").strip()
     return {
         "summary": summary,
         "technical": technical,
         "recommendations": recommendations,
-        "problem_nodes": problem_nodes,
-        "evidence": evidence,
         "recovery_attempts": recovery_attempts,
         "finetune_error": finetune_error,
         "fallback_used": fallback_used,
@@ -350,21 +353,12 @@ def render_runtime_failure_once(iteration: Dict[str, Any]) -> bool:
         )
     recommendations = details.get("recommendations", []) or []
     if recommendations:
-        st.write("Recovery suggestions")
+        st.write("Suggested fix")
         for recommendation in recommendations[:4]:
             st.write(f"- {recommendation}")
-    problem_nodes = details.get("problem_nodes") or []
-    if problem_nodes:
-        st.write("Likely problem nodes")
-        st.dataframe(pd.DataFrame(problem_nodes), use_container_width=True, hide_index=True)
-    evidence = details.get("evidence") or []
-    if evidence:
-        with st.expander("Why Engineer thinks so", expanded=False):
-            for item in evidence[:6]:
-                st.write(f"- {item}")
     recovery_attempts = details.get("recovery_attempts") or []
     if recovery_attempts:
-        with st.expander(f"Recovery attempts ({len(recovery_attempts)})", expanded=False):
+        with st.expander(f"Training attempts ({len(recovery_attempts)})", expanded=False):
             st.dataframe(pd.DataFrame(recovery_attempts), use_container_width=True, hide_index=True)
     if details.get("technical"):
         # Open by default so the user immediately sees what actually broke.

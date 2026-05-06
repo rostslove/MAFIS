@@ -153,13 +153,21 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
 
             if self._recovery_resolved(failed_run, recovered):
                 diagnostic = self._nodes_skipped_diagnostic([node], original_error, recovered_graph)
+                attempts_with_current = attempts + [self._attempt_record(node, recovered, recovered_graph)]
+                attempts_summary = self._runtime_attempts_summary_diagnostic(
+                    graph=graph,
+                    original_run=failed_run,
+                    attempts=attempts_with_current,
+                )
                 localization = self._failure_localization_diagnostic(
                     graph=graph,
                     run=failed_run,
-                    attempts=attempts + [self._attempt_record(node, recovered)],
+                    attempts=attempts_with_current,
                 )
                 recovered.setdefault("diagnostics", [])
                 extra_diagnostics = [diagnostic]
+                if attempts_summary:
+                    extra_diagnostics.append(attempts_summary)
                 if localization:
                     extra_diagnostics.append(localization)
                 recovered["diagnostics"] = (
@@ -189,7 +197,7 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
                 nodes=[node],
                 recovered_graph=recovered_graph,
             )
-            attempts.append(self._attempt_record(node, recovered))
+            attempts.append(self._attempt_record(node, recovered, recovered_graph))
 
         if len(candidates) > 1:
             recovered_graph = self._graph_with_nodes_skipped(
@@ -201,29 +209,41 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
             if not isinstance(recovered, dict):
                 recovered = {"score": 0, "error": "train_graph returned no data"}
 
-            attempts.append({
+            all_optional_attempt = {
                 "id": "__all_optional__",
                 "operation": "skip_all_optional_nodes",
+                "variant": "skip_all_optional_nodes",
+                "skipped_nodes": [
+                    {"id": node.get("id"), "operation": node.get("operation")}
+                    for node in candidates
+                ],
+                "remaining_graph": self._graph_signature(recovered_graph),
                 "error": self._failure_message(recovered),
-            })
+                "error_signature": self._error_signature(self._failure_message(recovered)),
+                "phase": self._error_phase(recovered),
+                "score": self._primary_score(recovered),
+                "fallback_used": recovered.get("fallback_used", ""),
+                "finetune_error": recovered.get("finetune_error", ""),
+                "fallback_error": recovered.get("fallback_error", ""),
+            }
+            attempts.append(all_optional_attempt)
 
             if self._recovery_resolved(failed_run, recovered):
                 diagnostic = self._nodes_skipped_diagnostic(candidates, original_error, recovered_graph)
+                attempts_summary = self._runtime_attempts_summary_diagnostic(
+                    graph=graph,
+                    original_run=failed_run,
+                    attempts=attempts,
+                )
                 localization = self._failure_localization_diagnostic(
                     graph=graph,
                     run=failed_run,
-                    attempts=attempts + [{
-                        "id": "__all_optional__",
-                        "operation": "skip_all_optional_nodes",
-                        "error": self._failure_message(recovered),
-                        "score": self._primary_score(recovered),
-                        "fallback_used": recovered.get("fallback_used", ""),
-                        "finetune_error": recovered.get("finetune_error", ""),
-                        "fallback_error": recovered.get("fallback_error", ""),
-                    }],
+                    attempts=attempts,
                 )
                 recovered.setdefault("diagnostics", [])
                 extra_diagnostics = [diagnostic]
+                if attempts_summary:
+                    extra_diagnostics.append(attempts_summary)
                 if localization:
                     extra_diagnostics.append(localization)
                 recovered["diagnostics"] = (
@@ -262,6 +282,11 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
                 original_error,
                 best_fallback["graph"],
             )
+            attempts_summary = self._runtime_attempts_summary_diagnostic(
+                graph=graph,
+                original_run=failed_run,
+                attempts=attempts,
+            )
             localization = self._failure_localization_diagnostic(
                 graph=graph,
                 run=failed_run,
@@ -269,6 +294,8 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
             )
             recovered.setdefault("diagnostics", [])
             extra_diagnostics = [diagnostic]
+            if attempts_summary:
+                extra_diagnostics.append(attempts_summary)
             if localization:
                 extra_diagnostics.append(localization)
             recovered["diagnostics"] = (
@@ -295,6 +322,11 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
             for node in candidates
         ]
         failed_run.setdefault("diagnostics", [])
+        attempts_summary = self._runtime_attempts_summary_diagnostic(
+            graph=graph,
+            original_run=failed_run,
+            attempts=attempts,
+        )
         localization = self._failure_localization_diagnostic(
             graph=graph,
             run=failed_run,
@@ -311,6 +343,8 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
                 "recoverable": True,
             }
         )
+        if attempts_summary:
+            failed_run["diagnostics"].append(attempts_summary)
         if localization:
             failed_run["diagnostics"].append(localization)
         failed_run["error"] = original_error
@@ -473,16 +507,103 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
         }
 
     @classmethod
-    def _attempt_record(cls, node: Dict[str, Any], recovered: Dict[str, Any]) -> Dict[str, Any]:
+    def _attempt_record(
+        cls,
+        node: Dict[str, Any],
+        recovered: Dict[str, Any],
+        recovered_graph: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        error = cls._failure_message(recovered)
         return {
             "id": node.get("id"),
             "operation": node.get("operation"),
-            "error": cls._failure_message(recovered),
+            "variant": f"skip_{node.get('id')}",
+            "skipped_nodes": [{"id": node.get("id"), "operation": node.get("operation")}],
+            "remaining_graph": cls._graph_signature(recovered_graph),
+            "phase": cls._error_phase(recovered),
+            "error_signature": cls._error_signature(error),
+            "error": error,
             "score": cls._primary_score(recovered),
             "fallback_used": recovered.get("fallback_used", ""),
             "finetune_error": recovered.get("finetune_error", ""),
             "fallback_error": recovered.get("fallback_error", ""),
         }
+
+    @classmethod
+    def _runtime_attempts_summary_diagnostic(
+        cls,
+        graph: Dict[str, Any],
+        original_run: Dict[str, Any],
+        attempts: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if not attempts:
+            return None
+        original_error = cls._failure_message(original_run)
+        rows = [{
+            "variant": "approved_graph",
+            "skipped_nodes": [],
+            "remaining_graph": cls._graph_signature(graph),
+            "phase": cls._error_phase(original_run),
+            "error_signature": cls._error_signature(original_error),
+            "error": original_error,
+            "score": cls._primary_score(original_run),
+            "fallback_used": original_run.get("fallback_used", ""),
+            "finetune_error": original_run.get("finetune_error", ""),
+            "fallback_error": original_run.get("fallback_error", ""),
+        }]
+        rows.extend(attempts)
+        return {
+            "agent": "Engineer",
+            "kind": "runtime_attempts_summary",
+            "summary": "Fedot.Industrial failed across multiple graph variants; review the attempt sequence before applying graph mutations.",
+            "technical_message": original_error[:2000],
+            "recovery_attempts": rows,
+            "recommendations": cls._runtime_recommendations(rows),
+            "recoverable": True,
+        }
+
+    @staticmethod
+    def _graph_signature(graph: Optional[Dict[str, Any]]) -> str:
+        if not isinstance(graph, dict):
+            return ""
+        nodes = graph.get("nodes", []) or []
+        by_id = {node.get("id"): node for node in nodes if isinstance(node, dict)}
+        roots = []
+        children = {
+            inp
+            for node in nodes
+            for inp in (node.get("inputs", []) or [])
+            if inp
+        }
+        for node in nodes:
+            if isinstance(node, dict) and node.get("id") not in children:
+                roots.append(node.get("id"))
+
+        def render(node_id: str) -> str:
+            node = by_id.get(node_id, {})
+            op = str(node.get("operation") or node_id)
+            inputs = [render(inp) for inp in (node.get("inputs", []) or []) if inp in by_id]
+            return f"{' + '.join(inputs)} -> {op}" if inputs else op
+
+        return " | ".join(render(str(root)) for root in roots if root) or "empty_graph"
+
+    @classmethod
+    def _runtime_recommendations(cls, attempts: List[Dict[str, Any]]) -> List[str]:
+        signatures = {str(item.get("error_signature") or "") for item in attempts if isinstance(item, dict)}
+        recommendations: List[str] = []
+        if "categorical_encoder_metadata" in signatures:
+            recommendations.append(
+                "Retry with automatically detected categorical metadata; if the encoder still fails, remove or replace the explicit categorical encoder node."
+            )
+        if "sklearn_dimensionality" in signatures:
+            recommendations.append(
+                "Do not keep the shape-changing preprocessing path with a sklearn tabular model until a shape adapter is available."
+            )
+        if "fedot_predict_preprocessor_state" in signatures:
+            recommendations.append(
+                "Treat the finetune result as failed at prediction time; direct-fit metrics are only fallback baseline metrics."
+            )
+        return recommendations
 
     @classmethod
     def _append_failure_localization(
@@ -568,15 +689,20 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
                     f"Graph contains explicit categorical encoder node '{node.get('id')}' ({node.get('operation')}).",
                 )
 
-        if "expected 2d array, got 1d array" in combined:
+        if (
+            "expected 2d array, got 1d array" in combined
+            or "found array with dim" in combined
+            or "invalid shape" in combined
+            or "must be 2 or 3 dimensional" in combined
+        ):
             global_evidence.append(
-                "sklearn preprocessing received a 1D feature vector where a 2D matrix was expected."
+                "A sklearn/FEDOT operation received data with a dimensionality it does not accept."
             )
-            for node in operation_matches({"scaling", "normalization"}):
+            for node in operation_matches({"scaling", "normalization", "resample"}):
                 add(
                     node,
                     5,
-                    f"Node '{node.get('id')}' ({node.get('operation')}) uses sklearn-style preprocessing that expects 2D input.",
+                    f"Node '{node.get('id')}' ({node.get('operation')}) can change feature shape before a sklearn tabular model.",
                 )
 
         if "unexpected keyword argument 'output_mode'" in combined or 'unexpected keyword argument "output_mode"' in combined:
@@ -591,6 +717,12 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
                         1,
                         f"output_mode error is raised inside a preprocessing strategy while node '{node.get('id')}' exists in that path.",
                     )
+
+        if "keyerror: 'default'" in combined or "ids_relevant_features" in combined:
+            runtime_issue = "fedot_predict_preprocessor_state"
+            global_evidence.append(
+                "Fedot predict failed because pipeline preprocessing state for source 'default' was missing after finetune."
+            )
 
         original_signature = cls._error_signature(error_text)
         ruled_out_nodes: List[Dict[str, Any]] = []
@@ -648,6 +780,9 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
             "evidence": cls._unique_text(evidence),
             "ruled_out_nodes": cls._unique_node_records(ruled_out_nodes),
             "runtime_issue": runtime_issue,
+            "recommendations": cls._runtime_recommendations([
+                {"error_signature": cls._error_signature(error_text)}
+            ]),
             "recoverable": True,
         }
 
@@ -656,15 +791,41 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
         text = str(message or "").lower()
         if "categorical_ids" in text or "categorical_encoders.py" in text or "no attribute 'size'" in text:
             return "categorical_encoder_metadata"
-        if "expected 2d array, got 1d array" in text:
-            return "preprocessing_1d_input"
+        if (
+            "expected 2d array, got 1d array" in text
+            or "found array with dim" in text
+            or "invalid shape" in text
+            or "must be 2 or 3 dimensional" in text
+        ):
+            return "sklearn_dimensionality"
         if "unexpected keyword argument 'output_mode'" in text or 'unexpected keyword argument "output_mode"' in text:
             return "fedot_output_mode_api"
+        if "keyerror: 'default'" in text or "ids_relevant_features" in text:
+            return "fedot_predict_preprocessor_state"
         if "mix of binary and continuous targets" in text:
             return "classification_prediction_shape"
         if "early stopping" in text and "eval metric" in text:
             return "model_eval_set_required"
         return text[:120]
+
+    @classmethod
+    def _error_phase(cls, payload: Dict[str, Any]) -> str:
+        text = cls._failure_message(payload).lower()
+        traceback_text = str(
+            payload.get("finetune_traceback")
+            or payload.get("fallback_traceback")
+            or ""
+        ).lower()
+        combined = f"{text}\n{traceback_text}"
+        if "keyerror: 'default'" in combined or "ids_relevant_features" in combined:
+            return "finetune_predict"
+        if payload.get("fallback_error") and not payload.get("fallback_used"):
+            return "direct_fit"
+        if payload.get("finetune_error"):
+            return "finetune_fit"
+        if payload.get("error"):
+            return "train_graph"
+        return "completed"
 
     @staticmethod
     def _unique_text(items: List[str]) -> List[str]:
