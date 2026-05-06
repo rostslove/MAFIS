@@ -465,6 +465,59 @@ async def propose_revision_from_critic(
         fallback_params=industrial_strategy_params,
     )
 
+    if graph_mutations:
+        try:
+            draft_graph = graph
+            for mutation in graph_mutations:
+                draft_graph = draft_graph.apply_mutation(mutation)
+                ok, validation_message = draft_graph.validate()
+                if not ok:
+                    return {
+                        "error": f"Selected Critic mutation produced an invalid graph: {validation_message}",
+                        "profile": profile,
+                        "diagnostics": [
+                            {
+                                "agent": "Architect",
+                                "kind": "invalid_selected_mutation",
+                                "summary": "Selected Critic graph mutation could not be applied safely.",
+                                "technical_message": validation_message,
+                                "recoverable": True,
+                            }
+                        ],
+                        "tool_calls": [],
+                    }
+            return {
+                "profile": profile,
+                "graph": draft_graph.to_dict(),
+                "mermaid": draft_graph.to_mermaid(),
+                "analysis": "Applied the selected Critic graph mutation(s) directly as a new draft.",
+                "reasoning": (
+                    "Critic mutations are structural node edits, so the backend applied them deterministically "
+                    "instead of asking Architect to reinterpret the same change."
+                ),
+                "diagnostics": [],
+                "applied_mutations": selected_feedback_mutations,
+                "industrial_strategy": applied_strategy or "tabular",
+                "industrial_strategy_params": dict(applied_strategy_params or {}),
+                "requires_approval": True,
+                "tool_calls": [],
+            }
+        except Exception as exc:
+            return {
+                "error": f"Selected Critic mutation could not be applied: {exc}",
+                "profile": profile,
+                "diagnostics": [
+                    {
+                        "agent": "Architect",
+                        "kind": "selected_mutation_error",
+                        "summary": "Selected Critic graph mutation failed before a draft could be prepared.",
+                        "technical_message": str(exc),
+                        "recoverable": True,
+                    }
+                ],
+                "tool_calls": [],
+            }
+
     data_context = DataContext(
         csv_path=csv_path,
         target_column=target_column,

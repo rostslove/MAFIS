@@ -155,6 +155,7 @@ def approve_graph() -> None:
         st.session_state.approved_graph = st.session_state.graph
         st.session_state.approved_mermaid = st.session_state.get("mermaid", "")
         st.session_state.graph_approved = True
+        st.session_state.revision_success_message = ""
 
 
 def discard_draft() -> None:
@@ -163,6 +164,7 @@ def discard_draft() -> None:
         st.session_state.graph = approved
         st.session_state.mermaid = st.session_state.get("approved_mermaid", "")
         st.session_state.graph_approved = True
+    st.session_state.revision_success_message = ""
 
 
 def root_node_id(graph: Dict[str, Any]) -> str:
@@ -565,6 +567,123 @@ def graph_rows(graph: Dict[str, Any]) -> List[Dict[str, str]]:
             "params": format_params(node.get("params", {}) or {}),
         })
     return rows
+
+
+def has_pending_draft() -> bool:
+    return bool(st.session_state.get("graph")) and not bool(st.session_state.get("graph_approved"))
+
+
+def render_pending_draft_panel(key_prefix: str = "pending_draft") -> None:
+    if not has_pending_draft():
+        return
+
+    draft = st.session_state.get("graph", {}) or {}
+    st.info("Architect prepared a revised draft. It is not the active evaluated pipeline until you approve it.")
+    render_graph(draft, show_details=False)
+    rows = graph_rows(draft)
+    if rows:
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    approve_col, discard_col = st.columns(2)
+    if approve_col.button("Approve Draft", use_container_width=True, key=f"{key_prefix}_approve"):
+        approve_graph()
+        st.session_state.revision_success_message = "Draft approved. You can now evaluate this pipeline."
+        st.rerun()
+    if discard_col.button(
+        "Discard Draft",
+        use_container_width=True,
+        disabled=not st.session_state.get("approved_graph"),
+        key=f"{key_prefix}_discard",
+    ):
+        discard_draft()
+        st.session_state.revision_success_message = "Draft discarded; approved graph restored."
+        st.rerun()
+
+
+def metric_comparison_rows(engineer: Dict[str, Any]) -> List[Dict[str, Any]]:
+    train_metrics = engineer.get("train_metrics", {}) or {}
+    test_metrics = engineer.get("test_metrics", {}) or engineer.get("graph_metrics", {}) or {}
+    names = [
+        name
+        for name in dict.fromkeys(list(train_metrics.keys()) + list(test_metrics.keys()))
+        if name not in METRIC_METADATA_KEYS
+    ]
+    rows: List[Dict[str, Any]] = []
+    for name in names:
+        train_value = _numeric_or_none(train_metrics.get(name))
+        test_value = _numeric_or_none(test_metrics.get(name))
+        if train_value is None and test_value is None:
+            continue
+        gap = None
+        if train_value is not None and test_value is not None:
+            gap = train_value - test_value
+        rows.append({
+            "metric": name,
+            "train": train_value,
+            "test": test_value,
+            "gap": gap,
+        })
+    return rows
+
+
+def render_model_assessment(engineer: Dict[str, Any]) -> None:
+    rows = metric_comparison_rows(engineer)
+    if not rows:
+        st.caption("No train/test metric comparison is available for this run.")
+        return
+
+    st.write("Train/Test Assessment")
+    chart = pd.DataFrame(rows).set_index("metric")
+    st.bar_chart(chart[["train", "test"]])
+    st.dataframe(
+        pd.DataFrame([
+            {
+                "metric": row["metric"],
+                "train": format_number(row["train"]) if row["train"] is not None else "",
+                "test": format_number(row["test"]) if row["test"] is not None else "",
+                "gap": format_number(row["gap"]) if row["gap"] is not None else "",
+            }
+            for row in rows
+        ]),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+def render_explain_graph_assessment(explanation: Dict[str, Any]) -> None:
+    if not explanation or explanation.get("skipped"):
+        st.caption("Graph explanation is unavailable for this run.")
+        return
+
+    graph = explanation.get("graph") or {}
+    feature_importance = explanation.get("feature_importance") or {}
+
+    if graph:
+        st.write("Explained Pipeline")
+        render_graph(graph, show_details=False)
+
+    if feature_importance:
+        rows = sorted(
+            (
+                {"feature": str(feature), "importance": _numeric_or_none(value)}
+                for feature, value in feature_importance.items()
+            ),
+            key=lambda row: row["importance"] if row["importance"] is not None else -1.0,
+            reverse=True,
+        )
+        rows = [row for row in rows if row["importance"] is not None]
+        if rows:
+            st.write("Feature Importance")
+            frame = pd.DataFrame(rows).set_index("feature")
+            st.bar_chart(frame["importance"])
+            st.dataframe(
+                pd.DataFrame([
+                    {"feature": row["feature"], "importance": format_number(row["importance"])}
+                    for row in rows
+                ]),
+                use_container_width=True,
+                hide_index=True,
+            )
 
 
 def industrial_strategies_for_task(config: Dict[str, Any], task_type: str) -> List[Dict[str, Any]]:
@@ -1288,7 +1407,7 @@ def render_engineer_report(
         render_diagnostics(engineer.get("diagnostics", []), "Engineer diagnostics", use_expander=False)
 
 
-def render_critic_feedback(critic: Dict[str, Any], compact_runtime_error: bool = False) -> None:
+def render_critic_feedback(critic: Dict[str, Any], compact_runtime_error: bool = False, iteration=None) -> None:
     st.markdown("#### Critic Recovery" if compact_runtime_error else "#### Critic Feedback")
     if compact_runtime_error:
         st.caption("Critic is focused on recovery because Engineer reported a training/runtime issue.")
@@ -1334,6 +1453,20 @@ def render_critic_feedback(critic: Dict[str, Any], compact_runtime_error: bool =
                 label += f" - {row['details']}"
             default_selected = True
             st.checkbox(label, value=default_selected, key=f"critic_mut_{idx}")
+        if iteration is not None:
+            if st.button(
+                "Apply Selected Mutations",
+                type="primary",
+                use_container_width=True,
+                key="critic_apply_selected_mutations",
+            ):
+                if selected_critic_mutations(critic):
+                    try:
+                        request_architect_revision(iteration)
+                    except Exception as exc:
+                        st.error(f"Could not apply Critic mutations: {exc}")
+                else:
+                    st.warning("Select at least one mutation to apply.")
 
     if not compact_runtime_error:
         render_diagnostics(critic.get("diagnostics", []), "Critic diagnostics", use_expander=False)
@@ -1369,15 +1502,16 @@ def request_architect_revision(iteration: Dict[str, Any], message: str = "") -> 
 
     graph_changes = [m for m in selected if isinstance(m, dict)]
     if graph_changes:
-        st.success(
+        st.session_state.revision_success_message = (
             f"Architect prepared a new draft from {len(graph_changes)} graph mutation(s). "
-            "Approve it to make it the active pipeline."
+            "Review it below or in Graph Editor, then approve it to make it the active pipeline."
         )
     else:
-        st.success(
+        st.session_state.revision_success_message = (
             "Architect prepared a new draft (no mutations selected; LLM-driven revision). "
-            "Approve it to make it the active pipeline."
+            "Review it below or in Graph Editor, then approve it to make it the active pipeline."
         )
+    st.rerun()
 
 
 def _numeric_or_none(value: Any) -> float | None:
@@ -1589,6 +1723,10 @@ def results_tab() -> None:
         st.info("Evaluate an approved graph to see Engineer and Critic feedback.")
         return
 
+    revision_message = st.session_state.get("revision_success_message", "")
+    if revision_message:
+        st.success(revision_message)
+
     item = latest_iteration(result)
     if not item:
         st.error("No successful evaluation found.")
@@ -1625,7 +1763,6 @@ def results_tab() -> None:
         "Critic",
         "Diagnostics",
         "History",
-        "Next action",
     ])
 
     with sub_tabs[0]:
@@ -1641,7 +1778,10 @@ def results_tab() -> None:
         )
 
     with sub_tabs[1]:
-        render_critic_feedback(critic, compact_runtime_error=has_runtime_failure)
+        render_critic_feedback(critic, compact_runtime_error=has_runtime_failure, iteration=item)
+        if has_pending_draft():
+            st.divider()
+            render_pending_draft_panel("critic_pending_draft")
 
     with sub_tabs[2]:
         eng_diag = engineer.get("diagnostics", []) or []
@@ -1659,40 +1799,6 @@ def results_tab() -> None:
     with sub_tabs[3]:
         render_evaluation_history(result)
 
-    with sub_tabs[4]:
-        st.markdown("#### Next Pipeline Decision")
-        critic_questions = critic.get("questions_for_user", []) or []
-        if critic_questions:
-            st.info("Critic needs your input before the next graph can be made confidently.")
-            for question in critic_questions:
-                st.write(f"- {question}")
-        msg = st.text_area(
-            "Answer Critic / note for Architect",
-            placeholder=(
-                "Answer Critic questions here, for example: categorical columns are workclass, education, "
-                "marital-status, occupation, relationship, race, sex, native-country."
-            ),
-            height=90,
-        )
-        col_apply, col_keep = st.columns(2)
-        if col_apply.button(
-            "Ask Architect To Draft Critic Changes",
-            type="primary",
-            use_container_width=True,
-            key="critic_draft_changes",
-        ):
-            try:
-                request_architect_revision(item, msg)
-            except Exception as exc:
-                st.error(f"Architect revision failed: {exc}")
-        if col_keep.button(
-            "Keep Current Approved Pipeline",
-            use_container_width=True,
-            key="critic_keep_current",
-        ):
-            discard_draft()
-            st.info("Current approved pipeline kept. No new draft accepted.")
-
 
 def report_tab() -> None:
     st.subheader("Report")
@@ -1701,6 +1807,9 @@ def report_tab() -> None:
         st.info("No report yet.")
         return
 
+    item = latest_iteration(result)
+    engineer = item.get("engineer", {}) if item else {}
+    critic = item.get("critic", {}) if item else {}
     report = result.get("report", {})
     st.markdown(f"### {report.get('title', 'MAFIS report')}")
     st.write(report.get("summary", ""))
@@ -1712,8 +1821,14 @@ def report_tab() -> None:
         st.write(report["results"])
     if report.get("recommendations"):
         st.write("Recommendations")
-        for item in report["recommendations"]:
-            st.write(f"- {item}")
+        for recommendation in report["recommendations"]:
+            st.write(f"- {recommendation}")
+
+    st.divider()
+    st.markdown("#### Visual Assessment")
+    render_model_assessment(engineer)
+    st.divider()
+    render_explain_graph_assessment(critic.get("explanation", {}) or {})
 
 
 def tools_tab(tools: Dict[str, Any]) -> None:
