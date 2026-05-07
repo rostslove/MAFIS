@@ -137,6 +137,13 @@ def _as_2d_if_1d(features):
     return features
 
 
+def _output_predict_as_2d_if_1d(output):
+    predict = getattr(output, "predict", None)
+    if isinstance(predict, np.ndarray) and predict.ndim == 1:
+        output.predict = predict.reshape(-1, 1)
+    return output
+
+
 @contextmanager
 def _sklearn_preprocessors_accept_1d():
     """Allow sklearn preprocessors to consume per-feature vectors from Fedot.Industrial."""
@@ -150,7 +157,10 @@ def _sklearn_preprocessors_accept_1d():
 
     def wrap(method):
         def wrapped(self, X, *args, **kwargs):
-            return method(self, _as_2d_if_1d(X), *args, **kwargs)
+            result = method(self, _as_2d_if_1d(X), *args, **kwargs)
+            if isinstance(result, np.ndarray) and result.ndim == 1:
+                return result.reshape(-1, 1)
+            return result
         return wrapped
 
     try:
@@ -161,6 +171,21 @@ def _sklearn_preprocessors_accept_1d():
                     continue
                 patched.append((cls, method_name, method))
                 setattr(cls, method_name, wrap(method))
+        try:
+            from fedot.core.operations.evaluation.operation_implementations.data_operations.sklearn_transformations import (
+                EncodedInvariantImplementation,
+            )
+        except Exception:
+            EncodedInvariantImplementation = None
+        if EncodedInvariantImplementation is not None:
+            method = getattr(EncodedInvariantImplementation, "transform", None)
+            if method is not None:
+                patched.append((EncodedInvariantImplementation, "transform", method))
+
+                def transform_wrapped(self, input_data, *args, **kwargs):
+                    return _output_predict_as_2d_if_1d(method(self, input_data, *args, **kwargs))
+
+                setattr(EncodedInvariantImplementation, "transform", transform_wrapped)
         yield
     finally:
         for cls, method_name, method in patched:
