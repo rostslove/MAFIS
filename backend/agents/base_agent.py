@@ -35,9 +35,19 @@ _load_project_env()
 
 DEFAULT_LLM_MODEL = "qwen2.5-coder:14b"
 DEFAULT_LLM_BASE_URL = "http://localhost:11434/v1"
+
+
+def _env_int(name: str, default: int = 0) -> int:
+    try:
+        return int(os.environ.get(name) or default)
+    except (TypeError, ValueError):
+        return default
+
+
 LLM_MODEL = os.environ.get("LLM_MODEL", DEFAULT_LLM_MODEL)
-LLM_BASE_URL = os.environ.get("LLM_BASE_URL") or os.environ.get("OPENROUTER_BASE_URL", DEFAULT_LLM_BASE_URL)
-LLM_API_KEY = os.environ.get("LLM_API_KEY") or os.environ.get("OPENROUTER_API_KEY") or "ollama"
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", DEFAULT_LLM_BASE_URL)
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "ollama")
+LLM_NUM_CTX = _env_int("LLM_NUM_CTX", _env_int("OLLAMA_CONTEXT_LENGTH", 0))
 
 _client: Optional[OpenAI] = None
 
@@ -218,6 +228,8 @@ class BaseAgent(ABC):
 
             for round_num in range(max_rounds):
                 kwargs: Dict[str, Any] = {"model": LLM_MODEL, "messages": messages}
+                if LLM_NUM_CTX > 0 and ("ollama" in LLM_BASE_URL or "11434" in LLM_BASE_URL):
+                    kwargs["extra_body"] = {"options": {"num_ctx": LLM_NUM_CTX}}
                 if tools:
                     kwargs["tools"] = tools
                     kwargs["tool_choice"] = "auto"

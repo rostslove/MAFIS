@@ -9,7 +9,7 @@ services:
       - "127.0.0.1:11434:11434"
     environment:
       - OLLAMA_KEEP_ALIVE=30m
-      - OLLAMA_CONTEXT_LENGTH=${OLLAMA_CONTEXT_LENGTH:-8192}
+      - OLLAMA_CONTEXT_LENGTH=${OLLAMA_CONTEXT_LENGTH:-16384}
     healthcheck:
       test: ["CMD", "ollama", "list"]
       interval: 10s
@@ -47,6 +47,7 @@ services:
       - LLM_BASE_URL=http://ollama:11434/v1
       - LLM_API_KEY=ollama
       - LLM_MODEL=${LLM_MODEL:-qwen2.5-coder:14b}
+      - LLM_NUM_CTX=${OLLAMA_CONTEXT_LENGTH:-16384}
       - FEDOT_INDUSTRIAL_PATH=/opt/Fedot.Industrial
     depends_on:
       ollama-pull:

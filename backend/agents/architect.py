@@ -47,7 +47,7 @@ outside the graph; do not include them in the JSON. The default mode means
 Fedot.Industrial's non-tabular-default Industrial repository unless diagnostics
 explicitly say otherwise. For CSV feature matrices, the backend prepares numeric
 feature values before handing the native (X, y) tuple to Fedot.Industrial.
-Use the catalog's runtime_family, data_contract, and compatibility_note fields
+Use runtime_contracts and fedot_industrial_meta_groups from available_operations
 to keep preprocessing/model contracts compatible.
 Apply senior ML judgement when choosing preprocessing. Consider the data
 profile, model family assumptions, feature semantics, leakage risk,
@@ -195,7 +195,7 @@ Return JSON only."""
             "csv_path": dc.csv_path,
             "target_column": dc.target_column,
             "primary_metric": dc.primary_metric,
-            "data_profile": profile,
+            "data_profile": self._compact_profile(profile),
             "available_operations": operations,
             "previous_graph": prev_graph,
             "feedback": None,
@@ -206,12 +206,12 @@ Return JSON only."""
             payload["feedback"] = {
                 "decision": prev_fb.winner,
                 "assessment": prev_fb.assessment,
-                "strengths": prev_fb.strengths,
-                "weaknesses": prev_fb.weaknesses,
-                "suggested_mutations": prev_fb.suggested_mutations,
-                "improvement_plan": prev_fb.improvement_plan,
-                "questions_for_user": prev_fb.questions_for_user,
-                "diagnostics": prev_fb.diagnostics,
+                "strengths": list(prev_fb.strengths or [])[:3],
+                "weaknesses": list(prev_fb.weaknesses or [])[:3],
+                "suggested_mutations": list(prev_fb.suggested_mutations or [])[:5],
+                "improvement_plan": list(prev_fb.improvement_plan or [])[:5],
+                "questions_for_user": list(prev_fb.questions_for_user or [])[:3],
+                "diagnostics": list(prev_fb.diagnostics or [])[:5],
             }
         return (
             "Create one valid graph proposal for this payload.\n"
@@ -221,7 +221,7 @@ Return JSON only."""
             "For CSV feature matrices, the backend passes a native Fedot.Industrial (X, y) tuple "
             "with numeric feature values; do not rely on manual InputData metadata. "
             "Treat Fedot.Industrial repository operations as first-class candidates, and use "
-            "runtime_family/data_contract/compatibility_note from the catalog to avoid invalid contracts.\n"
+            "runtime_contracts and fedot_industrial_meta_groups from available_operations to avoid invalid contracts.\n"
             "Act like an expert ML architect: choose preprocessing by reasoning about the data profile, "
             "model family assumptions, feature semantics, missingness, categorical structure, dimensionality, "
             "and whether the transform has a plausible benefit for the selected downstream model. "
@@ -239,39 +239,62 @@ Return JSON only."""
 
     @staticmethod
     def _structure_only_operations(operations: Dict[str, Any]) -> Dict[str, Any]:
-        """Remove parameter/search-space hints before sending the catalog to Architect."""
+        """Keep the operation prompt compact enough for local Ollama contexts."""
         if not isinstance(operations, dict):
             return {}
-        cleaned = dict(operations)
-        catalog = cleaned.get("catalog")
-        if isinstance(catalog, dict):
-            cleaned_catalog: Dict[str, Any] = {}
-            for group, items in catalog.items():
+        cleaned = {
+            "task_type": operations.get("task_type"),
+            "is_time_series": operations.get("is_time_series"),
+            "preprocessing": list(operations.get("preprocessing", []) or []),
+            "models": list(operations.get("models", []) or []),
+            "metrics": list(operations.get("metrics", []) or []),
+        }
+        source_catalog = operations.get("catalog")
+        if isinstance(source_catalog, dict):
+            runtime_groups: Dict[tuple, List[str]] = {}
+            meta_groups: Dict[str, List[str]] = {}
+            for group, items in source_catalog.items():
                 if not isinstance(items, list):
-                    cleaned_catalog[group] = items
                     continue
-                cleaned_catalog[group] = [
-                    {
-                        key: value
-                        for key, value in item.items()
-                        if key not in {"param_hints", "industrial_search_space"}
-                    }
-                    for item in items
-                    if isinstance(item, dict)
-                ]
-            cleaned["catalog"] = cleaned_catalog
-        if isinstance(cleaned.get("default_graph"), list):
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    operation = item.get("operation")
+                    if not operation:
+                        continue
+                    runtime_key = (
+                        item.get("runtime_family") or "",
+                        item.get("data_contract") or "",
+                    )
+                    runtime_groups.setdefault(runtime_key, []).append(operation)
+                    meta = item.get("fedot_industrial_meta") or ""
+                    if meta:
+                        meta_groups.setdefault(str(meta), []).append(operation)
+            cleaned["runtime_contracts"] = [
+                {
+                    "runtime_family": runtime_family,
+                    "data_contract": data_contract,
+                    "operations": operations_for_contract,
+                }
+                for (runtime_family, data_contract), operations_for_contract in runtime_groups.items()
+            ]
+            cleaned["fedot_industrial_meta_groups"] = meta_groups
+        if isinstance(operations.get("default_graph"), list):
             cleaned["default_graph"] = [
                 {key: value for key, value in node.items() if key != "params"}
-                for node in cleaned["default_graph"]
+                for node in operations["default_graph"]
                 if isinstance(node, dict)
             ]
-        if isinstance(cleaned.get("industrial_templates"), list):
+        if isinstance(operations.get("industrial_templates"), list):
             templates = []
-            for template in cleaned["industrial_templates"]:
+            for template in operations["industrial_templates"]:
                 if not isinstance(template, dict):
                     continue
-                item = dict(template)
+                item = {
+                    "name": template.get("name"),
+                    "description": template.get("description"),
+                    "graph": template.get("graph"),
+                }
                 graph = item.get("graph")
                 if isinstance(graph, dict) and isinstance(graph.get("nodes"), list):
                     item["graph"] = {
@@ -284,4 +307,34 @@ Return JSON only."""
                     }
                 templates.append(item)
             cleaned["industrial_templates"] = templates
+        strategies = operations.get("industrial_strategies_catalog")
+        if isinstance(strategies, list):
+            cleaned["industrial_strategies_catalog"] = [
+                {
+                    "name": item.get("name"),
+                    "label": item.get("label"),
+                    "default_params": {
+                        key: value
+                        for key, value in dict(item.get("default_params", {}) or {}).items()
+                        if key in {"data_type", "problem", "available_operations"}
+                    },
+                }
+                for item in strategies
+                if isinstance(item, dict)
+            ]
         return cleaned
+
+    @staticmethod
+    def _compact_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(profile, dict):
+            return {}
+        compact = dict(profile)
+        for key in ("feature_names", "numeric_feature_names", "categorical_feature_names"):
+            if isinstance(compact.get(key), list):
+                compact[key] = compact[key][:12]
+        stats = dict(compact.get("feature_stats", {}) or {})
+        card = stats.get("categorical_cardinalities")
+        if isinstance(card, dict):
+            stats["categorical_cardinalities"] = dict(list(card.items())[:10])
+        compact["feature_stats"] = stats
+        return compact

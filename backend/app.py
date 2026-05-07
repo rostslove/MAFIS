@@ -94,8 +94,7 @@ async def get_config(request):
         "fedot_industrial_strategy_catalog": get_fedot_industrial_strategy_catalog(),
         "default_graphs": DEFAULT_GRAPHS,
         "industrial_graph_templates": INDUSTRIAL_GRAPH_TEMPLATES,
-        "llm_configured": bool(os.getenv("LLM_API_KEY") or os.getenv("OPENROUTER_API_KEY") or LLM_BASE_URL),
-        "openrouter_configured": "openrouter.ai" in LLM_BASE_URL and bool(os.getenv("OPENROUTER_API_KEY")),
+        "llm_configured": bool(os.getenv("LLM_API_KEY") or LLM_BASE_URL),
         "fedot_ind_version": FEDOT_IND_VERSION,
         "fedot_industrial_source": FEDOT_INDUSTRIAL_SOURCE,
         "benchmarks": {
