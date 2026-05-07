@@ -43,11 +43,11 @@ finetuned by AutoML. Do not propose node parameters, model hyperparameters, or
 operation search-space values; node params must be omitted or empty and are
 ignored by the backend. Industrial strategies
 (default/federated_automl/sampling_strategy) are execution modes selected
-outside the graph; do not include them in the JSON. The default mode means no
-strategy-specific training path.
-For tabular datasets, data_profile.categorical_feature_names are automatically
-passed to FEDOT as categorical metadata, so categorical preprocessing nodes can
-use that metadata without hard-coded column lists.
+outside the graph; do not include them in the JSON. The default mode means
+Fedot.Industrial's default strategy with task data_type supplied by config.
+For tabular datasets, the backend prepares numeric feature values before handing
+the native (X, y) tuple to Fedot.Industrial; use preprocessing nodes only when
+they are valid operations from the catalog.
 Return JSON only."""
 
     STRUCTURED_PROMPT = SYSTEM_PROMPT
@@ -209,8 +209,8 @@ Return JSON only."""
             "The graph you produce becomes Fedot.Industrial `initial_assumption` and is polished by AutoML finetune.\n"
             "Choose only operations and graph topology. Do not choose hyperparameters or node params; "
             "Fedot.Industrial owns parameter tuning during finetune.\n"
-            "For tabular data, automatically detected categorical_feature_names are passed to FEDOT InputData "
-            "as categorical metadata for preprocessing operations.\n"
+            "For tabular data, the backend passes a native Fedot.Industrial (X, y) tuple "
+            "with numeric feature values; do not rely on manual InputData metadata.\n"
             "available_operations.industrial_templates contains Fedot.Industrial-native graph patterns.\n"
             "available_operations.industrial_strategies_catalog describes selectable execution strategies "
             "(default/federated_automl/sampling_strategy). Strategies are picked by the user outside the graph; "

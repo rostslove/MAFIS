@@ -383,19 +383,6 @@ def _build_framework_operations() -> Dict[str, Dict[str, List[str]]]:
         "industrial_manifold_reg",
     }
 
-    tabular_preproc_common = _json_operation_names_by_meta(
-        INDUSTRIAL_DATA_OPERATION_REPOSITORY_JSON,
-        {"custom_preprocessing", "sklearn_categorical", "dimension_transformation"},
-    )
-    class_preproc = tabular_preproc_common + _json_operation_names_by_meta(
-        INDUSTRIAL_DATA_OPERATION_REPOSITORY_JSON,
-        {"classification_preprocessing"},
-    ) + _repo_keys("INDUSTRIAL_CLF_PREPROC_MODEL")
-    reg_preproc = tabular_preproc_common + _json_operation_names_by_meta(
-        INDUSTRIAL_DATA_OPERATION_REPOSITORY_JSON,
-        {"regression_preprocessing"},
-    )
-
     industrial_preproc = [
         name
         for name in _repo_keys("INDUSTRIAL_PREPROC_MODEL")
@@ -427,14 +414,21 @@ def _build_framework_operations() -> Dict[str, Dict[str, List[str]]]:
 
     return {
         "classification": {
-            "preprocessing": _only_framework_ops(class_preproc),
+            # In Fedot.Industrial default context tabular CSV preprocessing is
+            # handled by DataCheck before the initial assumption is tuned.
+            # Explicit FEDOT tabular preprocessing nodes are evaluated through
+            # Industrial's channel-independent dispatcher and receive 1D
+            # per-feature slices, while FEDOT tabular preprocessors expect a
+            # 2D table. Keep the graph vocabulary aligned with what the
+            # Industrial optimizer can execute reliably.
+            "preprocessing": [],
             "models": _only_framework_ops([
                 name for name in sorted(sklearn_class)
                 if name not in tabular_class_excluded and not name.startswith("industrial_")
             ]),
         },
         "regression": {
-            "preprocessing": _only_framework_ops(reg_preproc),
+            "preprocessing": [],
             "models": _only_framework_ops([
                 name for name in sorted(sklearn_reg)
                 if name not in tabular_reg_excluded and not name.startswith("industrial_")
@@ -1262,6 +1256,78 @@ def load_input_data(
         data_type=DataTypesEnum.table,
         **metadata_kwargs,
     )
+
+
+def load_industrial_tuple_data(
+    csv_path: str,
+    target: str,
+    task_type: str,
+    forecast_length: Optional[int] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Load CSV in the native Fedot.Industrial API format: ``(features, target)``.
+
+    Fedot.Industrial's ``DataCheck`` layer owns the conversion from this tuple
+    into ``InputData``. Passing a prebuilt FEDOT ``InputData`` skips that layer
+    and can leave Industrial preprocessing with shapes it does not expect.
+    """
+    csv_path = normalize_csv_path(csv_path)
+    df = pd.read_csv(csv_path)
+    if target not in df.columns:
+        raise ValueError(f"Target column '{target}' not in CSV")
+
+    if task_type == "ts_forecasting":
+        series = df[target].astype(float).values
+        horizon = forecast_length or 14
+        return series, series[-horizon:]
+
+    y = df[target].values
+    feature_df, numeric_columns, _ = _tabular_feature_metadata(df, target)
+    if feature_df.shape[1] == 0:
+        raise ValueError("No feature columns found after removing the target column.")
+
+    if task_type in ("ts_classification", "ts_regression"):
+        feature_df = feature_df[numeric_columns]
+        if feature_df.shape[1] == 0:
+            raise ValueError(
+                "Time-series tasks require numeric feature columns after removing the target column."
+            )
+
+    X = feature_df.to_numpy(dtype=float)
+    if task_type in ("regression", "ts_regression"):
+        try:
+            y = y.astype(float)
+        except ValueError as exc:
+            raise ValueError(
+                "Regression target contains non-numeric values. "
+                "Choose classification or convert the target to numbers."
+            ) from exc
+
+    return X, y
+
+
+def industrial_tuple_sample_count(data: Tuple[np.ndarray, np.ndarray]) -> int:
+    return len(np.asarray(data[0]))
+
+
+def split_industrial_tuple_data(
+    data: Tuple[np.ndarray, np.ndarray],
+    test_size: float = 0.2,
+) -> Tuple[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]:
+    """Train/validation split for native Fedot.Industrial tuple data."""
+    test_size = min(max(float(test_size) if test_size is not None else 0.2, 0.05), 0.5)
+    X, y = data
+    X_arr = np.asarray(X)
+    y_arr = np.asarray(y)
+    n = len(X_arr)
+    if n < 2:
+        raise ValueError("At least two samples are required for a train/test split.")
+    cut = int(n * (1 - test_size))
+    cut = min(max(cut, 1), n - 1)
+
+    rng = np.random.default_rng(42)
+    perm = rng.permutation(n)
+    train_idx, val_idx = perm[:cut], perm[cut:]
+    return (X_arr[train_idx], y_arr[train_idx]), (X_arr[val_idx], y_arr[val_idx])
 
 
 def input_sample_count(input_data: InputData) -> int:

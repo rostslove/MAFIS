@@ -117,7 +117,7 @@ async def run_orchestration_stream(
         yield _event(
             "status",
             message=(
-                "Industrial execution strategy: default (no strategy-specific training path; "
+                "Industrial execution strategy: default (Fedot.Industrial default strategy; "
                 "task data_type is passed through Fedot.Industrial config)."
             ),
         )

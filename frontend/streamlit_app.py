@@ -851,7 +851,7 @@ def render_industrial_strategy_summary() -> None:
     if name == "default":
         st.caption(
             "Industrial strategy: default "
-            f"(no strategy-specific path; config data_type={data_type_text})."
+            f"(Fedot.Industrial default strategy; config data_type={data_type_text})."
         )
         return
     st.caption(f"Industrial strategy: {name}")
@@ -920,8 +920,8 @@ def render_industrial_strategy_picker(config: Dict[str, Any], task_type: str, ke
         index=current_index,
         key=widget_key,
         help=(
-            "Default does not select a strategy-specific training path. federated_automl and "
-            "sampling_strategy remain available as explicit Fedot.Industrial strategies."
+            "Default runs Fedot.Industrial's default strategy. federated_automl and "
+            "sampling_strategy remain available as alternate Fedot.Industrial strategies."
         ),
     )
     selected_spec = next((item for item in available if item.get("name") == selected), {})
@@ -1621,9 +1621,6 @@ def render_critic_feedback(critic: Dict[str, Any], compact_runtime_error: bool =
                         st.error(f"Could not apply Critic mutations: {exc}")
                 else:
                     st.warning("Select at least one mutation to apply.")
-
-    if not compact_runtime_error:
-        render_diagnostics(critic.get("diagnostics", []), "Critic diagnostics", use_expander=False)
 
 
 def selected_critic_mutations(critic: Dict[str, Any]) -> List[Dict[str, Any]]:

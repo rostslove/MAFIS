@@ -30,7 +30,8 @@ from graph_engine import (
     OPERATIONS, METRICS_BY_TASK, SUPPORTED_TASKS, DEFAULT_GRAPHS, INDUSTRIAL_GRAPH_TEMPLATES,
     PipelineGraph, compute_metrics, get_operation_catalog, get_training_strategies,
     get_training_strategy_hints, is_ts_task,
-    input_sample_count, load_input_data, slice_input_data, split_input_data,
+    industrial_tuple_sample_count, input_sample_count, load_industrial_tuple_data,
+    load_input_data, slice_input_data, split_industrial_tuple_data, split_input_data,
 )
 from path_utils import normalize_csv_path
 
@@ -302,8 +303,8 @@ def _build_api_config(
     if task_type == "ts_forecasting":
         industrial_config["task_params"] = {"forecast_length": forecast_length or 14}
 
-    strategy = str(industrial_strategy or "default").strip().lower() or "default"
-    if strategy in ("federated_automl", "sampling_strategy"):
+    requested_strategy = str(industrial_strategy or "default").strip().lower() or "default"
+    if requested_strategy in ("federated_automl", "sampling_strategy"):
         merged_params = {
             "problem": fedot_problem,
             "data_type": data_type,
@@ -313,14 +314,15 @@ def _build_api_config(
             merged_params.update({
                 str(k): v for k, v in industrial_strategy_params.items() if v is not None
             })
-        industrial_config["learning_strategy"] = strategy
-        industrial_config["strategy"] = strategy
+        industrial_config["learning_strategy"] = requested_strategy
+        industrial_config["strategy"] = requested_strategy
         industrial_config["strategy_params"] = merged_params
     else:
         industrial_config["strategy"] = "default"
 
     logger.info(
-        "Fedot.Industrial config: strategy=%s, data_type=%s, problem=%s",
+        "Fedot.Industrial config: requested_strategy=%s, fedot_strategy=%s, data_type=%s, problem=%s",
+        requested_strategy,
         industrial_config.get("strategy", "default"),
         data_type,
         fedot_problem,
@@ -371,8 +373,8 @@ def _train_via_finetune(
     """
     from fedot_ind.api.main import FedotIndustrial
 
-    input_data = load_input_data(csv_path, target_column, graph.task_type, forecast_length)
-    train, test = split_input_data(input_data, test_size=test_size)
+    industrial_data = load_industrial_tuple_data(csv_path, target_column, graph.task_type, forecast_length)
+    train, test = split_industrial_tuple_data(industrial_data, test_size=test_size)
 
     api_config = _build_api_config(
         task_type=graph.task_type,
@@ -385,32 +387,28 @@ def _train_via_finetune(
 
     industrial = FedotIndustrial(**api_config)
     builder = _graph_to_pipeline_builder(graph)
-    with _sklearn_preprocessors_accept_1d():
+    try:
+        finetune_kwargs = {
+            "tuning_params": {"tuning_iterations": 5},
+            "model_to_tune": builder,
+            "return_only_fitted": False,
+        }
+        industrial.finetune(
+            train_data=train,
+            **finetune_kwargs,
+        )
+
+        fitted_pipeline = industrial.manager.solver
+        train_preds = np.asarray(industrial.predict(train)).reshape(-1)
+        test_preds = np.asarray(industrial.predict(test)).reshape(-1)
+    finally:
         try:
-            finetune_kwargs = {
-                "tuning_params": {"tuning_iterations": 5},
-                "model_to_tune": builder,
-                "return_only_fitted": False,
-            }
-            industrial.finetune(
-                train_data=train,
-                **finetune_kwargs,
-            )
+            industrial.shutdown()
+        except Exception as shutdown_exc:
+            logger.warning("FedotIndustrial shutdown failed: %s", shutdown_exc)
 
-            fitted_pipeline = industrial.manager.solver
-            # Use the fitted FEDOT solver directly. FedotIndustrial.predict()
-            # passes an output_mode argument through some strategy adapters that
-            # do not accept it in this runtime.
-            test_preds = _predict_pipeline(fitted_pipeline, test, graph.task_type).reshape(-1)
-            train_preds = _predict_pipeline(fitted_pipeline, train, graph.task_type).reshape(-1)
-        finally:
-            try:
-                industrial.shutdown()
-            except Exception as shutdown_exc:
-                logger.warning("FedotIndustrial shutdown failed: %s", shutdown_exc)
-
-    train_metrics = compute_metrics(graph.task_type, train.target, train_preds, primary_metric)
-    test_metrics = compute_metrics(graph.task_type, test.target, test_preds, primary_metric)
+    train_metrics = compute_metrics(graph.task_type, train[1], train_preds, primary_metric)
+    test_metrics = compute_metrics(graph.task_type, test[1], test_preds, primary_metric)
 
     assumption_graph = _pipeline_to_graph_dict(fitted_pipeline, graph.task_type)
     try:
@@ -435,7 +433,7 @@ def _train_via_finetune(
     else:
         strategy_name = "default"
         notes.append(
-            f"industrial_strategy='default' - no strategy-specific training path; "
+            f"industrial_strategy='default' - Fedot.Industrial default strategy; "
             f"Fedot.Industrial config data_type='{data_type}'."
         )
 
@@ -446,8 +444,8 @@ def _train_via_finetune(
         "test_metrics": test_metrics,
         "split_info": {
             "test_size": test_size,
-            "n_train": input_sample_count(train),
-            "n_test": input_sample_count(test),
+            "n_train": industrial_tuple_sample_count(train),
+            "n_test": industrial_tuple_sample_count(test),
         },
         "graph": graph.to_dict(),
         "assumption_graph": assumption_graph,
