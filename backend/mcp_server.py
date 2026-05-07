@@ -393,14 +393,15 @@ def _train_via_finetune(
             "model_to_tune": builder,
             "return_only_fitted": False,
         }
-        industrial.finetune(
-            train_data=train,
-            **finetune_kwargs,
-        )
+        with _sklearn_preprocessors_accept_1d():
+            industrial.finetune(
+                train_data=train,
+                **finetune_kwargs,
+            )
 
-        fitted_pipeline = industrial.manager.solver
-        train_preds = np.asarray(industrial.predict(train)).reshape(-1)
-        test_preds = np.asarray(industrial.predict(test)).reshape(-1)
+            fitted_pipeline = industrial.manager.solver
+            train_preds = np.asarray(industrial.predict(train)).reshape(-1)
+            test_preds = np.asarray(industrial.predict(test)).reshape(-1)
     finally:
         try:
             industrial.shutdown()

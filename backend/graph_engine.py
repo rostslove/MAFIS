@@ -313,11 +313,11 @@ def _operation_repository_info(operation: str) -> Dict[str, Any]:
 # Local fallback is used only when Fedot.Industrial repository introspection is unavailable.
 FALLBACK_OPERATIONS: Dict[str, Dict[str, List[str]]] = {
     "classification": {
-        "preprocessing": [],
+        "preprocessing": ["scaling", "normalization", "simple_imputation", "kernel_pca", "pca"],
         "models": ["rf", "xgboost", "logit", "knn", "lgbm", "mlp", "dt"],
     },
     "regression": {
-        "preprocessing": [],
+        "preprocessing": ["scaling", "normalization", "simple_imputation", "kernel_pca", "pca"],
         "models": ["xgbreg", "treg", "ridge", "lasso", "lgbmreg", "knnreg", "dtreg", "sgdr"],
     },
     "ts_classification": {
@@ -357,6 +357,14 @@ FALLBACK_OPERATIONS: Dict[str, Dict[str, List[str]]] = {
 def _build_framework_operations() -> Dict[str, Dict[str, List[str]]]:
     if not (_repo_keys("SKLEARN_CLF_MODELS") or _repo_keys("SKLEARN_REG_MODELS")):
         return FALLBACK_OPERATIONS
+
+    tabular_preproc_allow = ["scaling", "normalization", "simple_imputation", "kernel_pca", "pca"]
+    tabular_preproc = _only_framework_ops([
+        name
+        for name in tabular_preproc_allow
+        if name in _repo_keys("FEDOT_PREPROC_MODEL")
+        or name in _json_operations(INDUSTRIAL_DATA_OPERATION_REPOSITORY_JSON)
+    ])
 
     sklearn_class = set(_json_operation_names_by_meta(
         INDUSTRIAL_MODEL_REPOSITORY_JSON,
@@ -414,21 +422,18 @@ def _build_framework_operations() -> Dict[str, Dict[str, List[str]]]:
 
     return {
         "classification": {
-            # In Fedot.Industrial default context tabular CSV preprocessing is
-            # handled by DataCheck before the initial assumption is tuned.
-            # Explicit FEDOT tabular preprocessing nodes are evaluated through
-            # Industrial's channel-independent dispatcher and receive 1D
-            # per-feature slices, while FEDOT tabular preprocessors expect a
-            # 2D table. Keep the graph vocabulary aligned with what the
-            # Industrial optimizer can execute reliably.
-            "preprocessing": [],
+            # Keep tabular preprocessing aligned with Fedot.Industrial's own
+            # table operation set. The PCA/imputation operations are exposed
+            # experimentally so real runs can surface the exact upstream
+            # IndustrialCustomPreprocessingStrategy failure modes.
+            "preprocessing": tabular_preproc,
             "models": _only_framework_ops([
                 name for name in sorted(sklearn_class)
                 if name not in tabular_class_excluded and not name.startswith("industrial_")
             ]),
         },
         "regression": {
-            "preprocessing": [],
+            "preprocessing": tabular_preproc,
             "models": _only_framework_ops([
                 name for name in sorted(sklearn_reg)
                 if name not in tabular_reg_excluded and not name.startswith("industrial_")
@@ -556,8 +561,11 @@ OPERATION_DESCRIPTIONS: Dict[str, str] = {
     "knnreg": "Nearest-neighbor regressor; sensitive to feature scale.",
     "dtreg": "Decision tree regressor; interpretable but can overfit.",
     "sgdr": "Linear stochastic-gradient regressor; useful on larger tables.",
-    "scaling": "Scale time-series channels before feature extraction.",
-    "normalization": "Normalize time-series channels before feature extraction.",
+    "scaling": "Scale numeric table features or time-series channels before modeling.",
+    "normalization": "Normalize numeric table features or time-series channels before modeling.",
+    "simple_imputation": "Fill missing table values before downstream preprocessing or modeling.",
+    "kernel_pca": "Nonlinear kernel PCA projection for compact table features.",
+    "pca": "Linear PCA projection for compact table features.",
     "channel_filtration": "Filter noisy or weak time-series channels.",
     "wavelet_basis": "Wavelet decomposition for localized time-frequency patterns.",
     "fourier_basis": "Frequency-domain representation for periodic signals.",
@@ -829,7 +837,8 @@ FEDERATED_AUTOML_RUNTIME_NOTICE = (
 
 
 def _strategy_default_operations(task_type: str, preferred: List[str]) -> List[str]:
-    available = OPERATIONS.get(task_type, {}).get("models", [])
+    task_ops = OPERATIONS.get(task_type, {})
+    available = task_ops.get("preprocessing", []) + task_ops.get("models", [])
     return [operation for operation in preferred if operation in available]
 
 
@@ -850,7 +859,10 @@ TRAINING_STRATEGIES: Dict[str, List[Dict[str, Any]]] = {
                 "n_jobs": 1,
                 "available_operations": _strategy_default_operations(
                     "classification",
-                    ["rf", "xgboost", "logit", "dt", "lgbm", "catboost"],
+                    [
+                        "scaling", "normalization", "simple_imputation", "kernel_pca", "pca",
+                        "rf", "xgboost", "logit", "dt", "lgbm", "catboost",
+                    ],
                 ),
             },
         },
@@ -871,7 +883,10 @@ TRAINING_STRATEGIES: Dict[str, List[Dict[str, Any]]] = {
                 "n_jobs": 1,
                 "available_operations": _strategy_default_operations(
                     "regression",
-                    ["treg", "xgbreg", "ridge", "lasso", "dtreg", "lgbmreg", "sgdr", "catboostreg"],
+                    [
+                        "scaling", "normalization", "simple_imputation", "kernel_pca", "pca",
+                        "treg", "xgbreg", "ridge", "lasso", "dtreg", "lgbmreg", "sgdr", "catboostreg",
+                    ],
                 ),
             },
         },
