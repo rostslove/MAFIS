@@ -41,9 +41,10 @@ existing node id, or [] for raw data. The graph must be a DAG with exactly one
 root model node. The graph passed to Fedot.Industrial as `initial_assumption` is
 finetuned by AutoML. Do not propose node parameters, model hyperparameters, or
 operation search-space values; node params must be omitted or empty and are
-ignored by the backend. Industrial strategies (federated_automl,
-sampling_strategy) are execution modes selected outside the graph; do not
-include them in the JSON.
+ignored by the backend. Industrial strategies
+(default/federated_automl/sampling_strategy) are execution modes selected
+outside the graph; do not include them in the JSON. The default mode means no
+strategy-specific training path.
 For tabular datasets, data_profile.categorical_feature_names are automatically
 passed to FEDOT as categorical metadata, so categorical preprocessing nodes can
 use that metadata without hard-coded column lists.
@@ -189,7 +190,7 @@ Return JSON only."""
             "available_operations": operations,
             "previous_graph": prev_graph,
             "feedback": None,
-            "industrial_strategy_in_use": dc.industrial_strategy or "tabular",
+            "industrial_strategy_in_use": dc.industrial_strategy or "default",
             "industrial_strategy_params": dict(dc.industrial_strategy_params or {}),
         }
         if prev_fb:
@@ -212,7 +213,7 @@ Return JSON only."""
             "as categorical metadata for preprocessing operations.\n"
             "available_operations.industrial_templates contains Fedot.Industrial-native graph patterns.\n"
             "available_operations.industrial_strategies_catalog describes selectable execution strategies "
-            "(tabular/federated_automl/sampling_strategy). Strategies are picked by the user outside the graph; "
+            "(default/federated_automl/sampling_strategy). Strategies are picked by the user outside the graph; "
             "do not include them in your JSON.\n"
             "For graph node inputs, use [] for raw data and otherwise use only existing node ids.\n"
             "Return strict JSON literals: null/true/false, not Python None/True/False.\n"

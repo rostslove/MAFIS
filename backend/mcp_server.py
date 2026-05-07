@@ -174,8 +174,8 @@ def _task_problem(task_type: str) -> str:
     return task_type
 
 
-def _strategy_data_type(task_type: str) -> str:
-    return "time_series" if task_type in ("ts_classification", "ts_regression") else "table"
+def _fedot_config_data_type(task_type: str) -> str:
+    return "time_series" if task_type in ("ts_classification", "ts_regression", "ts_forecasting") else "table"
 
 
 def _graph_to_pipeline_builder(graph: PipelineGraph):
@@ -290,17 +290,23 @@ def _build_api_config(
     problem = _task_problem(task_type)
     fedot_problem = "ts_forecasting" if task_type == "ts_forecasting" else problem
 
-    industrial_config: Dict[str, Any] = {"problem": fedot_problem}
+    data_type = _fedot_config_data_type(task_type)
+    industrial_config: Dict[str, Any] = {
+        "problem": fedot_problem,
+        "data_type": data_type,
+        "strategy_params": {
+            "problem": fedot_problem,
+            "data_type": data_type,
+        },
+    }
     if task_type == "ts_forecasting":
         industrial_config["task_params"] = {"forecast_length": forecast_length or 14}
 
-    strategy = (industrial_strategy or "tabular").strip().lower()
-    if strategy == "tabular":
-        industrial_config["strategy"] = "tabular"
-    elif strategy in ("federated_automl", "sampling_strategy"):
+    strategy = str(industrial_strategy or "default").strip().lower() or "default"
+    if strategy in ("federated_automl", "sampling_strategy"):
         merged_params = {
             "problem": fedot_problem,
-            "data_type": _strategy_data_type(task_type),
+            "data_type": data_type,
             "timeout": int(timeout),
         }
         if isinstance(industrial_strategy_params, dict):
@@ -311,8 +317,14 @@ def _build_api_config(
         industrial_config["strategy"] = strategy
         industrial_config["strategy_params"] = merged_params
     else:
-        # Unknown strategy label - fall back to tabular path so the run still completes.
-        industrial_config["strategy"] = "tabular"
+        industrial_config["strategy"] = "default"
+
+    logger.info(
+        "Fedot.Industrial config: strategy=%s, data_type=%s, problem=%s",
+        industrial_config.get("strategy", "default"),
+        data_type,
+        fedot_problem,
+    )
 
     if task_type == "ts_forecasting":
         automl_config = dict(DEFAULT_TSF_AUTOML_CONFIG)
@@ -414,12 +426,18 @@ def _train_via_finetune(
     notes = [
         "Engineer ran Fedot.Industrial finetune over the architect's graph as the initial assumption.",
     ]
-    if industrial_strategy and industrial_strategy != "tabular":
+    strategy_name = str(industrial_strategy or "default").strip().lower() or "default"
+    data_type = _fedot_config_data_type(graph.task_type)
+    if strategy_name in ("federated_automl", "sampling_strategy"):
         notes.append(
-            f"industrial_strategy='{industrial_strategy}' was attached to the run via industrial_config."
+            f"industrial_strategy='{strategy_name}' was attached to the run via industrial_config."
         )
     else:
-        notes.append("industrial_strategy='tabular' - default Fedot context was used (no industrial strategy).")
+        strategy_name = "default"
+        notes.append(
+            f"industrial_strategy='default' - no strategy-specific training path; "
+            f"Fedot.Industrial config data_type='{data_type}'."
+        )
 
     return {
         "score": test_metrics["primary_score"],
@@ -434,8 +452,9 @@ def _train_via_finetune(
         "graph": graph.to_dict(),
         "assumption_graph": assumption_graph,
         "assumption_mermaid": assumption_mermaid,
-        "industrial_strategy": industrial_strategy or "tabular",
+        "industrial_strategy": strategy_name,
         "industrial_strategy_params": industrial_strategy_params or {},
+        "industrial_data_type": data_type,
         "target_info": target_info,
         "training_notes": notes,
     }
@@ -483,8 +502,9 @@ def _train_direct(
         "graph": graph.to_dict(),
         "assumption_graph": graph.to_dict(),
         "assumption_mermaid": graph.to_mermaid(),
-        "industrial_strategy": "tabular",
+        "industrial_strategy": "default",
         "industrial_strategy_params": {},
+        "industrial_data_type": _fedot_config_data_type(graph.task_type),
         "target_info": target_info,
         "training_notes": notes,
     }
@@ -610,7 +630,7 @@ def train_graph(
     forecast_length: Optional[int] = None,
     primary_metric: Optional[str] = None,
     test_size: float = 0.2,
-    industrial_strategy: str = "tabular",
+    industrial_strategy: str = "default",
     industrial_strategy_params: Optional[Dict[str, Any]] = None,
     finetune_timeout: int = 5,
     allow_direct_fallback: bool = True,
@@ -620,9 +640,9 @@ def train_graph(
     Behavior:
     - Loads the CSV, splits into train/test.
     - Converts the graph into a PipelineBuilder usable as ``model_to_tune``.
-    - Runs ``FedotIndustrial.finetune`` with ``industrial_strategy`` (when not
-      ``tabular``) and the optional ``industrial_strategy_params`` attached to
-      ``industrial_config``.
+    - Runs ``FedotIndustrial.finetune`` with the task data_type attached to
+      ``industrial_config``. ``industrial_strategy`` is only used for explicit
+      strategy-specific execution such as ``federated_automl``.
     - When finetune raises, either returns the finetune failure directly or,
       if ``allow_direct_fallback`` is true, attempts a direct fit so we can
       still expose baseline metrics.
@@ -640,6 +660,10 @@ def train_graph(
         ts = float(test_size) if test_size is not None else 0.2
         ts = min(max(ts, 0.05), 0.5)
         timeout = max(1, int(finetune_timeout or 5))
+        strategy_name = str(industrial_strategy or "default").strip().lower() or "default"
+        if strategy_name not in ("default", "federated_automl", "sampling_strategy"):
+            strategy_name = "default"
+        data_type = _fedot_config_data_type(graph.task_type)
 
         try:
             result = _train_via_finetune(
@@ -649,7 +673,7 @@ def train_graph(
                 forecast_length=forecast_length,
                 primary_metric=primary_metric,
                 test_size=ts,
-                industrial_strategy=industrial_strategy or "tabular",
+                industrial_strategy=strategy_name,
                 industrial_strategy_params=industrial_strategy_params,
                 timeout=timeout,
             )
@@ -669,6 +693,9 @@ def train_graph(
                     },
                     "finetune_error": finetune_error,
                     "finetune_traceback": finetune_traceback,
+                    "industrial_strategy": strategy_name,
+                    "industrial_strategy_params": industrial_strategy_params or {},
+                    "industrial_data_type": data_type,
                     "fallback_skipped": True,
                     "training_notes": [
                         "Fedot.Industrial finetune failed; direct-fit fallback is deferred until structural recovery attempts are exhausted."
@@ -692,6 +719,9 @@ def train_graph(
                 fallback["finetune_traceback"] = finetune_traceback
                 fallback["fallback_used"] = "direct_fit"
                 fallback["fallback_reason"] = "Fedot.Industrial finetune raised before producing a fitted solver."
+                fallback["industrial_strategy"] = strategy_name
+                fallback["industrial_strategy_params"] = industrial_strategy_params or {}
+                fallback["industrial_data_type"] = data_type
                 return json.dumps(fallback)
             except Exception as fallback_exc:
                 logger.exception("Direct-fit fallback also failed")
@@ -704,6 +734,9 @@ def train_graph(
                     ),
                     "finetune_error": finetune_error,
                     "finetune_traceback": finetune_traceback,
+                    "industrial_strategy": strategy_name,
+                    "industrial_strategy_params": industrial_strategy_params or {},
+                    "industrial_data_type": data_type,
                     "fallback_error": repr(fallback_exc),
                     "fallback_traceback": fallback_traceback,
                 })

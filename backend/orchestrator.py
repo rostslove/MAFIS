@@ -64,7 +64,7 @@ async def run_orchestration_stream(
     forecast_length: Optional[int] = None,
     primary_metric: Optional[str] = None,
     test_size: float = 0.2,
-    industrial_strategy: str = "tabular",
+    industrial_strategy: str = "default",
     industrial_strategy_params: Optional[Dict[str, Any]] = None,
     previous_evaluations: Optional[List[Dict[str, Any]]] = None,
 ) -> AsyncGenerator[Dict[str, Any], None]:
@@ -95,7 +95,7 @@ async def run_orchestration_stream(
         forecast_length=forecast_length,
         primary_metric=primary_metric,
         test_size=test_size,
-        industrial_strategy=(industrial_strategy or "tabular"),
+        industrial_strategy=(str(industrial_strategy or "default").strip().lower() or "default"),
         industrial_strategy_params=dict(industrial_strategy_params or {}),
     )
     yield _event(
@@ -105,7 +105,7 @@ async def run_orchestration_stream(
     yield _event("status", message=f"Train/test split: test_size={test_size:.2f}")
     if primary_metric:
         yield _event("status", message=f"Primary metric: {primary_metric}")
-    if data_context.industrial_strategy and data_context.industrial_strategy != "tabular":
+    if data_context.industrial_strategy != "default":
         yield _event(
             "status",
             message=(
@@ -116,7 +116,10 @@ async def run_orchestration_stream(
     else:
         yield _event(
             "status",
-            message="Industrial execution strategy: tabular (default Fedot AutoML on the proposed graph).",
+            message=(
+                "Industrial execution strategy: default (no strategy-specific training path; "
+                "task data_type is passed through Fedot.Industrial config)."
+            ),
         )
 
     mcp_client: Optional[MCPToolClient] = None
@@ -180,8 +183,8 @@ async def run_orchestration_stream(
                 )
 
                 yield _event("agent_start", agent="Engineer", iteration=iteration, step="2/3")
-                strategy_name = data_context.industrial_strategy or "tabular"
-                if strategy_name and strategy_name != "tabular":
+                strategy_name = data_context.industrial_strategy or "default"
+                if strategy_name != "default":
                     yield _event(
                         "status",
                         message=(
@@ -194,7 +197,7 @@ async def run_orchestration_stream(
                         "status",
                         message=(
                             "Engineer is finetuning the proposed graph through Fedot.Industrial AutoML "
-                            "(tabular execution mode)."
+                            "(default execution mode)."
                         ),
                     )
                 engineer_task = asyncio.create_task(
@@ -206,7 +209,7 @@ async def run_orchestration_stream(
                     if engineer_task.done():
                         break
                     elapsed = int(time.monotonic() - engineer_started)
-                    if strategy_name and strategy_name != "tabular":
+                    if strategy_name != "default":
                         message = (
                             f"Still running '{strategy_name}'. Fedot.Industrial may be fitting "
                             "several internal branch pipelines."
@@ -347,7 +350,7 @@ async def run_orchestration(
     forecast_length: Optional[int] = None,
     primary_metric: Optional[str] = None,
     test_size: float = 0.2,
-    industrial_strategy: str = "tabular",
+    industrial_strategy: str = "default",
     industrial_strategy_params: Optional[Dict[str, Any]] = None,
     previous_evaluations: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
@@ -383,7 +386,7 @@ async def propose_architecture(
     current_graph: Optional[Dict[str, Any]] = None,
     forecast_length: Optional[int] = None,
     primary_metric: Optional[str] = None,
-    industrial_strategy: str = "tabular",
+    industrial_strategy: str = "default",
     industrial_strategy_params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """One-shot Architect interaction for the frontend graph approval flow."""
@@ -399,7 +402,7 @@ async def propose_architecture(
         profile=profile,
         forecast_length=forecast_length,
         primary_metric=primary_metric,
-        industrial_strategy=(industrial_strategy or "tabular"),
+        industrial_strategy=(str(industrial_strategy or "default").strip().lower() or "default"),
         industrial_strategy_params=dict(industrial_strategy_params or {}),
     )
 
@@ -449,7 +452,7 @@ async def propose_revision_from_critic(
     forecast_length: Optional[int] = None,
     primary_metric: Optional[str] = None,
     selected_mutations: Optional[list] = None,
-    industrial_strategy: str = "tabular",
+    industrial_strategy: str = "default",
     industrial_strategy_params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Create a new draft graph from explicit Critic feedback; user must approve it.
@@ -512,7 +515,7 @@ async def propose_revision_from_critic(
                 ),
                 "diagnostics": [],
                 "applied_mutations": selected_feedback_mutations,
-                "industrial_strategy": applied_strategy or "tabular",
+                "industrial_strategy": applied_strategy or "default",
                 "industrial_strategy_params": dict(applied_strategy_params or {}),
                 "requires_approval": True,
                 "tool_calls": [],
@@ -540,7 +543,7 @@ async def propose_revision_from_critic(
         profile=profile,
         forecast_length=forecast_length,
         primary_metric=primary_metric,
-        industrial_strategy=(applied_strategy or "tabular"),
+        industrial_strategy=(str(applied_strategy or "default").strip().lower() or "default"),
         industrial_strategy_params=dict(applied_strategy_params or {}),
     )
     feedback = CriticFeedback(
@@ -601,7 +604,7 @@ async def propose_revision_from_critic(
 
 def _split_graph_and_strategy_mutations(
     mutations: list,
-    fallback_strategy: str = "tabular",
+    fallback_strategy: str = "default",
     fallback_params: Optional[Dict[str, Any]] = None,
 ):
     """Filter Critic suggestions down to graph node mutations.
@@ -610,7 +613,7 @@ def _split_graph_and_strategy_mutations(
     ignored here; strategy selection lives in the dedicated UI controls.
     Returns (graph_mutations, strategy_name, strategy_params)."""
     graph_mutations = []
-    chosen_strategy = (fallback_strategy or "tabular")
+    chosen_strategy = str(fallback_strategy or "default").strip().lower() or "default"
     chosen_params: Dict[str, Any] = dict(fallback_params or {})
     for mutation in mutations or []:
         if not isinstance(mutation, dict):
@@ -773,8 +776,8 @@ def _engineer_summary(engineer_result: EngineerResult) -> str:
         value_text = f"{float(value):.4f}"
     except (TypeError, ValueError):
         value_text = str(value)
-    strategy = engineer_result.industrial_strategy or "tabular"
-    prefix = f"{strategy}; " if strategy and strategy != "tabular" else ""
+    strategy = engineer_result.industrial_strategy or "default"
+    prefix = f"{strategy}; " if strategy != "default" else ""
     return f"{prefix}{metric}: {value_text}; ranking score: {engineer_result.graph_score:.4f}"
 
 

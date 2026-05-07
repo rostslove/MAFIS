@@ -123,11 +123,11 @@ async def get_tools(request):
 
 
 def _payload_strategy(payload: Dict[str, Any]):
-    name = payload.get("industrial_strategy") or "tabular"
+    name = (str(payload.get("industrial_strategy") or "default").strip() or "default").lower()
     params = payload.get("industrial_strategy_params") or {}
     if not isinstance(params, dict):
         params = {}
-    return str(name), params
+    return name, params
 
 
 async def architect_chat(request):

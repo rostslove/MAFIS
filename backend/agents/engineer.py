@@ -44,7 +44,7 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
                 result.industrial_strategy = (
                     graph_run.get("industrial_strategy")
                     or data_context.industrial_strategy
-                    or "tabular"
+                    or "default"
                 )
                 result.industrial_strategy_params = (
                     graph_run.get("industrial_strategy_params", {})
@@ -112,8 +112,8 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
                 )
                 fallback["fallback_after_structural_recovery"] = True
                 trained = fallback
-        strategy_name = trained.get("industrial_strategy") or dc.industrial_strategy
-        if strategy_name and strategy_name != "tabular":
+        strategy_name = trained.get("industrial_strategy") or dc.industrial_strategy or "default"
+        if strategy_name != "default":
             trained.setdefault("training_notes", []).append(
                 f"Fedot.Industrial executed the '{strategy_name}' strategy with its own internal search. "
                 "MAFIS did not run separate node-level hyperparameter tuning."
@@ -131,7 +131,7 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
             "csv_path": dc.csv_path,
             "target_column": dc.target_column,
             "test_size": dc.test_size,
-            "industrial_strategy": dc.industrial_strategy or "tabular",
+            "industrial_strategy": dc.industrial_strategy or "default",
             "industrial_strategy_params": dict(dc.industrial_strategy_params or {}),
             "allow_direct_fallback": allow_direct_fallback,
         }

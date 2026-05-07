@@ -125,7 +125,7 @@ def current_payload(extra: Dict[str, Any] | None = None) -> Dict[str, Any]:
         "task_type": st.session_state.get("task_type", "classification"),
         "primary_metric": st.session_state.get("primary_metric", ""),
         "test_size": float(st.session_state.get("test_size", 0.2)),
-        "industrial_strategy": st.session_state.get("industrial_strategy") or "tabular",
+        "industrial_strategy": st.session_state.get("industrial_strategy") or "default",
         "industrial_strategy_params": dict(st.session_state.get("industrial_strategy_params") or {}),
     }
     if st.session_state.get("forecast_length"):
@@ -480,13 +480,13 @@ def result_label(result: Dict[str, Any]) -> str:
     item = latest_iteration(result)
     graph = item.get("architect", {}).get("graph", {}) if item else {}
     engineer = item.get("engineer", {}) if item else {}
-    strategy_name = engineer.get("industrial_strategy", "") or ""
+    strategy_name = engineer.get("industrial_strategy", "") or "default"
     rows = graph_rows(graph) if graph else []
     if not rows:
         return "evaluation"
     model = next((row for row in rows if row["role"] == "model"), rows[-1])
     params = "" if model["params"] == "-" else f" ({model['params']})"
-    prefix = f"{strategy_name} + " if strategy_name and strategy_name != "tabular" else ""
+    prefix = f"{strategy_name} + " if strategy_name != "default" else ""
     return f"{prefix}{model['operation']}{params}"
 
 
@@ -755,12 +755,7 @@ def render_explain_graph_assessment(explanation: Dict[str, Any]) -> None:
         st.caption("Graph explanation is unavailable for this run.")
         return
 
-    graph = explanation.get("graph") or {}
     feature_importance = explanation.get("feature_importance") or {}
-
-    if graph:
-        st.write("Explained Pipeline")
-        render_graph(graph, show_details=False)
 
     if feature_importance:
         rows = sorted(
@@ -818,9 +813,6 @@ def render_best_graph_assessment(result: Dict[str, Any]) -> None:
 
     if best_graph:
         render_graph(best_graph, show_details=False)
-        rows = graph_rows(best_graph)
-        if rows:
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
         if st.button("Restore Saved Best Graph", use_container_width=True, key="restore_saved_best_graph"):
             st.session_state.graph = best_graph
             st.session_state.approved_graph = best_graph
@@ -851,10 +843,16 @@ def strategy_rows(config: Dict[str, Any], task_type: str) -> List[Dict[str, str]
 
 
 def render_industrial_strategy_summary() -> None:
-    name = st.session_state.get("industrial_strategy") or "tabular"
+    name = st.session_state.get("industrial_strategy") or "default"
     params = st.session_state.get("industrial_strategy_params") or {}
-    if name == "tabular":
-        st.caption("Industrial strategy: tabular (default Fedot AutoML on the proposed graph).")
+    task_type = st.session_state.get("task_type", "classification")
+    data_type = "time_series" if task_type in ("ts_classification", "ts_regression", "ts_forecasting") else "table"
+    data_type_text = "table (tabular)" if data_type == "table" else data_type
+    if name == "default":
+        st.caption(
+            "Industrial strategy: default "
+            f"(no strategy-specific path; config data_type={data_type_text})."
+        )
         return
     st.caption(f"Industrial strategy: {name}")
     if params:
@@ -862,19 +860,19 @@ def render_industrial_strategy_summary() -> None:
 
 
 def render_strategy_runtime_notice() -> None:
-    name = st.session_state.get("industrial_strategy") or "tabular"
-    if name and name != "tabular":
+    name = st.session_state.get("industrial_strategy") or "default"
+    if name != "default":
         st.warning(
             f"Fedot.Industrial strategy '{name}' is selected. It may train several internal "
-            "AutoML branches, so evaluation can take noticeably longer than the tabular path."
+            "AutoML branches, so evaluation can take noticeably longer than the default path."
         )
 
 
 def render_strategy_selection_details(strategy_name: str, strategy_spec: Dict[str, Any]) -> None:
-    if strategy_name == "tabular":
+    if strategy_name == "default":
         st.info(
-            "Tabular execution: Fedot.Industrial finetunes the proposed graph through default "
-            "Fedot AutoML without running a strategy-specific path."
+            "Default execution: no Fedot.Industrial training strategy is selected. The backend "
+            "passes task data_type into the Fedot.Industrial config."
         )
         return
 
@@ -901,21 +899,29 @@ def render_strategy_selection_details(strategy_name: str, strategy_spec: Dict[st
 def render_industrial_strategy_picker(config: Dict[str, Any], task_type: str, key_suffix: str = "") -> None:
     """Pick the Fedot.Industrial execution strategy applied to the next evaluation."""
     available = industrial_strategies_for_task(config, task_type)
-    names = ["tabular"] + [item.get("name", "") for item in available if item.get("name") and item.get("name") != "tabular"]
+    names = ["default"] + [
+        item.get("name", "")
+        for item in available
+        if item.get("name") and item.get("name") not in ("default", "tabular")
+    ]
 
-    current_name = st.session_state.get("industrial_strategy") or "tabular"
+    current_name = st.session_state.get("industrial_strategy") or "default"
     if current_name not in names:
-        names = [current_name] + names
+        current_name = "default"
+        st.session_state.industrial_strategy = "default"
     current_index = names.index(current_name) if current_name in names else 0
 
+    widget_key = f"industrial_strategy_select_{key_suffix}"
+    if widget_key in st.session_state and st.session_state.get(widget_key) not in names:
+        st.session_state[widget_key] = "default"
     selected = st.selectbox(
         "Industrial strategy",
         names,
         index=current_index,
-        key=f"industrial_strategy_select_{key_suffix}",
+        key=widget_key,
         help=(
-            "Three options are supported: tabular (default Fedot AutoML), federated_automl "
-            "(branch-based AutoML), and sampling_strategy (resampling-based AutoML)."
+            "Default does not select a strategy-specific training path. federated_automl and "
+            "sampling_strategy remain available as explicit Fedot.Industrial strategies."
         ),
     )
     selected_spec = next((item for item in available if item.get("name") == selected), {})
@@ -926,19 +932,19 @@ def render_industrial_strategy_picker(config: Dict[str, Any], task_type: str, ke
         shown_params = st.session_state.get("industrial_strategy_params") or default_params
     else:
         shown_params = default_params
-    if selected == "tabular":
+    if selected == "default":
         shown_params = {}
 
     params_text = st.text_area(
         "Strategy parameters",
         value=json.dumps(shown_params or {}, ensure_ascii=False, indent=2),
         height=110,
-        disabled=selected == "tabular",
+        disabled=selected == "default",
         key=f"industrial_strategy_params_{key_suffix}",
     )
     if st.button("Apply strategy", key=f"industrial_strategy_apply_{key_suffix}"):
         try:
-            params = {} if selected == "tabular" else json.loads(params_text or "{}")
+            params = {} if selected == "default" else json.loads(params_text or "{}")
             if not isinstance(params, dict):
                 raise ValueError("strategy parameters must be a JSON object")
             st.session_state.industrial_strategy = selected
@@ -1100,7 +1106,7 @@ def stream_run(payload: Dict[str, Any]) -> None:
                     f"critic decision={decision_label(event.get('winner'))}"
                 )
                 if event.get("industrial_strategy"):
-                    st.session_state.industrial_strategy = event.get("industrial_strategy") or "tabular"
+                    st.session_state.industrial_strategy = event.get("industrial_strategy") or "default"
                     st.session_state.industrial_strategy_params = dict(
                         event.get("industrial_strategy_params") or {}
                     )
@@ -1750,6 +1756,8 @@ def adopt_m4_dataset(result: Dict[str, Any]) -> None:
     st.session_state.target_column = result.get("target_column", "frequency_group")
     st.session_state.task_type = result.get("task_type", "ts_classification")
     st.session_state.forecast_length = None
+    st.session_state.industrial_strategy = "default"
+    st.session_state.industrial_strategy_params = {}
     st.session_state.result = {}
     st.session_state.evaluation_history = []
     st.session_state.graph = {}
@@ -1956,7 +1964,6 @@ def report_tab() -> None:
         return
 
     item = latest_iteration(result)
-    engineer = item.get("engineer", {}) if item else {}
     critic = item.get("critic", {}) if item else {}
     report = result.get("report", {})
     st.markdown(f"### {report.get('title', 'MAFIS report')}")
@@ -1976,8 +1983,6 @@ def report_tab() -> None:
     st.markdown("#### Visual Assessment")
     render_best_graph_assessment(result)
     st.divider()
-    render_model_assessment(engineer)
-    st.divider()
     render_explain_graph_assessment(critic.get("explanation", {}) or {})
 
 
@@ -1995,7 +2000,7 @@ def main() -> None:
     st.title(APP_SHORT_NAME)
     st.caption(f"{APP_NAME}: LLM agents compose, train, validate and report Fedot.Industrial pipeline graphs and strategies through MCP tools.")
     if "industrial_strategy" not in st.session_state:
-        st.session_state.industrial_strategy = "tabular"
+        st.session_state.industrial_strategy = "default"
     if "industrial_strategy_params" not in st.session_state:
         st.session_state.industrial_strategy_params = {}
     config = load_config()
