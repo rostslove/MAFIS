@@ -11,7 +11,6 @@ import logging
 import os
 import sys
 import traceback
-from contextlib import contextmanager
 from copy import deepcopy
 from inspect import Parameter, signature
 from typing import Any, Dict, List, Optional, Union, get_args, get_origin
@@ -130,68 +129,6 @@ def _predict_pipeline(pipeline, data, task_type: str) -> np.ndarray:
     return np.asarray(pipeline.predict(data).predict)
 
 
-def _as_2d_if_1d(features):
-    arr = np.asarray(features)
-    if arr.ndim == 1:
-        return arr.reshape(-1, 1)
-    return features
-
-
-def _output_predict_as_2d_if_1d(output):
-    predict = getattr(output, "predict", None)
-    if isinstance(predict, np.ndarray) and predict.ndim == 1:
-        output.predict = predict.reshape(-1, 1)
-    return output
-
-
-@contextmanager
-def _sklearn_preprocessors_accept_1d():
-    """Allow sklearn preprocessors to consume per-feature vectors from Fedot.Industrial."""
-    try:
-        from sklearn.preprocessing import MinMaxScaler, Normalizer, RobustScaler, StandardScaler
-    except Exception:
-        yield
-        return
-
-    patched = []
-
-    def wrap(method):
-        def wrapped(self, X, *args, **kwargs):
-            result = method(self, _as_2d_if_1d(X), *args, **kwargs)
-            if isinstance(result, np.ndarray) and result.ndim == 1:
-                return result.reshape(-1, 1)
-            return result
-        return wrapped
-
-    try:
-        for cls in (StandardScaler, MinMaxScaler, RobustScaler, Normalizer):
-            for method_name in ("fit", "partial_fit", "transform", "fit_transform", "inverse_transform"):
-                method = getattr(cls, method_name, None)
-                if method is None:
-                    continue
-                patched.append((cls, method_name, method))
-                setattr(cls, method_name, wrap(method))
-        try:
-            from fedot.core.operations.evaluation.operation_implementations.data_operations.sklearn_transformations import (
-                EncodedInvariantImplementation,
-            )
-        except Exception:
-            EncodedInvariantImplementation = None
-        if EncodedInvariantImplementation is not None:
-            method = getattr(EncodedInvariantImplementation, "transform", None)
-            if method is not None:
-                patched.append((EncodedInvariantImplementation, "transform", method))
-
-                def transform_wrapped(self, input_data, *args, **kwargs):
-                    return _output_predict_as_2d_if_1d(method(self, input_data, *args, **kwargs))
-
-                setattr(EncodedInvariantImplementation, "transform", transform_wrapped)
-        yield
-    finally:
-        for cls, method_name, method in patched:
-            setattr(cls, method_name, method)
-
-
 def _task_problem(task_type: str) -> str:
     if task_type in ("classification", "ts_classification"):
         return "classification"
@@ -201,7 +138,14 @@ def _task_problem(task_type: str) -> str:
 
 
 def _fedot_config_data_type(task_type: str) -> str:
+    # Classification/regression CSVs stay feature-table data, but the default
+    # strategy is still Fedot.Industrial unless the strategy name contains
+    # "tabular" in upstream IndustrialConfig.
     return "time_series" if task_type in ("ts_classification", "ts_regression", "ts_forecasting") else "table"
+
+
+def _fedot_repository_context(industrial_strategy: str) -> str:
+    return "fedot_tabular" if "tabular" in str(industrial_strategy or "").lower() else "fedot_industrial"
 
 
 def _graph_to_pipeline_builder(graph: PipelineGraph):
@@ -346,11 +290,12 @@ def _build_api_config(
         industrial_config["strategy"] = "default"
 
     logger.info(
-        "Fedot.Industrial config: requested_strategy=%s, fedot_strategy=%s, data_type=%s, problem=%s",
+        "Fedot.Industrial config: requested_strategy=%s, fedot_strategy=%s, data_type=%s, problem=%s, repository_context=%s",
         requested_strategy,
         industrial_config.get("strategy", "default"),
         data_type,
         fedot_problem,
+        _fedot_repository_context(industrial_config.get("strategy", "default")),
     )
 
     if task_type == "ts_forecasting":
@@ -418,15 +363,14 @@ def _train_via_finetune(
             "model_to_tune": builder,
             "return_only_fitted": False,
         }
-        with _sklearn_preprocessors_accept_1d():
-            industrial.finetune(
-                train_data=train,
-                **finetune_kwargs,
-            )
+        industrial.finetune(
+            train_data=train,
+            **finetune_kwargs,
+        )
 
-            fitted_pipeline = industrial.manager.solver
-            train_preds = np.asarray(industrial.predict(train)).reshape(-1)
-            test_preds = np.asarray(industrial.predict(test)).reshape(-1)
+        fitted_pipeline = industrial.manager.solver
+        train_preds = np.asarray(industrial.predict(train)).reshape(-1)
+        test_preds = np.asarray(industrial.predict(test)).reshape(-1)
     finally:
         try:
             industrial.shutdown()
@@ -452,6 +396,7 @@ def _train_via_finetune(
     ]
     strategy_name = str(industrial_strategy or "default").strip().lower() or "default"
     data_type = _fedot_config_data_type(graph.task_type)
+    repository_context = _fedot_repository_context(strategy_name)
     if strategy_name in ("federated_automl", "sampling_strategy"):
         notes.append(
             f"industrial_strategy='{strategy_name}' was attached to the run via industrial_config."
@@ -460,7 +405,7 @@ def _train_via_finetune(
         strategy_name = "default"
         notes.append(
             f"industrial_strategy='default' - Fedot.Industrial default strategy; "
-            f"Fedot.Industrial config data_type='{data_type}'."
+            f"repository_context='{repository_context}', data_type='{data_type}'."
         )
 
     return {
@@ -479,6 +424,7 @@ def _train_via_finetune(
         "industrial_strategy": strategy_name,
         "industrial_strategy_params": industrial_strategy_params or {},
         "industrial_data_type": data_type,
+        "industrial_repository_context": repository_context,
         "target_info": target_info,
         "training_notes": notes,
     }
@@ -497,10 +443,9 @@ def _train_direct(
     train, val = split_input_data(input_data, test_size=test_size)
 
     pipeline = graph.to_fedot_pipeline()
-    with _sklearn_preprocessors_accept_1d():
-        pipeline.fit(train)
-        train_preds = _predict_pipeline(pipeline, train, graph.task_type)
-        test_preds = _predict_pipeline(pipeline, val, graph.task_type)
+    pipeline.fit(train)
+    train_preds = _predict_pipeline(pipeline, train, graph.task_type)
+    test_preds = _predict_pipeline(pipeline, val, graph.task_type)
 
     train_metrics = compute_metrics(graph.task_type, train.target, train_preds, primary_metric)
     test_metrics = compute_metrics(graph.task_type, val.target, test_preds, primary_metric)
@@ -529,6 +474,7 @@ def _train_direct(
         "industrial_strategy": "default",
         "industrial_strategy_params": {},
         "industrial_data_type": _fedot_config_data_type(graph.task_type),
+        "industrial_repository_context": _fedot_repository_context("default"),
         "target_info": target_info,
         "training_notes": notes,
     }
@@ -688,6 +634,7 @@ def train_graph(
         if strategy_name not in ("default", "federated_automl", "sampling_strategy"):
             strategy_name = "default"
         data_type = _fedot_config_data_type(graph.task_type)
+        repository_context = _fedot_repository_context(strategy_name)
 
         try:
             result = _train_via_finetune(
@@ -720,6 +667,7 @@ def train_graph(
                     "industrial_strategy": strategy_name,
                     "industrial_strategy_params": industrial_strategy_params or {},
                     "industrial_data_type": data_type,
+                    "industrial_repository_context": repository_context,
                     "fallback_skipped": True,
                     "training_notes": [
                         "Fedot.Industrial finetune failed; direct-fit fallback is deferred until structural recovery attempts are exhausted."
@@ -746,6 +694,7 @@ def train_graph(
                 fallback["industrial_strategy"] = strategy_name
                 fallback["industrial_strategy_params"] = industrial_strategy_params or {}
                 fallback["industrial_data_type"] = data_type
+                fallback["industrial_repository_context"] = repository_context
                 return json.dumps(fallback)
             except Exception as fallback_exc:
                 logger.exception("Direct-fit fallback also failed")
@@ -761,6 +710,7 @@ def train_graph(
                     "industrial_strategy": strategy_name,
                     "industrial_strategy_params": industrial_strategy_params or {},
                     "industrial_data_type": data_type,
+                    "industrial_repository_context": repository_context,
                     "fallback_error": repr(fallback_exc),
                     "fallback_traceback": fallback_traceback,
                 })
@@ -801,9 +751,8 @@ def validate_graph(
             val = slice_input_data(input_data, np.flatnonzero(~mask))
 
             pipeline = graph.to_fedot_pipeline()
-            with _sklearn_preprocessors_accept_1d():
-                pipeline.fit(train)
-                preds = _predict_pipeline(pipeline, val, graph.task_type)
+            pipeline.fit(train)
+            preds = _predict_pipeline(pipeline, val, graph.task_type)
             m = compute_metrics(graph.task_type, val.target, preds, primary_metric)
             scores.append(m["primary_score"])
 
@@ -841,14 +790,13 @@ def get_node_importance(
 
         # Reference score: full graph
         full_pipe = graph.to_fedot_pipeline()
-        with _sklearn_preprocessors_accept_1d():
-            full_pipe.fit(train)
-            full_score = compute_metrics(
-                graph.task_type,
-                val.target,
-                _predict_pipeline(full_pipe, val, graph.task_type),
-                primary_metric,
-            )["primary_score"]
+        full_pipe.fit(train)
+        full_score = compute_metrics(
+            graph.task_type,
+            val.target,
+            _predict_pipeline(full_pipe, val, graph.task_type),
+            primary_metric,
+        )["primary_score"]
 
         importances: Dict[str, float] = {}
         for node in graph.nodes:
@@ -861,14 +809,13 @@ def get_node_importance(
                 if not ok:
                     continue
                 pipe = ablated.to_fedot_pipeline()
-                with _sklearn_preprocessors_accept_1d():
-                    pipe.fit(train)
-                    score = compute_metrics(
-                        graph.task_type,
-                        val.target,
-                        _predict_pipeline(pipe, val, graph.task_type),
-                        primary_metric,
-                    )["primary_score"]
+                pipe.fit(train)
+                score = compute_metrics(
+                    graph.task_type,
+                    val.target,
+                    _predict_pipeline(pipe, val, graph.task_type),
+                    primary_metric,
+                )["primary_score"]
                 importances[node.id] = round(full_score - score, 4)
             except Exception as e:
                 importances[node.id] = None

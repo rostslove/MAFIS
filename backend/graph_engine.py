@@ -310,15 +310,99 @@ def _operation_repository_info(operation: str) -> Dict[str, Any]:
     return {"source": "MAFIS fallback", "meta": "", "description": ""}
 
 
+def _operation_meta(operation: str) -> str:
+    return str(_operation_repository_info(operation).get("meta") or "")
+
+
+def _is_industrial_native_model(operation: str) -> bool:
+    if operation in {"bagging", "ensembled_featuresbagging"}:
+        return False
+    industrial_models = set(_repo_keys("INDUSTRIAL_CLF_AUTOML_MODEL"))
+    industrial_models.update(_repo_keys("INDUSTRIAL_REG_AUTOML_MODEL"))
+    industrial_models.update(_repo_keys("NEURAL_MODEL_FOR_CLF"))
+    industrial_models.update(_repo_keys("NEURAL_MODEL"))
+    industrial_models.update(_json_operation_names_by_meta(
+        INDUSTRIAL_MODEL_REPOSITORY_JSON,
+        {"fedot_automl_classification", "fedot_automl_regression", "fedot_NN_classification"},
+    ))
+    return (
+        operation.startswith("industrial_")
+        or operation in industrial_models
+        or _operation_meta(operation) in {
+            "fedot_automl_classification",
+            "fedot_automl_regression",
+            "fedot_NN_classification",
+        }
+    )
+
+
+def _operation_runtime_contract(operation: str) -> Dict[str, str]:
+    meta = _operation_meta(operation)
+    if _is_industrial_native_model(operation):
+        return {
+            "runtime_family": "fedot_industrial_model",
+            "data_contract": "industrial_tensor_features",
+            "compatibility_note": (
+                "Fedot.Industrial-native model from industrial_model_repository; "
+                "designed to consume Industrial feature/tensor representations."
+            ),
+        }
+    if meta == "industrial_preprocessing":
+        return {
+            "runtime_family": "fedot_industrial_preprocessing",
+            "data_contract": "industrial_feature_extractor",
+            "compatibility_note": (
+                "Fedot.Industrial feature extractor; usually valid before Industrial "
+                "models or table heads that consume extracted feature matrices."
+            ),
+        }
+    if meta in {"custom_preprocessing", "dimension_transformation"}:
+        return {
+            "runtime_family": "fedot_industrial_preprocessing",
+            "data_contract": "industrial_channel_transform",
+            "compatibility_note": (
+                "Industrial channel-wise transform; in default Industrial finetune it "
+                "may emit 3D tensor features, so it should not feed a classic table "
+                "model directly."
+            ),
+        }
+    if meta in {"sklearn_categorical", "classification_preprocessing", "regression_preprocessing"}:
+        return {
+            "runtime_family": "fedot_preprocessing",
+            "data_contract": "table_feature_transform",
+            "compatibility_note": "Table-preserving preprocessing operation from the Fedot.Industrial repository.",
+        }
+    return {
+        "runtime_family": "fedot_table_model",
+        "data_contract": "table_features",
+        "compatibility_note": "Classic FEDOT/sklearn-style operation exposed through Fedot.Industrial.",
+    }
+
+
 # Local fallback is used only when Fedot.Industrial repository introspection is unavailable.
 FALLBACK_OPERATIONS: Dict[str, Dict[str, List[str]]] = {
     "classification": {
-        "preprocessing": ["scaling", "normalization", "simple_imputation", "kernel_pca", "pca"],
-        "models": ["rf", "xgboost", "logit", "knn", "lgbm", "mlp", "dt"],
+        "preprocessing": [
+            "quantile_extractor", "quantile_extractor_torch", "wavelet_basis", "fourier_basis",
+            "eigen_basis", "channel_filtration", "scaling", "normalization",
+            "simple_imputation", "kernel_pca", "pca", "one_hot_encoding", "label_encoding",
+        ],
+        "models": [
+            "industrial_stat_clf", "industrial_freq_clf", "industrial_manifold_clf",
+            "inception_model", "resnet_model", "rf", "xgboost", "logit", "knn", "lgbm", "mlp", "dt",
+        ],
     },
     "regression": {
-        "preprocessing": ["scaling", "normalization", "simple_imputation", "kernel_pca", "pca"],
-        "models": ["xgbreg", "treg", "ridge", "lasso", "lgbmreg", "knnreg", "dtreg", "sgdr"],
+        "preprocessing": [
+            "quantile_extractor", "quantile_extractor_torch", "wavelet_basis", "fourier_basis",
+            "eigen_basis", "channel_filtration", "scaling", "normalization",
+            "simple_imputation", "kernel_pca", "pca", "one_hot_encoding", "label_encoding",
+        ],
+        "models": [
+            "industrial_stat_reg", "industrial_freq_reg", "industrial_manifold_reg",
+            "inception_model", "resnet_model", "xgbreg", "treg", "ridge", "lasso",
+            "lgbmreg", "knnreg", "dtreg", "sgdr",
+        ],
     },
     "ts_classification": {
         "preprocessing": [
@@ -358,13 +442,38 @@ def _build_framework_operations() -> Dict[str, Dict[str, List[str]]]:
     if not (_repo_keys("SKLEARN_CLF_MODELS") or _repo_keys("SKLEARN_REG_MODELS")):
         return FALLBACK_OPERATIONS
 
-    tabular_preproc_allow = ["scaling", "normalization", "simple_imputation", "kernel_pca", "pca"]
-    tabular_preproc = _only_framework_ops([
-        name
-        for name in tabular_preproc_allow
-        if name in _repo_keys("FEDOT_PREPROC_MODEL")
-        or name in _json_operations(INDUSTRIAL_DATA_OPERATION_REPOSITORY_JSON)
-    ])
+    fedot_preproc = _json_operation_names_by_meta(
+        INDUSTRIAL_DATA_OPERATION_REPOSITORY_JSON,
+        {"custom_preprocessing", "dimension_transformation", "sklearn_categorical"},
+    )
+    fedot_preproc = _repo_keys("FEDOT_PREPROC_MODEL") + fedot_preproc
+
+    industrial_feature_preproc = _repo_keys("INDUSTRIAL_PREPROC_MODEL")
+    industrial_feature_preproc += _json_operation_names_by_meta(
+        INDUSTRIAL_DATA_OPERATION_REPOSITORY_JSON,
+        {"industrial_preprocessing"},
+    )
+
+    classification_preproc = industrial_feature_preproc + _repo_keys("INDUSTRIAL_CLF_PREPROC_MODEL")
+    classification_preproc += _json_operation_names_by_meta(
+        INDUSTRIAL_DATA_OPERATION_REPOSITORY_JSON,
+        {"classification_preprocessing"},
+    )
+    classification_preproc += fedot_preproc
+    classification_preproc = [
+        name for name in classification_preproc
+        if name not in {"isolation_forest_reg", "data_source_table", "data_source_ts"}
+    ]
+
+    regression_preproc = industrial_feature_preproc + _json_operation_names_by_meta(
+        INDUSTRIAL_DATA_OPERATION_REPOSITORY_JSON,
+        {"regression_preprocessing"},
+    )
+    regression_preproc += fedot_preproc
+    regression_preproc = [
+        name for name in regression_preproc
+        if name not in {"isolation_forest_class", "class_decompose", "resample", "data_source_table", "data_source_ts"}
+    ]
 
     sklearn_class = set(_json_operation_names_by_meta(
         INDUSTRIAL_MODEL_REPOSITORY_JSON,
@@ -393,7 +502,7 @@ def _build_framework_operations() -> Dict[str, Dict[str, List[str]]]:
 
     industrial_preproc = [
         name
-        for name in _repo_keys("INDUSTRIAL_PREPROC_MODEL")
+        for name in industrial_feature_preproc
         if name not in {"bagging", "isolation_forest_class", "isolation_forest_reg"}
     ]
     ts_scalers = [name for name in _repo_keys("FEDOT_PREPROC_MODEL") if name in {"scaling", "normalization"}]
@@ -420,21 +529,45 @@ def _build_framework_operations() -> Dict[str, Dict[str, List[str]]]:
     forecasting_models = _repo_keys("FORECASTING_MODELS") + _repo_keys("PRIMARY_FORECASTING_MODELS")
     forecasting_preproc = _repo_keys("FORECASTING_PREPROC")
 
+    industrial_class_models = _json_operation_names_by_meta(
+        INDUSTRIAL_MODEL_REPOSITORY_JSON,
+        {"fedot_automl_classification", "fedot_NN_classification"},
+    )
+    industrial_class_models += _repo_keys("INDUSTRIAL_CLF_AUTOML_MODEL") + _repo_keys("NEURAL_MODEL_FOR_CLF")
+    industrial_class_models = [
+        name
+        for name in industrial_class_models
+        if name not in {"ensembled_featuresbagging", "pdl_clf", "one_class_svm", "dummy"}
+    ]
+
+    industrial_reg_neural_allow = {
+        "inception_model", "resnet_model", "nbeats_model", "tcn_model", "tst_model", "xcm_model"
+    }
+    industrial_reg_models = _json_operation_names_by_meta(
+        INDUSTRIAL_MODEL_REPOSITORY_JSON,
+        {"fedot_automl_regression"},
+    )
+    industrial_reg_models += _repo_keys("INDUSTRIAL_REG_AUTOML_MODEL")
+    industrial_reg_models += [
+        name for name in _repo_keys("NEURAL_MODEL") if name in industrial_reg_neural_allow
+    ]
+    industrial_reg_models = [
+        name
+        for name in industrial_reg_models
+        if name not in {"ensembled_featuresbagging", "pdl_reg", "bagging", "dummy"}
+    ]
+
     return {
         "classification": {
-            # Keep tabular preprocessing aligned with Fedot.Industrial's own
-            # table operation set. The PCA/imputation operations are exposed
-            # experimentally so real runs can surface the exact upstream
-            # IndustrialCustomPreprocessingStrategy failure modes.
-            "preprocessing": tabular_preproc,
-            "models": _only_framework_ops([
+            "preprocessing": _only_framework_ops(classification_preproc),
+            "models": _only_framework_ops(industrial_class_models + [
                 name for name in sorted(sklearn_class)
                 if name not in tabular_class_excluded and not name.startswith("industrial_")
             ]),
         },
         "regression": {
-            "preprocessing": tabular_preproc,
-            "models": _only_framework_ops([
+            "preprocessing": _only_framework_ops(regression_preproc),
+            "models": _only_framework_ops(industrial_reg_models + [
                 name for name in sorted(sklearn_reg)
                 if name not in tabular_reg_excluded and not name.startswith("industrial_")
             ]),
@@ -469,10 +602,10 @@ METRICS_BY_TASK: Dict[str, List[str]] = {
 # Sensible default graph per task - used as starter / fallback.
 DEFAULT_GRAPHS: Dict[str, List[Dict[str, Any]]] = {
     "classification": [
-        {"id": "model", "operation": "rf", "params": {}, "inputs": []},
+        {"id": "model", "operation": "industrial_stat_clf", "params": {}, "inputs": []},
     ],
     "regression": [
-        {"id": "model", "operation": "ridge", "params": {}, "inputs": []},
+        {"id": "model", "operation": "industrial_stat_reg", "params": {}, "inputs": []},
     ],
     "ts_classification": [
         {"id": "stat_feat", "operation": "quantile_extractor", "params": {}, "inputs": []},
@@ -509,16 +642,32 @@ def _graph_template(task_type: str, nodes: List[Dict[str, Any]]) -> Dict[str, An
 INDUSTRIAL_GRAPH_TEMPLATES: Dict[str, List[Dict[str, Any]]] = {
     "classification": [
         {
-            "name": "tabular_direct_model",
-            "description": "Direct FEDOT/Fedot.Industrial table model over numeric CSV features.",
+            "name": "industrial_stat_model",
+            "description": "Fedot.Industrial statistical-domain classifier from industrial_model_repository.",
             "graph": _graph_template("classification", DEFAULT_GRAPHS["classification"]),
+        },
+        {
+            "name": "industrial_feature_head",
+            "description": "Fedot.Industrial statistical feature extraction followed by a compact classification head.",
+            "graph": _graph_template("classification", [
+                {"id": "features", "operation": "quantile_extractor", "params": {}, "inputs": []},
+                {"id": "model", "operation": "logit", "params": {}, "inputs": ["features"]},
+            ]),
         },
     ],
     "regression": [
         {
-            "name": "tabular_direct_model",
-            "description": "Direct FEDOT/Fedot.Industrial table model over numeric CSV features.",
+            "name": "industrial_stat_model",
+            "description": "Fedot.Industrial statistical-domain regressor from industrial_model_repository.",
             "graph": _graph_template("regression", DEFAULT_GRAPHS["regression"]),
+        },
+        {
+            "name": "industrial_feature_head",
+            "description": "Fedot.Industrial statistical feature extraction followed by a robust regression head.",
+            "graph": _graph_template("regression", [
+                {"id": "features", "operation": "quantile_extractor", "params": {}, "inputs": []},
+                {"id": "model", "operation": "treg", "params": {}, "inputs": ["features"]},
+            ]),
         },
     ],
     "ts_classification": [
@@ -564,6 +713,8 @@ OPERATION_DESCRIPTIONS: Dict[str, str] = {
     "scaling": "Scale numeric table features or time-series channels before modeling.",
     "normalization": "Normalize numeric table features or time-series channels before modeling.",
     "simple_imputation": "Fill missing table values before downstream preprocessing or modeling.",
+    "one_hot_encoding": "Expand categorical table features into binary indicators for non-tree or distance-sensitive models.",
+    "label_encoding": "Encode categorical table features as integer codes, mainly for tree-style models.",
     "kernel_pca": "Nonlinear kernel PCA projection for compact table features.",
     "pca": "Linear PCA projection for compact table features.",
     "channel_filtration": "Filter noisy or weak time-series channels.",
@@ -860,7 +1011,9 @@ TRAINING_STRATEGIES: Dict[str, List[Dict[str, Any]]] = {
                 "available_operations": _strategy_default_operations(
                     "classification",
                     [
-                        "scaling", "normalization", "simple_imputation", "kernel_pca", "pca",
+                        "industrial_stat_clf", "industrial_freq_clf", "industrial_manifold_clf",
+                        "quantile_extractor", "quantile_extractor_torch", "fourier_basis",
+                        "wavelet_basis", "eigen_basis", "channel_filtration",
                         "rf", "xgboost", "logit", "dt", "lgbm", "catboost",
                     ],
                 ),
@@ -884,7 +1037,9 @@ TRAINING_STRATEGIES: Dict[str, List[Dict[str, Any]]] = {
                 "available_operations": _strategy_default_operations(
                     "regression",
                     [
-                        "scaling", "normalization", "simple_imputation", "kernel_pca", "pca",
+                        "industrial_stat_reg", "industrial_freq_reg", "industrial_manifold_reg",
+                        "quantile_extractor", "quantile_extractor_torch", "fourier_basis",
+                        "wavelet_basis", "eigen_basis", "channel_filtration",
                         "treg", "xgbreg", "ridge", "lasso", "dtreg", "lgbmreg", "sgdr", "catboostreg",
                     ],
                 ),
@@ -987,6 +1142,7 @@ def get_operation_catalog(task_type: str) -> Dict[str, List[Dict[str, Any]]]:
                 "fedot_industrial_meta": _operation_repository_info(name).get("meta", ""),
                 "tags": _operation_repository_info(name).get("tags", []),
                 "presets": _operation_repository_info(name).get("presets", []),
+                **_operation_runtime_contract(name),
             }
             for name in names
         ]
@@ -1078,6 +1234,37 @@ class PipelineGraph:
         if root_node.operation not in OPERATIONS[self.task_type].get("models", []):
             return False, f"Root node '{root_node.id}' must be a model operation"
 
+        ok, message = self._validate_runtime_contracts(root_node)
+        if not ok:
+            return False, message
+
+        return True, "OK"
+
+    def _validate_runtime_contracts(self, root_node: GraphNode) -> Tuple[bool, str]:
+        root_contract = _operation_runtime_contract(root_node.operation)
+        if root_contract.get("runtime_family") != "fedot_table_model":
+            return True, "OK"
+
+        nodes_by_id = {node.id: node for node in self.nodes}
+        stack = list(root_node.inputs)
+        visited: set[str] = set()
+        while stack:
+            node_id = stack.pop()
+            if node_id in visited:
+                continue
+            visited.add(node_id)
+            node = nodes_by_id[node_id]
+            contract = _operation_runtime_contract(node.operation)
+            if contract.get("data_contract") == "industrial_channel_transform":
+                return False, (
+                    f"Operation '{node.operation}' is a Fedot.Industrial channel-wise transform, "
+                    f"but root model '{root_node.operation}' is a classic table model. "
+                    "This combination can hand a 3D Industrial tensor to a 2D table model "
+                    "during finetune. Use a Fedot.Industrial-native model from "
+                    "industrial_model_repository, an Industrial feature extractor such as "
+                    "quantile_extractor, or a table-preserving preprocessing operation."
+                )
+            stack.extend(node.inputs)
         return True, "OK"
 
     def _topo_sorted(self) -> List[GraphNode]:

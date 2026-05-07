@@ -44,10 +44,19 @@ operation search-space values; node params must be omitted or empty and are
 ignored by the backend. Industrial strategies
 (default/federated_automl/sampling_strategy) are execution modes selected
 outside the graph; do not include them in the JSON. The default mode means
-Fedot.Industrial's default strategy with task data_type supplied by config.
-For tabular datasets, the backend prepares numeric feature values before handing
-the native (X, y) tuple to Fedot.Industrial; use preprocessing nodes only when
-they are valid operations from the catalog.
+Fedot.Industrial's non-tabular-default Industrial repository unless diagnostics
+explicitly say otherwise. For CSV feature matrices, the backend prepares numeric
+feature values before handing the native (X, y) tuple to Fedot.Industrial.
+Use the catalog's runtime_family, data_contract, and compatibility_note fields
+to keep preprocessing/model contracts compatible.
+Apply senior ML judgement when choosing preprocessing. Consider the data
+profile, model family assumptions, feature semantics, leakage risk,
+dimensionality, sparsity, missingness, categorical structure, and whether a
+transform changes the hypothesis space or merely adds complexity. Prefer a
+compact graph whose preprocessing has a clear expected benefit for the chosen
+downstream model. In the analysis and reasoning fields, justify each
+preprocessing node by explaining the specific data/model interaction it
+improves; omit preprocessing when that justification is weak.
 Return JSON only."""
 
     STRUCTURED_PROMPT = SYSTEM_PROMPT
@@ -209,8 +218,15 @@ Return JSON only."""
             "The graph you produce becomes Fedot.Industrial `initial_assumption` and is polished by AutoML finetune.\n"
             "Choose only operations and graph topology. Do not choose hyperparameters or node params; "
             "Fedot.Industrial owns parameter tuning during finetune.\n"
-            "For tabular data, the backend passes a native Fedot.Industrial (X, y) tuple "
-            "with numeric feature values; do not rely on manual InputData metadata.\n"
+            "For CSV feature matrices, the backend passes a native Fedot.Industrial (X, y) tuple "
+            "with numeric feature values; do not rely on manual InputData metadata. "
+            "Treat Fedot.Industrial repository operations as first-class candidates, and use "
+            "runtime_family/data_contract/compatibility_note from the catalog to avoid invalid contracts.\n"
+            "Act like an expert ML architect: choose preprocessing by reasoning about the data profile, "
+            "model family assumptions, feature semantics, missingness, categorical structure, dimensionality, "
+            "and whether the transform has a plausible benefit for the selected downstream model. "
+            "Prefer compact graphs, and justify every preprocessing node in analysis/reasoning through its "
+            "specific data/model interaction; omit transforms whose benefit is only generic or decorative.\n"
             "available_operations.industrial_templates contains Fedot.Industrial-native graph patterns.\n"
             "available_operations.industrial_strategies_catalog describes selectable execution strategies "
             "(default/federated_automl/sampling_strategy). Strategies are picked by the user outside the graph; "

@@ -53,6 +53,15 @@ fallback baseline metrics, not as a clean Fedot.Industrial finetune result.
 Preserve and reason from diagnostics. Do not recommend re-adding an operation
 that diagnostics identify as failed/skipped/bypassed unless the payload shows a
 different configuration that directly addresses that failure.
+Treat preprocessing/model compatibility as a graph-quality issue. Evaluate
+whether each preprocessing node has a clear expected benefit given the data
+profile, feature semantics, model family assumptions, leakage risk,
+dimensionality, missingness, and categorical structure. If a transform appears
+generic, redundant, or weakly connected to the selected downstream model,
+suggest simplifying the graph and explain the ML rationale.
+When operation catalog diagnostics include runtime_family, data_contract, or
+compatibility_note, treat those as the execution contract for Fedot.Industrial
+finetune and prefer fixes that keep Industrial repository operations compatible.
 When diagnostics include kind="failure_localization", treat primary_suspect,
 confidence, evidence, and ruled_out_nodes as factual runtime evidence. Prefer
 mutations that address a high-confidence primary_suspect over nodes that merely
