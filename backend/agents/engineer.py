@@ -658,6 +658,10 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
             recommendations.append(
                 "Execute explicit FEDOT preprocessing nodes through a data-boundary adapter when Fedot.Industrial predict_for_fit passes output_mode to an incompatible upstream strategy."
             )
+        if "model_eval_set_required" in signatures:
+            recommendations.append(
+                "Disable eval-set early stopping for model nodes in this Fedot.Industrial finetune path unless an eval_set and eval_metric are provided."
+            )
         if "sklearn_dimensionality" in signatures:
             recommendations.append(
                 "Do not keep the shape-changing preprocessing path with a sklearn tabular model until a shape adapter is available."

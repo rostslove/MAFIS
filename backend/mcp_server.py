@@ -132,6 +132,7 @@ TRAIN_ONLY_OPS = {"resample"}
 DATA_BOUNDARY_PREPROCESSING_OPS = {"one_hot_encoding", "label_encoding"}
 EXECUTION_ADAPTER_OPS = TRAIN_ONLY_OPS | DATA_BOUNDARY_PREPROCESSING_OPS
 CATBOOST_OPS = {"catboost", "catboostreg"}
+LGBM_OPS = {"lgbm", "lgbmreg"}
 N_JOBS_OPERATION_OPS = {
     "rf", "rfr", "xgboost", "xgbreg", "lgbm", "lgbmreg", "catboost", "catboostreg",
     "extra_trees", "extra_trees_reg", "isolation_forest_class", "isolation_forest_reg",
@@ -215,8 +216,20 @@ def _graph_with_runtime_model_params(graph: PipelineGraph, n_jobs: int) -> Pipel
         params = dict(node.params or {})
         if node.operation in N_JOBS_OPERATION_OPS:
             params["n_jobs"] = n_jobs
+        if node.operation in LGBM_OPS:
+            params["use_eval_set"] = False
+            params["early_stopping_rounds"] = None
         node.params = params
     return adapted
+
+
+def _runtime_model_param_adapters(graph: PipelineGraph) -> List[str]:
+    adapters: List[str] = []
+    if any(node.operation in N_JOBS_OPERATION_OPS for node in graph.nodes):
+        adapters.append("n_jobs_runtime_params")
+    if any(node.operation in LGBM_OPS for node in graph.nodes):
+        adapters.append("lgbm_eval_set_sanitizer")
+    return adapters
 
 
 def _adapt_initial_assumption_graph(
@@ -818,6 +831,7 @@ def _train_via_finetune(
     )
     n_jobs = _resolve_training_n_jobs(industrial_strategy_params)
     executable_graph = _graph_with_runtime_model_params(executable_graph, n_jobs)
+    model_param_adapters = _runtime_model_param_adapters(executable_graph)
     _record_training_event(
         training_events,
         "config",
@@ -828,6 +842,15 @@ def _train_via_finetune(
         repository_context=_fedot_repository_context(industrial_strategy or "default"),
         n_jobs=n_jobs,
     )
+    if model_param_adapters:
+        _record_training_event(
+            training_events,
+            "model_adapter",
+            "done",
+            "Applied model runtime parameter adapters.",
+            run_started_at,
+            adapters=model_param_adapters,
+        )
 
     industrial = FedotIndustrial(**api_config)
     patched_search_space = _catboost_search_space_adapter(executable_graph)
@@ -938,6 +961,10 @@ def _train_via_finetune(
         )
     if any((node.params or {}).get("n_jobs") == n_jobs for node in executable_graph.nodes):
         notes.append(f"Runtime model parameters set n_jobs={n_jobs} on supported model nodes.")
+    if any(node.operation in LGBM_OPS for node in executable_graph.nodes):
+        notes.append(
+            "LGBM eval-set early stopping was disabled for this finetune path because upstream does not provide eval_set/eval_metric to LightGBM."
+        )
     strategy_name = str(industrial_strategy or "default").strip().lower() or "default"
     data_type = _fedot_config_data_type(graph.task_type)
     repository_context = _fedot_repository_context(strategy_name)
@@ -1058,6 +1085,10 @@ def _train_direct(
     notes.extend(train_only_notes)
     if any((node.params or {}).get("n_jobs") == resolved_n_jobs for node in executable_graph.nodes):
         notes.append(f"Runtime model parameters set n_jobs={resolved_n_jobs} on supported model nodes.")
+    if any(node.operation in LGBM_OPS for node in executable_graph.nodes):
+        notes.append(
+            "LGBM eval-set early stopping was disabled for this fit path because no eval_set/eval_metric is supplied."
+        )
     if target_info.get("fedot_receives_raw_target") and target_info.get("reference_encoded"):
         notes.append(
             "Fedot graph received the raw string classification target; reference mapping is shown only for readable diagnostics."

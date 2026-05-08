@@ -422,6 +422,8 @@ def _operation_execution_hints(operation: str) -> Dict[str, Any]:
         hints["runtime_adapter"] = "data_boundary_resampling"
     if operation in {"catboost", "catboostreg"}:
         hints["runtime_adapter"] = "catboost_search_space_sanitizer"
+    if operation in {"lgbm", "lgbmreg"}:
+        hints["runtime_adapter"] = "lgbm_eval_set_sanitizer"
     return hints
 
 
