@@ -56,6 +56,8 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
                 result.fallback_used = graph_run.get("fallback_used", "") or ""
                 result.target_info = graph_run.get("target_info", {}) or result.target_info
                 result.training_notes.extend(graph_run.get("training_notes", []) or [])
+                result.training_log.extend(graph_run.get("training_log", []) or [])
+                result.n_jobs = int(graph_run.get("n_jobs") or 0)
                 result.diagnostics.extend(self._extract_diagnostics(graph_run))
                 self._append_training_diagnostic(result)
                 self._append_failure_localization(result, architect_result.graph)
@@ -97,21 +99,9 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
         if self._should_attempt_node_recovery(trained):
             trained = await self._recover_by_skipping_node(graph_json, dc, trained)
         if self._needs_direct_fallback(trained):
-            fallback = await self._train_direct(graph_json, dc, allow_direct_fallback=True)
-            if isinstance(fallback, dict):
-                fallback["diagnostics"] = (
-                    list(trained.get("diagnostics", []) or [])
-                    + list(fallback.get("diagnostics", []) or [])
-                )
-                fallback["training_notes"] = (
-                    list(trained.get("training_notes", []) or [])
-                    + [
-                        "Engineer ran direct-fit fallback only after Fedot.Industrial structural recovery attempts were exhausted."
-                    ]
-                    + list(fallback.get("training_notes", []) or [])
-                )
-                fallback["fallback_after_structural_recovery"] = True
-                trained = fallback
+            trained.setdefault("training_notes", []).append(
+                "Engineer did not run direct FEDOT fallback automatically; the evaluated result must come from Fedot.Industrial finetune or structural recovery."
+            )
         strategy_name = trained.get("industrial_strategy") or dc.industrial_strategy or "default"
         if strategy_name != "default":
             trained.setdefault("training_notes", []).append(
@@ -124,7 +114,7 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
         self,
         graph_json: str,
         dc: DataContext,
-        allow_direct_fallback: bool = True,
+        allow_direct_fallback: bool = False,
     ) -> dict:
         args = {
             "graph_json": graph_json,

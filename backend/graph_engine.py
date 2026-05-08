@@ -18,6 +18,19 @@ from path_utils import normalize_csv_path
 logger = logging.getLogger("GraphEngine")
 
 
+def _default_n_jobs() -> int:
+    try:
+        requested = int(os.environ.get("FEDOT_N_JOBS") or os.environ.get("N_JOBS") or 0)
+    except (TypeError, ValueError):
+        requested = 0
+    if requested > 0:
+        return requested
+    return max(1, os.cpu_count() or 1)
+
+
+DEFAULT_N_JOBS = _default_n_jobs()
+
+
 def _add_local_fedot_industrial_to_path() -> str:
     """Prefer a sibling Fedot.Industrial source checkout when it exists."""
     candidates = []
@@ -44,7 +57,7 @@ def _add_local_fedot_industrial_to_path() -> str:
 FEDOT_INDUSTRIAL_SOURCE = _add_local_fedot_industrial_to_path()
 
 try:
-    import fedot_ind  # noqa: F401
+    import fedot_ind
     from fedot_ind.core.repository.initializer_industrial_models import IndustrialModels
 
     FEDOT_IND_VERSION = getattr(fedot_ind, "__version__", "unknown")
@@ -1007,7 +1020,7 @@ TRAINING_STRATEGIES: Dict[str, List[Dict[str, Any]]] = {
                 "timeout": 10,
                 "data_type": "table",
                 "problem": "classification",
-                "n_jobs": 1,
+                "n_jobs": DEFAULT_N_JOBS,
                 "available_operations": _strategy_default_operations(
                     "classification",
                     [
@@ -1033,7 +1046,7 @@ TRAINING_STRATEGIES: Dict[str, List[Dict[str, Any]]] = {
                 "timeout": 10,
                 "data_type": "table",
                 "problem": "regression",
-                "n_jobs": 1,
+                "n_jobs": DEFAULT_N_JOBS,
                 "available_operations": _strategy_default_operations(
                     "regression",
                     [
@@ -1055,7 +1068,12 @@ TRAINING_STRATEGIES: Dict[str, List[Dict[str, Any]]] = {
             "pipeline_effects": FEDERATED_AUTOML_PIPELINE_EFFECTS,
             "editable_params": FEDERATED_AUTOML_EDITABLE_PARAMS,
             "runtime_notice": FEDERATED_AUTOML_RUNTIME_NOTICE,
-            "default_params": {"timeout": 10, "data_type": "time_series", "problem": "classification", "n_jobs": 1},
+            "default_params": {
+                "timeout": 10,
+                "data_type": "time_series",
+                "problem": "classification",
+                "n_jobs": DEFAULT_N_JOBS,
+            },
         },
     ],
     "ts_regression": [
@@ -1067,7 +1085,12 @@ TRAINING_STRATEGIES: Dict[str, List[Dict[str, Any]]] = {
             "pipeline_effects": FEDERATED_AUTOML_PIPELINE_EFFECTS,
             "editable_params": FEDERATED_AUTOML_EDITABLE_PARAMS,
             "runtime_notice": FEDERATED_AUTOML_RUNTIME_NOTICE,
-            "default_params": {"timeout": 10, "data_type": "time_series", "problem": "regression", "n_jobs": 1},
+            "default_params": {
+                "timeout": 10,
+                "data_type": "time_series",
+                "problem": "regression",
+                "n_jobs": DEFAULT_N_JOBS,
+            },
         },
     ],
 }

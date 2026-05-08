@@ -74,10 +74,9 @@ async def health(request):
 
 
 async def get_config(request):
-    llm_provider = "ollama" if "11434" in LLM_BASE_URL or "ollama" in LLM_BASE_URL else "openai-compatible"
     return JSONResponse({
         "agents": ["Architect", "Engineer", "Critic", "Scribe"],
-        "llm_provider": llm_provider,
+        "llm_provider": "ollama-container",
         "llm_model": LLM_MODEL,
         "llm_base_url": LLM_BASE_URL,
         "protocol": "MCP",

@@ -2,6 +2,7 @@ import json
 import os
 import copy
 import hashlib
+import html
 import io
 from pathlib import Path
 from typing import Any, Dict, List
@@ -15,6 +16,58 @@ APP_NAME = "MultiAgentFedot.IndustrialSystem"
 APP_SHORT_NAME = "MAFIS"
 
 st.set_page_config(page_title=APP_SHORT_NAME, layout="wide")
+
+st.markdown(
+    """
+    <style>
+    .run-log, .training-journal {
+        display: flex;
+        flex-direction: column;
+        gap: 0.45rem;
+        margin: 0.35rem 0 0.75rem 0;
+    }
+    .run-log-entry, .training-journal-entry {
+        border: 1px solid #e3e7ef;
+        border-left: 3px solid #5876d6;
+        border-radius: 8px;
+        background: #ffffff;
+        padding: 0.55rem 0.7rem;
+    }
+    .run-log-entry.done, .training-journal-entry.done {
+        border-left-color: #228b5b;
+        background: #f7fbf8;
+    }
+    .run-log-entry.warn, .training-journal-entry.warn {
+        border-left-color: #c27a1a;
+        background: #fffaf1;
+    }
+    .run-log-entry.error, .training-journal-entry.error {
+        border-left-color: #c24141;
+        background: #fff7f7;
+    }
+    .run-log-label, .training-journal-label {
+        color: #3a4253;
+        font-size: 0.74rem;
+        font-weight: 700;
+        line-height: 1.15;
+        text-transform: uppercase;
+    }
+    .run-log-text, .training-journal-text {
+        color: #1f2937;
+        font-size: 0.9rem;
+        line-height: 1.35;
+        margin-top: 0.15rem;
+    }
+    .training-journal-meta {
+        color: #5f6b7a;
+        font-size: 0.78rem;
+        line-height: 1.25;
+        margin-top: 0.15rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8001")
 TASK_TYPES = ["classification", "regression", "ts_classification", "ts_regression", "ts_forecasting"]
@@ -467,6 +520,115 @@ def format_elapsed(seconds: Any) -> str:
     if minutes:
         return f"{minutes}m {sec:02d}s"
     return f"{sec}s"
+
+
+def _escape(value: Any) -> str:
+    return html.escape(str(value or ""))
+
+
+def _log_state(text: str) -> str:
+    lower = text.lower()
+    if "error" in lower or "failed" in lower or "exception" in lower:
+        return "error"
+    if "fallback" in lower or "revision" in lower or "warning" in lower:
+        return "warn"
+    if "done" in lower or "completed" in lower or "accepted" in lower:
+        return "done"
+    return "running"
+
+
+def _split_log_line(line: str) -> tuple[str, str]:
+    if ":" not in line:
+        return "System", line
+    label, text = line.split(":", 1)
+    return label.strip() or "System", text.strip()
+
+
+def render_run_log(lines: List[str]) -> None:
+    if not lines:
+        return
+    blocks = []
+    for line in lines[-14:]:
+        label, text = _split_log_line(str(line))
+        state = _log_state(line)
+        blocks.append(
+            "<div class='run-log-entry {state}'>"
+            "<div class='run-log-label'>{label}</div>"
+            "<div class='run-log-text'>{text}</div>"
+            "</div>".format(
+                state=_escape(state),
+                label=_escape(label),
+                text=_escape(text),
+            )
+        )
+    st.markdown("<div class='run-log'>" + "".join(blocks) + "</div>", unsafe_allow_html=True)
+
+
+def render_training_journal(engineer: Dict[str, Any]) -> None:
+    log_rows = engineer.get("training_log", []) or []
+    notes = unique_text(engineer.get("training_notes", []) or [])
+    if not log_rows and not notes:
+        return
+
+    blocks = []
+    split = engineer.get("split_info", {}) or {}
+    strategy = engineer.get("industrial_strategy") or "default"
+    context = engineer.get("industrial_repository_context") or "fedot_industrial"
+    data_type = engineer.get("industrial_data_type") or ""
+    n_jobs = engineer.get("n_jobs") or (engineer.get("industrial_strategy_params", {}) or {}).get("n_jobs")
+
+    summary_bits = [f"strategy={strategy}", f"context={context}"]
+    if data_type:
+        summary_bits.append(f"data_type={data_type}")
+    if n_jobs:
+        summary_bits.append(f"n_jobs={n_jobs}")
+    if split:
+        summary_bits.append(f"train={split.get('n_train', '')}")
+        summary_bits.append(f"holdout={split.get('n_test', '')}")
+    blocks.append(
+        "<div class='training-journal-entry done'>"
+        "<div class='training-journal-label'>Execution</div>"
+        "<div class='training-journal-text'>Fedot.Industrial training path</div>"
+        "<div class='training-journal-meta'>{meta}</div>"
+        "</div>".format(meta=_escape(", ".join(bit for bit in summary_bits if bit and not bit.endswith("="))))
+    )
+
+    for row in log_rows:
+        if not isinstance(row, dict):
+            continue
+        stage = row.get("stage") or "stage"
+        status = row.get("status") or "running"
+        elapsed = row.get("elapsed_seconds")
+        details = row.get("details") or {}
+        meta_parts = []
+        if elapsed is not None:
+            meta_parts.append(f"elapsed={format_elapsed(elapsed)}")
+        if isinstance(details, dict):
+            meta_parts.extend(f"{key}={value}" for key, value in details.items())
+        blocks.append(
+            "<div class='training-journal-entry {state}'>"
+            "<div class='training-journal-label'>{stage} / {status}</div>"
+            "<div class='training-journal-text'>{message}</div>"
+            "<div class='training-journal-meta'>{meta}</div>"
+            "</div>".format(
+                state=_escape(_log_state(f"{status} {row.get('message', '')}")),
+                stage=_escape(stage),
+                status=_escape(status),
+                message=_escape(row.get("message", "")),
+                meta=_escape(", ".join(meta_parts)),
+            )
+        )
+
+    for note in notes:
+        blocks.append(
+            "<div class='training-journal-entry'>"
+            "<div class='training-journal-label'>Note</div>"
+            "<div class='training-journal-text'>{note}</div>"
+            "</div>".format(note=_escape(note))
+        )
+
+    with st.expander("Training journal", expanded=bool(log_rows)):
+        st.markdown("<div class='training-journal'>" + "".join(blocks) + "</div>", unsafe_allow_html=True)
 
 
 def latest_iteration(result: Dict[str, Any]) -> Dict[str, Any]:
@@ -1127,7 +1289,8 @@ def stream_run(payload: Dict[str, Any]) -> None:
                 progress.progress(1.0)
                 lines.append("Run completed.")
 
-            log_box.markdown("\n\n".join(f"- {line}" for line in lines[-14:]))
+            with log_box.container():
+                render_run_log(lines)
 
 
 def sidebar(config: Dict[str, Any]) -> None:
@@ -1529,11 +1692,8 @@ def render_engineer_report(
         if target_info.get("sample_values"):
             st.caption("Target sample: " + ", ".join(target_info["sample_values"][:8]))
 
-    notes = engineer.get("training_notes", []) or []
-    if notes and show_training_notes:
-        with st.expander(f"Training notes ({len(notes)})", expanded=False):
-            for note in notes:
-                st.write(f"- {note}")
+    if show_training_notes:
+        render_training_journal(engineer)
 
     if engineer.get("graph_error") and show_failure_details:
         st.error(engineer["graph_error"])

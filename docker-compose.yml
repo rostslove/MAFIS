@@ -49,6 +49,8 @@ services:
       - LLM_MODEL=${LLM_MODEL:-qwen2.5-coder:32b}
       - LLM_NUM_CTX=${OLLAMA_CONTEXT_LENGTH:-32768}
       - FEDOT_INDUSTRIAL_PATH=/opt/Fedot.Industrial
+      - FEDOT_N_JOBS=${FEDOT_N_JOBS:-0}
+      - TRAINING_PROGRESS_LOG_INTERVAL=${TRAINING_PROGRESS_LOG_INTERVAL:-30}
     depends_on:
       ollama-pull:
         condition: service_completed_successfully

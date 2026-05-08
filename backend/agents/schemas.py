@@ -91,6 +91,8 @@ class EngineerResult:
     fallback_used: str = ""
     target_info: Dict[str, Any] = field(default_factory=dict)
     training_notes: List[str] = field(default_factory=list)
+    training_log: List[Dict[str, Any]] = field(default_factory=list)
+    n_jobs: int = 0
     diagnostics: List[Dict[str, Any]] = field(default_factory=list)
     tool_calls: List[ToolCall] = field(default_factory=list)
 
@@ -111,6 +113,8 @@ class EngineerResult:
             "fallback_used": self.fallback_used,
             "target_info": self.target_info,
             "training_notes": self.training_notes,
+            "training_log": self.training_log,
+            "n_jobs": self.n_jobs,
             "diagnostics": self.diagnostics,
             "tool_calls": [tc.to_dict() for tc in self.tool_calls],
         }

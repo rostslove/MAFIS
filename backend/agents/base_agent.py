@@ -58,10 +58,6 @@ def get_llm_client() -> OpenAI:
         _client = OpenAI(
             api_key=LLM_API_KEY,
             base_url=LLM_BASE_URL,
-            default_headers={
-                "HTTP-Referer": "http://localhost",
-                "X-Title": "MAFIS Agent",
-            },
         )
     return _client
 

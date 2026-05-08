@@ -184,6 +184,13 @@ async def run_orchestration_stream(
 
                 yield _event("agent_start", agent="Engineer", iteration=iteration, step="2/3")
                 strategy_name = data_context.industrial_strategy or "default"
+                logger.info(
+                    "Engineer training started: iteration=%s strategy=%s task=%s metric=%s",
+                    iteration,
+                    strategy_name,
+                    data_context.task_type,
+                    data_context.primary_metric or "",
+                )
                 if strategy_name != "default":
                     yield _event(
                         "status",
@@ -216,6 +223,12 @@ async def run_orchestration_stream(
                         )
                     else:
                         message = "Still finetuning the assumption graph through Fedot.Industrial AutoML."
+                    logger.info(
+                        "Engineer training progress: iteration=%s elapsed=%ss message=%s",
+                        iteration,
+                        elapsed,
+                        message,
+                    )
                     yield _event(
                         "agent_progress",
                         agent="Engineer",
@@ -224,6 +237,12 @@ async def run_orchestration_stream(
                         message=message,
                     )
                 engineer_result = await engineer_task
+                logger.info(
+                    "Engineer training completed: iteration=%s score=%.4f strategy=%s",
+                    iteration,
+                    engineer_result.graph_score,
+                    engineer_result.industrial_strategy or strategy_name,
+                )
                 yield _event(
                     "agent_done",
                     agent="Engineer",
