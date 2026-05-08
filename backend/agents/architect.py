@@ -218,10 +218,13 @@ Return JSON only."""
             "The graph you produce becomes Fedot.Industrial `initial_assumption` and is polished by AutoML finetune.\n"
             "Choose only operations and graph topology. Do not choose hyperparameters or node params; "
             "Fedot.Industrial owns parameter tuning during finetune.\n"
-            "For CSV feature matrices, the backend passes a native Fedot.Industrial (X, y) tuple "
-            "with numeric feature values; do not rely on manual InputData metadata. "
+            "For plain CSV feature matrices, the backend normally passes a native Fedot.Industrial "
+            "(X, y) tuple with numeric feature values; adapter-backed operations may instead be "
+            "executed at the InputData/data-boundary layer before Fedot.Industrial finetune. "
             "Treat Fedot.Industrial repository operations as first-class candidates, and use "
-            "runtime_contracts and fedot_industrial_meta_groups from available_operations to avoid invalid contracts.\n"
+            "runtime_contracts, runtime_adapters, and fedot_industrial_meta_groups from "
+            "available_operations to avoid invalid contracts. Adapter-backed operations are allowed, "
+            "but explain why their adapter semantics are useful for this graph.\n"
             "Act like an expert ML architect: choose preprocessing by reasoning about the data profile, "
             "model family assumptions, feature semantics, missingness, categorical structure, dimensionality, "
             "and whether the transform has a plausible benefit for the selected downstream model. "
@@ -279,6 +282,21 @@ Return JSON only."""
                 for (runtime_family, data_contract), operations_for_contract in runtime_groups.items()
             ]
             cleaned["fedot_industrial_meta_groups"] = meta_groups
+            adapters = []
+            for group, items in source_catalog.items():
+                if not isinstance(items, list):
+                    continue
+                for item in items:
+                    if not isinstance(item, dict) or not item.get("runtime_adapter"):
+                        continue
+                    adapters.append({
+                        "operation": item.get("operation"),
+                        "adapter": item.get("runtime_adapter"),
+                        "train_only": bool(item.get("train_only")),
+                        "requires_categorical_metadata": bool(item.get("requires_categorical_metadata")),
+                    })
+            if adapters:
+                cleaned["runtime_adapters"] = adapters
         if isinstance(operations.get("default_graph"), list):
             cleaned["default_graph"] = [
                 {key: value for key, value in node.items() if key != "params"}

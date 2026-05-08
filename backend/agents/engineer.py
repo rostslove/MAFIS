@@ -41,6 +41,7 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
                 result.split_info = graph_run.get("split_info", {}) or {}
                 result.assumption_graph = graph_run.get("assumption_graph", {}) or {}
                 result.assumption_mermaid = graph_run.get("assumption_mermaid", "") or ""
+                result.effective_graph = graph_run.get("effective_graph", {}) or {}
                 result.industrial_strategy = (
                     graph_run.get("industrial_strategy")
                     or data_context.industrial_strategy
@@ -645,6 +646,18 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
             recommendations.append(
                 "Retry with automatically detected categorical metadata; if the encoder still fails, remove or replace the explicit categorical encoder node."
             )
+        if "catboost_border_count_max_bin" in signatures:
+            recommendations.append(
+                "Sanitize CatBoost tuning search space so border_count is not tuned while max_bin is present in upstream defaults."
+            )
+        if "resample_train_only_transform" in signatures:
+            recommendations.append(
+                "Execute resample as a train-only data-boundary step instead of keeping it as a predict-time graph node."
+            )
+        if "fedot_output_mode_api" in signatures:
+            recommendations.append(
+                "Execute explicit FEDOT preprocessing nodes through a data-boundary adapter when Fedot.Industrial predict_for_fit passes output_mode to an incompatible upstream strategy."
+            )
         if "sklearn_dimensionality" in signatures:
             recommendations.append(
                 "Do not keep the shape-changing preprocessing path with a sklearn tabular model until a shape adapter is available."
@@ -863,6 +876,10 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
             return "feature_names_indexing"
         if "categorical_ids" in text or "categorical_encoders.py" in text or "no attribute 'size'" in text:
             return "categorical_encoder_metadata"
+        if "only one of the parameters border_count, max_bin" in text:
+            return "catboost_border_count_max_bin"
+        if "no attribute 'transform'" in text and "resample" in text:
+            return "resample_train_only_transform"
         if (
             "expected 2d array, got 1d array" in text
             or "found array with dim" in text

@@ -24,7 +24,7 @@ if _backend_dir not in sys.path:
 
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, OneHotEncoder
 
 from data_profiler import DataProfiler
 from graph_engine import (
@@ -32,7 +32,8 @@ from graph_engine import (
     PipelineGraph, compute_metrics, get_operation_catalog, get_training_strategies,
     get_training_strategy_hints, is_ts_task,
     industrial_tuple_sample_count, input_sample_count, load_industrial_tuple_data,
-    load_input_data, slice_input_data, split_industrial_tuple_data, split_input_data,
+    load_input_data, make_tabular_input_data_like, slice_input_data,
+    split_industrial_tuple_data, split_input_data,
 )
 from path_utils import normalize_csv_path
 
@@ -127,6 +128,11 @@ mcp = LocalMCPRegistry("MAFISTools")
 
 _LAST: Dict[str, Any] = {"pipeline": None, "graph": None, "input_data": None, "predictions": None}
 
+TRAIN_ONLY_OPS = {"resample"}
+DATA_BOUNDARY_PREPROCESSING_OPS = {"one_hot_encoding", "label_encoding"}
+EXECUTION_ADAPTER_OPS = TRAIN_ONLY_OPS | DATA_BOUNDARY_PREPROCESSING_OPS
+CATBOOST_OPS = {"catboost", "catboostreg"}
+
 
 def _store_run(pipeline, graph, input_data, predictions) -> None:
     _LAST["pipeline"] = pipeline
@@ -142,6 +148,31 @@ def _predict_pipeline(pipeline, data, task_type: str) -> np.ndarray:
         except Exception:
             pass
     return np.asarray(pipeline.predict(data).predict)
+
+
+def _graph_operation_names(graph: PipelineGraph) -> List[str]:
+    return [node.operation for node in graph.nodes]
+
+
+def _is_tuple_data(data: Any) -> bool:
+    return isinstance(data, tuple) and len(data) == 2
+
+
+def _target_values(data: Any) -> np.ndarray:
+    if _is_tuple_data(data):
+        return np.asarray(data[1])
+    return np.asarray(data.target)
+
+
+def _sample_count(data: Any) -> int:
+    return industrial_tuple_sample_count(data) if _is_tuple_data(data) else input_sample_count(data)
+
+
+def _slice_training_data(data: Any, indices: np.ndarray) -> Any:
+    if _is_tuple_data(data):
+        X, y = data
+        return np.asarray(X)[indices], np.asarray(y)[indices]
+    return slice_input_data(data, indices)
 
 
 def _task_problem(task_type: str) -> str:
@@ -171,6 +202,281 @@ def _resolve_training_n_jobs(params: Optional[Dict[str, Any]] = None) -> int:
 
 def _graph_operation_summary(graph: PipelineGraph) -> str:
     return " -> ".join(node.operation for node in graph.nodes)
+
+
+def _adapt_initial_assumption_graph(
+    graph: PipelineGraph,
+) -> tuple[PipelineGraph, List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Move runtime-adapted operations out of the executable Fedot.Industrial graph."""
+    raw_graph = graph.to_dict()
+    nodes = raw_graph.get("nodes", []) or []
+    removed = [node for node in nodes if node.get("operation") in EXECUTION_ADAPTER_OPS]
+    if not removed:
+        return graph, [], []
+
+    data_boundary_nodes = [
+        node for node in removed
+        if node.get("operation") in DATA_BOUNDARY_PREPROCESSING_OPS
+    ]
+    train_only_nodes = [
+        node for node in removed
+        if node.get("operation") in TRAIN_ONLY_OPS
+    ]
+
+    removed_by_id = {node.get("id"): node for node in removed if node.get("id")}
+
+    def _rewired_inputs(node_id: str, seen: Optional[set[str]] = None) -> List[str]:
+        seen = set(seen or set())
+        if node_id in seen:
+            return []
+        seen.add(node_id)
+        removed_node = removed_by_id.get(node_id)
+        if not removed_node:
+            return [node_id]
+        expanded: List[str] = []
+        for parent_id in removed_node.get("inputs", []) or []:
+            expanded.extend(_rewired_inputs(str(parent_id), seen))
+        return expanded
+
+    adapted_nodes = []
+    for node in nodes:
+        if node.get("id") in removed_by_id:
+            continue
+        inputs: List[str] = []
+        for parent_id in node.get("inputs", []) or []:
+            for rewired in _rewired_inputs(str(parent_id)):
+                if rewired and rewired not in inputs:
+                    inputs.append(rewired)
+        adapted_nodes.append({**node, "inputs": inputs})
+
+    adapted_graph = PipelineGraph.from_dict({**raw_graph, "nodes": adapted_nodes})
+    return adapted_graph, data_boundary_nodes, train_only_nodes
+
+
+def _catboost_search_space_adapter(graph: PipelineGraph) -> List[str]:
+    """Avoid upstream CatBoost border_count/max_bin tuning conflict."""
+    patched: List[str] = []
+    operations = set(_graph_operation_names(graph))
+    if not operations.intersection(CATBOOST_OPS):
+        return patched
+    try:
+        from fedot_ind.core.tuning import search_space as industrial_search_space
+
+        for operation in CATBOOST_OPS.intersection(operations):
+            for repository_name in ("industrial_search_space", "default_fedot_operation_params"):
+                repository = getattr(industrial_search_space, repository_name, {})
+                space = repository.get(operation) if isinstance(repository, dict) else None
+                if isinstance(space, dict) and "border_count" in space:
+                    space.pop("border_count", None)
+                    patched.append(f"{repository_name}.{operation}")
+    except Exception as exc:
+        logger.warning("CatBoost search-space adapter failed: %s", exc)
+    return patched
+
+
+def _resample_indices(y: np.ndarray, params: Optional[Dict[str, Any]] = None) -> np.ndarray:
+    params = dict(params or {})
+    y_arr = np.asarray(y)
+    unique, counts = np.unique(y_arr, return_counts=True)
+    if len(unique) != 2 or counts[0] == counts[1]:
+        return np.arange(len(y_arr))
+
+    minority_pos = int(np.argmin(counts))
+    majority_pos = int(np.argmax(counts))
+    minority_label = unique[minority_pos]
+    majority_label = unique[majority_pos]
+    minority_indices = np.flatnonzero(y_arr == minority_label)
+    majority_indices = np.flatnonzero(y_arr == majority_label)
+
+    try:
+        ratio = float(params.get("balance_ratio", 1.0))
+    except (TypeError, ValueError):
+        ratio = 1.0
+    ratio = min(max(ratio, 0.0), 1.0)
+    balance = str(params.get("balance") or "expand_minority")
+    replace = bool(params.get("replace", False))
+    rng = np.random.default_rng(int(params.get("random_state", 42) or 42))
+
+    if balance == "reduce_majority":
+        desired_majority = int(round(len(majority_indices) - (len(majority_indices) - len(minority_indices)) * ratio))
+        desired_majority = max(len(minority_indices), desired_majority)
+        selected_majority = rng.choice(
+            majority_indices,
+            size=desired_majority,
+            replace=replace and desired_majority > len(majority_indices),
+        )
+        selected = np.concatenate([minority_indices, selected_majority])
+    else:
+        desired_minority = int(round(len(minority_indices) + (len(majority_indices) - len(minority_indices)) * ratio))
+        desired_minority = max(len(minority_indices), desired_minority)
+        selected_minority = rng.choice(
+            minority_indices,
+            size=desired_minority,
+            replace=True if desired_minority > len(minority_indices) else replace,
+        )
+        selected = np.concatenate([selected_minority, majority_indices])
+
+    return rng.permutation(selected)
+
+
+def _apply_train_only_operations(train_data: Any, train_only_nodes: List[Dict[str, Any]]) -> tuple[Any, List[str]]:
+    notes: List[str] = []
+    updated = train_data
+    for node in train_only_nodes:
+        operation = node.get("operation")
+        if operation != "resample":
+            continue
+        before = _sample_count(updated)
+        indices = _resample_indices(_target_values(updated), node.get("params") or {})
+        updated = _slice_training_data(updated, indices)
+        after = _sample_count(updated)
+        notes.append(
+            f"Operation '{node.get('id')}' (resample) was executed as a train-only data-boundary step "
+            f"and removed from the executable initial_assumption graph ({before} -> {after} train samples)."
+        )
+    return updated, notes
+
+
+def _input_metadata_value(input_data: Any, attr: str) -> Any:
+    value = getattr(input_data, attr, None)
+    supplementary = getattr(input_data, "supplementary_data", None)
+    if value is None and supplementary is not None:
+        value = getattr(supplementary, attr, None)
+    return value
+
+
+def _input_metadata_indices(input_data: Any, attr: str) -> np.ndarray:
+    value = _input_metadata_value(input_data, attr)
+    if value is None:
+        return np.asarray([], dtype=int)
+    return np.asarray(value, dtype=int)
+
+
+def _input_feature_names(input_data: Any) -> List[str]:
+    features = np.asarray(input_data.features)
+    value = _input_metadata_value(input_data, "features_names")
+    if value is not None and len(value) == features.shape[1]:
+        return [str(item) for item in list(value)]
+    return [f"feature_{idx}" for idx in range(features.shape[1])]
+
+
+def _new_one_hot_encoder() -> OneHotEncoder:
+    try:
+        return OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+    except TypeError:
+        return OneHotEncoder(handle_unknown="ignore", sparse=False)
+
+
+def _to_dense_array(values: Any) -> np.ndarray:
+    if hasattr(values, "toarray"):
+        return np.asarray(values.toarray())
+    return np.asarray(values)
+
+
+def _apply_one_hot_boundary(train_data: Any, test_data: Any) -> tuple[Any, Any, str]:
+    categorical_idx = _input_metadata_indices(train_data, "categorical_idx")
+    train_features = np.asarray(train_data.features)
+    test_features = np.asarray(test_data.features)
+    if train_features.ndim != 2 or test_features.ndim != 2 or categorical_idx.size == 0:
+        return (
+            train_data,
+            test_data,
+            "Operation one_hot_encoding was moved to the data boundary, but no categorical columns were available; no feature change was applied.",
+        )
+
+    feature_names = _input_feature_names(train_data)
+    all_idx = np.arange(train_features.shape[1])
+    categorical_set = set(int(idx) for idx in categorical_idx)
+    numerical_idx = [int(idx) for idx in all_idx if int(idx) not in categorical_set]
+
+    encoder = _new_one_hot_encoder()
+    train_categorical = train_features[:, categorical_idx]
+    test_categorical = test_features[:, categorical_idx]
+    train_encoded = _to_dense_array(encoder.fit_transform(train_categorical))
+    test_encoded = _to_dense_array(encoder.transform(test_categorical))
+
+    parts_train = []
+    parts_test = []
+    transformed_names = [feature_names[idx] for idx in numerical_idx]
+    if numerical_idx:
+        parts_train.append(train_features[:, numerical_idx])
+        parts_test.append(test_features[:, numerical_idx])
+
+    try:
+        encoded_names = [
+            str(name)
+            for name in encoder.get_feature_names_out([feature_names[idx] for idx in categorical_idx])
+        ]
+    except Exception:
+        encoded_names = [f"one_hot_{idx}" for idx in range(train_encoded.shape[1])]
+
+    parts_train.append(train_encoded)
+    parts_test.append(test_encoded)
+    transformed_names.extend(encoded_names)
+    transformed_train = np.hstack(parts_train)
+    transformed_test = np.hstack(parts_test)
+    numerical_after = list(range(transformed_train.shape[1]))
+
+    return (
+        make_tabular_input_data_like(
+            train_data,
+            transformed_train,
+            feature_names=transformed_names,
+            categorical_idx=[],
+            numerical_idx=numerical_after,
+        ),
+        make_tabular_input_data_like(
+            test_data,
+            transformed_test,
+            feature_names=transformed_names,
+            categorical_idx=[],
+            numerical_idx=numerical_after,
+        ),
+        (
+            "Operation one_hot_encoding was executed as a data-boundary transform "
+            f"({len(categorical_idx)} categorical columns -> {train_encoded.shape[1]} encoded columns) "
+            "and removed from the executable initial_assumption graph."
+        ),
+    )
+
+
+def _apply_data_boundary_preprocessing(
+    train_data: Any,
+    test_data: Any,
+    preprocessing_nodes: List[Dict[str, Any]],
+) -> tuple[Any, Any, List[str]]:
+    notes: List[str] = []
+    updated_train = train_data
+    updated_test = test_data
+    for node in preprocessing_nodes:
+        operation = node.get("operation")
+        if operation == "one_hot_encoding":
+            updated_train, updated_test, note = _apply_one_hot_boundary(updated_train, updated_test)
+            notes.append(f"Operation '{node.get('id')}' ({operation}) adapter: {note}")
+        elif operation == "label_encoding":
+            notes.append(
+                f"Operation '{node.get('id')}' (label_encoding) was executed by the data loader's "
+                "categorical factorization and removed from the executable initial_assumption graph."
+            )
+    return updated_train, updated_test, notes
+
+
+def _load_finetune_train_test(
+    graph: PipelineGraph,
+    preprocessing_nodes: List[Dict[str, Any]],
+    csv_path: str,
+    target_column: str,
+    forecast_length: Optional[int],
+    test_size: float,
+) -> tuple[Any, Any, str]:
+    if graph.task_type in ("classification", "regression") and preprocessing_nodes:
+        input_data = load_input_data(csv_path, target_column, graph.task_type, forecast_length)
+        train, test = split_input_data(input_data, test_size=test_size)
+        return train, test, "fedot_input_data_with_boundary_preprocessing"
+
+    industrial_data = load_industrial_tuple_data(csv_path, target_column, graph.task_type, forecast_length)
+    train, test = split_industrial_tuple_data(industrial_data, test_size=test_size)
+    return train, test, "industrial_tuple"
 
 
 def _record_training_event(
@@ -449,21 +755,42 @@ def _train_via_finetune(
         industrial_strategy or "default",
         timeout,
     )
-    industrial_data = load_industrial_tuple_data(csv_path, target_column, graph.task_type, forecast_length)
-    train, test = split_industrial_tuple_data(industrial_data, test_size=test_size)
+    executable_graph, preprocessing_nodes, train_only_nodes = _adapt_initial_assumption_graph(graph)
+    train, test, data_boundary = _load_finetune_train_test(
+        graph=executable_graph,
+        preprocessing_nodes=preprocessing_nodes,
+        csv_path=csv_path,
+        target_column=target_column,
+        forecast_length=forecast_length,
+        test_size=test_size,
+    )
+    train, test, preprocessing_notes = _apply_data_boundary_preprocessing(train, test, preprocessing_nodes)
+    train, train_only_notes = _apply_train_only_operations(train, train_only_nodes)
     _record_training_event(
         training_events,
         "data",
         "done",
         "Loaded CSV and created hold-out split.",
         run_started_at,
-        train_samples=industrial_tuple_sample_count(train),
-        test_samples=industrial_tuple_sample_count(test),
+        boundary=data_boundary,
+        train_samples=_sample_count(train),
+        test_samples=_sample_count(test),
         test_size=test_size,
     )
+    adapted_nodes = preprocessing_nodes + train_only_nodes
+    if adapted_nodes:
+        _record_training_event(
+            training_events,
+            "graph_adapter",
+            "done",
+            "Moved runtime-adapted operations out of the executable initial_assumption graph.",
+            run_started_at,
+            removed_operations=[node.get("operation") for node in adapted_nodes],
+            executable_graph=_graph_operation_summary(executable_graph),
+        )
 
     api_config = _build_api_config(
-        task_type=graph.task_type,
+        task_type=executable_graph.task_type,
         forecast_length=forecast_length,
         primary_metric=primary_metric,
         industrial_strategy=industrial_strategy,
@@ -483,7 +810,17 @@ def _train_via_finetune(
     )
 
     industrial = FedotIndustrial(**api_config)
-    builder = _graph_to_pipeline_builder(graph)
+    patched_search_space = _catboost_search_space_adapter(executable_graph)
+    if patched_search_space:
+        _record_training_event(
+            training_events,
+            "search_space",
+            "done",
+            "Sanitized CatBoost tuning search space to avoid border_count/max_bin conflicts.",
+            run_started_at,
+            operations=patched_search_space,
+        )
+    builder = _graph_to_pipeline_builder(executable_graph)
     try:
         finetune_kwargs = {
             "tuning_params": {"tuning_iterations": 5, "n_jobs": n_jobs},
@@ -542,8 +879,8 @@ def _train_via_finetune(
         except Exception as shutdown_exc:
             logger.warning("FedotIndustrial shutdown failed: %s", shutdown_exc)
 
-    train_metrics = compute_metrics(graph.task_type, train[1], train_preds, primary_metric)
-    test_metrics = compute_metrics(graph.task_type, test[1], test_preds, primary_metric)
+    train_metrics = compute_metrics(executable_graph.task_type, _target_values(train), train_preds, primary_metric)
+    test_metrics = compute_metrics(executable_graph.task_type, _target_values(test), test_preds, primary_metric)
     _record_training_event(
         training_events,
         "metrics",
@@ -554,7 +891,7 @@ def _train_via_finetune(
         primary_metric_value=test_metrics.get("primary_metric_value"),
     )
 
-    assumption_graph = _pipeline_to_graph_dict(fitted_pipeline, graph.task_type)
+    assumption_graph = _pipeline_to_graph_dict(fitted_pipeline, executable_graph.task_type)
     try:
         assumption_mermaid = (
             PipelineGraph.from_dict(assumption_graph).to_mermaid() if assumption_graph else ""
@@ -562,13 +899,23 @@ def _train_via_finetune(
     except Exception:
         assumption_mermaid = ""
 
-    _store_run(fitted_pipeline, graph, train, test_preds)
-    target_info = _target_info(csv_path, target_column, graph.task_type)
+    _store_run(fitted_pipeline, executable_graph, train, test_preds)
+    target_info = _target_info(csv_path, target_column, executable_graph.task_type)
 
     notes = [
         "Engineer ran Fedot.Industrial finetune over the architect's graph as the initial assumption.",
         f"Fedot.Industrial tuning ran with n_jobs={n_jobs}.",
     ]
+    notes.extend(preprocessing_notes)
+    notes.extend(train_only_notes)
+    if data_boundary == "fedot_input_data_with_boundary_preprocessing":
+        notes.append(
+            "Explicit categorical preprocessing node detected; backend used FEDOT InputData at the data boundary instead of executing the upstream encoder as a graph node."
+        )
+    if patched_search_space:
+        notes.append(
+            "CatBoost tuning search space was sanitized by removing border_count because upstream defaults already set max_bin."
+        )
     strategy_name = str(industrial_strategy or "default").strip().lower() or "default"
     data_type = _fedot_config_data_type(graph.task_type)
     repository_context = _fedot_repository_context(strategy_name)
@@ -590,10 +937,12 @@ def _train_via_finetune(
         "test_metrics": test_metrics,
         "split_info": {
             "test_size": test_size,
-            "n_train": industrial_tuple_sample_count(train),
-            "n_test": industrial_tuple_sample_count(test),
+            "n_train": _sample_count(train),
+            "n_test": _sample_count(test),
+            "data_boundary": data_boundary,
         },
         "graph": graph.to_dict(),
+        "effective_graph": executable_graph.to_dict(),
         "assumption_graph": assumption_graph,
         "assumption_mermaid": assumption_mermaid,
         "industrial_strategy": strategy_name,
@@ -626,8 +975,11 @@ def _train_direct(
         _graph_operation_summary(graph),
         resolved_n_jobs,
     )
+    executable_graph, preprocessing_nodes, train_only_nodes = _adapt_initial_assumption_graph(graph)
     input_data = load_input_data(csv_path, target_column, graph.task_type, forecast_length)
     train, val = split_input_data(input_data, test_size=test_size)
+    train, val, preprocessing_notes = _apply_data_boundary_preprocessing(train, val, preprocessing_nodes)
+    train, train_only_notes = _apply_train_only_operations(train, train_only_nodes)
     _record_training_event(
         training_events,
         "data",
@@ -638,8 +990,19 @@ def _train_direct(
         test_samples=input_sample_count(val),
         test_size=test_size,
     )
+    adapted_nodes = preprocessing_nodes + train_only_nodes
+    if adapted_nodes:
+        _record_training_event(
+            training_events,
+            "graph_adapter",
+            "done",
+            "Moved runtime-adapted operations out of the direct baseline graph.",
+            run_started_at,
+            removed_operations=[node.get("operation") for node in adapted_nodes],
+            executable_graph=_graph_operation_summary(executable_graph),
+        )
 
-    pipeline = graph.to_fedot_pipeline()
+    pipeline = executable_graph.to_fedot_pipeline()
     _record_training_event(
         training_events,
         "direct_fit",
@@ -664,10 +1027,12 @@ def _train_direct(
 
     train_metrics = compute_metrics(graph.task_type, train.target, train_preds, primary_metric)
     test_metrics = compute_metrics(graph.task_type, val.target, test_preds, primary_metric)
-    _store_run(pipeline, graph, input_data, test_preds)
+    _store_run(pipeline, executable_graph, input_data, test_preds)
 
     target_info = _target_info(csv_path, target_column, graph.task_type)
     notes = ["Engineer used the direct-fit fallback (Fedot.Industrial finetune unavailable)."]
+    notes.extend(preprocessing_notes)
+    notes.extend(train_only_notes)
     if target_info.get("fedot_receives_raw_target") and target_info.get("reference_encoded"):
         notes.append(
             "Fedot graph received the raw string classification target; reference mapping is shown only for readable diagnostics."
@@ -684,8 +1049,9 @@ def _train_direct(
             "n_test": input_sample_count(val),
         },
         "graph": graph.to_dict(),
-        "assumption_graph": graph.to_dict(),
-        "assumption_mermaid": graph.to_mermaid(),
+        "effective_graph": executable_graph.to_dict(),
+        "assumption_graph": executable_graph.to_dict(),
+        "assumption_mermaid": executable_graph.to_mermaid(),
         "industrial_strategy": "default",
         "industrial_strategy_params": {},
         "industrial_data_type": _fedot_config_data_type(graph.task_type),

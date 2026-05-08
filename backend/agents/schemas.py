@@ -83,6 +83,7 @@ class EngineerResult:
     split_info: Dict[str, Any] = field(default_factory=dict)
     assumption_graph: Dict[str, Any] = field(default_factory=dict)
     assumption_mermaid: str = ""
+    effective_graph: Dict[str, Any] = field(default_factory=dict)
     industrial_strategy: str = "default"
     industrial_strategy_params: Dict[str, Any] = field(default_factory=dict)
     graph_error: str = ""
@@ -105,6 +106,7 @@ class EngineerResult:
             "split_info": self.split_info,
             "assumption_graph": self.assumption_graph,
             "assumption_mermaid": self.assumption_mermaid,
+            "effective_graph": self.effective_graph,
             "industrial_strategy": self.industrial_strategy,
             "industrial_strategy_params": self.industrial_strategy_params,
             "graph_error": self.graph_error,

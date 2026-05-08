@@ -350,6 +350,26 @@ def _is_industrial_native_model(operation: str) -> bool:
 
 
 def _operation_runtime_contract(operation: str) -> Dict[str, str]:
+    if operation == "resample":
+        return {
+            "runtime_family": "fedot_train_only_preprocessing",
+            "data_contract": "train_only_target_transform",
+            "compatibility_note": (
+                "Train-only class balancing operation. MAFIS executes it on the train split "
+                "before Fedot.Industrial finetune and removes it from the executable graph."
+            ),
+        }
+    if operation in {"one_hot_encoding", "label_encoding"}:
+        return {
+            "runtime_family": "fedot_data_boundary_preprocessing",
+            "data_contract": "categorical_boundary_transform",
+            "compatibility_note": (
+                "FEDOT categorical encoder. MAFIS executes this transform at the train/test "
+                "data boundary and removes it from the executable Fedot.Industrial graph, "
+                "because the upstream graph-node strategy is incompatible with Industrial "
+                "predict_for_fit output_mode handling."
+            ),
+        }
     meta = _operation_meta(operation)
     if _is_industrial_native_model(operation):
         return {
@@ -390,6 +410,19 @@ def _operation_runtime_contract(operation: str) -> Dict[str, str]:
         "data_contract": "table_features",
         "compatibility_note": "Classic FEDOT/sklearn-style operation exposed through Fedot.Industrial.",
     }
+
+
+def _operation_execution_hints(operation: str) -> Dict[str, Any]:
+    hints: Dict[str, Any] = {}
+    if operation in {"one_hot_encoding", "label_encoding"}:
+        hints["requires_categorical_metadata"] = True
+        hints["runtime_adapter"] = "data_boundary_categorical_encoding"
+    if operation == "resample":
+        hints["train_only"] = True
+        hints["runtime_adapter"] = "data_boundary_resampling"
+    if operation in {"catboost", "catboostreg"}:
+        hints["runtime_adapter"] = "catboost_search_space_sanitizer"
+    return hints
 
 
 # Local fallback is used only when Fedot.Industrial repository introspection is unavailable.
@@ -1166,6 +1199,7 @@ def get_operation_catalog(task_type: str) -> Dict[str, List[Dict[str, Any]]]:
                 "tags": _operation_repository_info(name).get("tags", []),
                 "presets": _operation_repository_info(name).get("presets", []),
                 **_operation_runtime_contract(name),
+                **_operation_execution_hints(name),
             }
             for name in names
         ]
@@ -1581,6 +1615,43 @@ def slice_input_data(input_data: InputData, sample_indices) -> InputData:
         data_type=input_data.data_type,
         supplementary_data=input_data.supplementary_data,
         **_metadata_kwargs_from_input(input_data, indices),
+    )
+
+
+def make_tabular_input_data_like(
+    source_data: InputData,
+    features,
+    target=None,
+    feature_names: Optional[List[str]] = None,
+    categorical_idx: Optional[List[int]] = None,
+    numerical_idx: Optional[List[int]] = None,
+) -> InputData:
+    """Build table InputData from transformed features while preserving task/target."""
+    feature_array = np.asarray(features)
+    if feature_array.ndim != 2:
+        raise ValueError(f"Tabular transformed features must be 2D, got shape={feature_array.shape}")
+
+    names = feature_names or [f"feature_{idx}" for idx in range(feature_array.shape[1])]
+    cat_idx = np.asarray(categorical_idx or [], dtype=int)
+    num_idx = np.asarray(
+        numerical_idx if numerical_idx is not None else [idx for idx in range(feature_array.shape[1]) if idx not in cat_idx],
+        dtype=int,
+    )
+    metadata_kwargs: Dict[str, Any] = {
+        "features_names": np.asarray(names, dtype=object),
+        "categorical_idx": cat_idx,
+        "numerical_idx": num_idx,
+    }
+    if cat_idx.size > 0:
+        metadata_kwargs["categorical_features"] = feature_array[:, cat_idx]
+
+    return _input_data(
+        idx=np.arange(len(feature_array)),
+        features=feature_array,
+        target=np.asarray(source_data.target if target is None else target),
+        task=source_data.task,
+        data_type=DataTypesEnum.table,
+        **metadata_kwargs,
     )
 
 
