@@ -132,6 +132,10 @@ TRAIN_ONLY_OPS = {"resample"}
 DATA_BOUNDARY_PREPROCESSING_OPS = {"one_hot_encoding", "label_encoding"}
 EXECUTION_ADAPTER_OPS = TRAIN_ONLY_OPS | DATA_BOUNDARY_PREPROCESSING_OPS
 CATBOOST_OPS = {"catboost", "catboostreg"}
+N_JOBS_OPERATION_OPS = {
+    "rf", "rfr", "xgboost", "xgbreg", "lgbm", "lgbmreg", "catboost", "catboostreg",
+    "extra_trees", "extra_trees_reg", "isolation_forest_class", "isolation_forest_reg",
+}
 
 
 def _store_run(pipeline, graph, input_data, predictions) -> None:
@@ -202,6 +206,17 @@ def _resolve_training_n_jobs(params: Optional[Dict[str, Any]] = None) -> int:
 
 def _graph_operation_summary(graph: PipelineGraph) -> str:
     return " -> ".join(node.operation for node in graph.nodes)
+
+
+def _graph_with_runtime_model_params(graph: PipelineGraph, n_jobs: int) -> PipelineGraph:
+    """Attach runtime execution params that upstream repositories default too low."""
+    adapted = deepcopy(graph)
+    for node in adapted.nodes:
+        params = dict(node.params or {})
+        if node.operation in N_JOBS_OPERATION_OPS:
+            params["n_jobs"] = n_jobs
+        node.params = params
+    return adapted
 
 
 def _adapt_initial_assumption_graph(
@@ -549,6 +564,7 @@ def _graph_to_pipeline_builder(graph: PipelineGraph):
         builder.add_node(
             operation_type=root.operation,
             branch_idx=0,
+            params=dict(root.params or {}),
         )
         return builder
 
@@ -572,16 +588,19 @@ def _graph_to_pipeline_builder(graph: PipelineGraph):
             builder.add_node(
                 operation_type=node.operation,
                 branch_idx=branch_idx,
+                params=dict(node.params or {}),
             )
 
     if len(root.inputs) == 1:
         builder.add_node(
             operation_type=root.operation,
             branch_idx=0,
+            params=dict(root.params or {}),
         )
     else:
         builder.join_branches(
             operation_type=root.operation,
+            params=dict(root.params or {}),
         )
     return builder
 
@@ -798,6 +817,7 @@ def _train_via_finetune(
         timeout=timeout,
     )
     n_jobs = _resolve_training_n_jobs(industrial_strategy_params)
+    executable_graph = _graph_with_runtime_model_params(executable_graph, n_jobs)
     _record_training_event(
         training_events,
         "config",
@@ -916,6 +936,8 @@ def _train_via_finetune(
         notes.append(
             "CatBoost tuning search space was sanitized by removing border_count because upstream defaults already set max_bin."
         )
+    if any((node.params or {}).get("n_jobs") == n_jobs for node in executable_graph.nodes):
+        notes.append(f"Runtime model parameters set n_jobs={n_jobs} on supported model nodes.")
     strategy_name = str(industrial_strategy or "default").strip().lower() or "default"
     data_type = _fedot_config_data_type(graph.task_type)
     repository_context = _fedot_repository_context(strategy_name)
@@ -976,6 +998,7 @@ def _train_direct(
         resolved_n_jobs,
     )
     executable_graph, preprocessing_nodes, train_only_nodes = _adapt_initial_assumption_graph(graph)
+    executable_graph = _graph_with_runtime_model_params(executable_graph, resolved_n_jobs)
     input_data = load_input_data(csv_path, target_column, graph.task_type, forecast_length)
     train, val = split_input_data(input_data, test_size=test_size)
     train, val, preprocessing_notes = _apply_data_boundary_preprocessing(train, val, preprocessing_nodes)
@@ -1033,6 +1056,8 @@ def _train_direct(
     notes = ["Engineer used the direct-fit fallback (Fedot.Industrial finetune unavailable)."]
     notes.extend(preprocessing_notes)
     notes.extend(train_only_notes)
+    if any((node.params or {}).get("n_jobs") == resolved_n_jobs for node in executable_graph.nodes):
+        notes.append(f"Runtime model parameters set n_jobs={resolved_n_jobs} on supported model nodes.")
     if target_info.get("fedot_receives_raw_target") and target_info.get("reference_encoded"):
         notes.append(
             "Fedot graph received the raw string classification target; reference mapping is shown only for readable diagnostics."
@@ -1322,11 +1347,15 @@ def validate_graph(
         if not ok:
             return json.dumps({"error": f"Invalid graph: {msg}"})
 
+        n_jobs = _resolve_training_n_jobs()
+        executable_graph, preprocessing_nodes, train_only_nodes = _adapt_initial_assumption_graph(graph)
+        executable_graph = _graph_with_runtime_model_params(executable_graph, n_jobs)
         input_data = load_input_data(csv_path, target_column, graph.task_type, forecast_length)
 
         # Simple CV: rotate validation cuts
         n = input_sample_count(input_data)
         scores: List[float] = []
+        adapter_notes: List[str] = []
         for fold in range(cv_folds):
             offset = fold / cv_folds
             cut_lo = int(n * offset)
@@ -1336,11 +1365,16 @@ def validate_graph(
 
             train = slice_input_data(input_data, np.flatnonzero(mask))
             val = slice_input_data(input_data, np.flatnonzero(~mask))
+            train, val, preprocessing_notes = _apply_data_boundary_preprocessing(train, val, preprocessing_nodes)
+            train, train_only_notes = _apply_train_only_operations(train, train_only_nodes)
+            if fold == 0:
+                adapter_notes.extend(preprocessing_notes)
+                adapter_notes.extend(train_only_notes)
 
-            pipeline = graph.to_fedot_pipeline()
+            pipeline = executable_graph.to_fedot_pipeline()
             pipeline.fit(train)
             preds = _predict_pipeline(pipeline, val, graph.task_type)
-            m = compute_metrics(graph.task_type, val.target, preds, primary_metric)
+            m = compute_metrics(graph.task_type, _target_values(val), preds, primary_metric)
             scores.append(m["primary_score"])
 
         return json.dumps({
@@ -1350,6 +1384,9 @@ def validate_graph(
             "cv_folds": cv_folds,
             "primary_metric": primary_metric,
             "primary_score_direction": "higher_is_better",
+            "effective_graph": executable_graph.to_dict(),
+            "adapter_notes": adapter_notes,
+            "n_jobs": n_jobs,
         })
     except Exception as e:
         logger.exception("validate_graph failed")
@@ -1374,16 +1411,28 @@ def get_node_importance(
         graph = PipelineGraph.from_dict(json.loads(graph_json))
         input_data = load_input_data(csv_path, target_column, graph.task_type, forecast_length)
         train, val = split_input_data(input_data)
+        n_jobs = _resolve_training_n_jobs()
+
+        def _score_graph(candidate: PipelineGraph) -> float:
+            executable_graph, preprocessing_nodes, train_only_nodes = _adapt_initial_assumption_graph(candidate)
+            executable_graph = _graph_with_runtime_model_params(executable_graph, n_jobs)
+            candidate_train, candidate_val, _ = _apply_data_boundary_preprocessing(
+                train,
+                val,
+                preprocessing_nodes,
+            )
+            candidate_train, _ = _apply_train_only_operations(candidate_train, train_only_nodes)
+            pipe = executable_graph.to_fedot_pipeline()
+            pipe.fit(candidate_train)
+            return compute_metrics(
+                candidate.task_type,
+                _target_values(candidate_val),
+                _predict_pipeline(pipe, candidate_val, candidate.task_type),
+                primary_metric,
+            )["primary_score"]
 
         # Reference score: full graph
-        full_pipe = graph.to_fedot_pipeline()
-        full_pipe.fit(train)
-        full_score = compute_metrics(
-            graph.task_type,
-            val.target,
-            _predict_pipeline(full_pipe, val, graph.task_type),
-            primary_metric,
-        )["primary_score"]
+        full_score = _score_graph(graph)
 
         importances: Dict[str, float] = {}
         for node in graph.nodes:
@@ -1395,19 +1444,18 @@ def get_node_importance(
                 ok, _ = ablated.validate()
                 if not ok:
                     continue
-                pipe = ablated.to_fedot_pipeline()
-                pipe.fit(train)
-                score = compute_metrics(
-                    graph.task_type,
-                    val.target,
-                    _predict_pipeline(pipe, val, graph.task_type),
-                    primary_metric,
-                )["primary_score"]
+                score = _score_graph(ablated)
                 importances[node.id] = round(full_score - score, 4)
             except Exception as e:
                 importances[node.id] = None
 
-        return json.dumps({"full_score": full_score, "node_importance": importances})
+        effective_graph, _, _ = _adapt_initial_assumption_graph(graph)
+        effective_graph = _graph_with_runtime_model_params(effective_graph, n_jobs)
+        return json.dumps({
+            "full_score": full_score,
+            "node_importance": importances,
+            "effective_graph": effective_graph.to_dict(),
+        })
     except Exception as e:
         return json.dumps({"error": str(e)})
 

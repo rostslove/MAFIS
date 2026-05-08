@@ -1360,6 +1360,8 @@ class PipelineGraph:
         for spec in self._topo_sorted():
             parents = [nodes_by_id[i] for i in spec.inputs] or None
             fedot_node = PipelineNode(operation_type=spec.operation, nodes_from=parents)
+            if spec.params:
+                fedot_node.parameters = dict(spec.params)
             nodes_by_id[spec.id] = fedot_node
         return Pipeline(nodes_by_id[self.root_id()])
 
