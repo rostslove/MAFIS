@@ -1373,10 +1373,19 @@ def data_tab() -> None:
     if not require_dataset():
         return
     df = st.session_state.df
+    preview = df.iloc[:10, :10]
+    preview_columns = list(preview.columns)
     st.write(f"Path: `{st.session_state.csv_path}`")
-    st.dataframe(df.head(50), use_container_width=True)
+    st.caption(
+        f"Showing first {len(preview)} rows and {len(preview.columns)} columns "
+        f"of {len(df)} rows and {len(df.columns)} columns."
+    )
+    st.dataframe(preview, use_container_width=True)
     st.write("Numeric summary")
-    st.dataframe(df.describe(include="all").transpose(), use_container_width=True)
+    if preview_columns:
+        st.dataframe(df.loc[:, preview_columns].describe(include="all").transpose(), use_container_width=True)
+    else:
+        st.info("No columns available.")
 
 
 def architect_tab(config: Dict[str, Any]) -> None:
