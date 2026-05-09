@@ -26,6 +26,12 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import LabelEncoder, Normalizer, OneHotEncoder
 
+from benchmarks import (
+    DEFAULT_BENCHMARK_TARGET_COLUMN,
+    load_benchmark_artifact_data,
+    load_benchmark_artifact_metadata,
+    profile_benchmark_artifact,
+)
 from data_profiler import DataProfiler
 from graph_engine import (
     OPERATIONS, METRICS_BY_TASK, SUPPORTED_TASKS, DEFAULT_GRAPHS, INDUSTRIAL_GRAPH_TEMPLATES,
@@ -34,12 +40,6 @@ from graph_engine import (
     industrial_tuple_sample_count, input_sample_count, load_industrial_tuple_data,
     load_input_data, make_tabular_input_data_like, slice_input_data,
     split_industrial_tuple_data, split_input_data,
-)
-from m4_benchmark import (
-    M4_TARGET_COLUMN,
-    load_m4_artifact_data,
-    load_m4_artifact_metadata,
-    profile_m4_artifact,
 )
 from path_utils import normalize_csv_path
 
@@ -1256,12 +1256,12 @@ def _train_direct(
 
 def _target_info(csv_path: str, target_column: str, task_type: str) -> Dict[str, Any]:
     csv_path = normalize_csv_path(csv_path)
-    metadata = load_m4_artifact_metadata(csv_path)
+    metadata = load_benchmark_artifact_metadata(csv_path)
     if metadata is not None:
-        expected_target = metadata.get("target_column", M4_TARGET_COLUMN)
+        expected_target = metadata.get("target_column", DEFAULT_BENCHMARK_TARGET_COLUMN)
         if target_column != expected_target:
-            raise ValueError(f"Target column '{target_column}' not in M4 artifact; expected '{expected_target}'.")
-        _, y, _ = load_m4_artifact_data(csv_path, mmap_mode="r")
+            raise ValueError(f"Target column '{target_column}' not in benchmark artifact; expected '{expected_target}'.")
+        _, y, _ = load_benchmark_artifact_data(csv_path, mmap_mode="r")
         y_arr = np.asarray(y).astype(str)
         values = y_arr[y_arr != ""]
         unique_values = np.unique(values)
@@ -1309,16 +1309,13 @@ def get_data_profile(csv_path: str, target_column: str, task_type: str = "classi
     """Profile a CSV: returns factual dataset shape, target distribution and issues."""
     try:
         csv_path = normalize_csv_path(csv_path)
-        if load_m4_artifact_metadata(csv_path) is not None:
-            return json.dumps(profile_m4_artifact(csv_path, target_column, task_type), default=str)
+        if load_benchmark_artifact_metadata(csv_path) is not None:
+            return json.dumps(profile_benchmark_artifact(csv_path, target_column, task_type), default=str)
     except Exception as e:
         return json.dumps({"error": str(e)})
 
     try:
-        df = pd.read_csv(csv_path)
-        y = df[target_column] if target_column in df.columns else None
-        X = df.drop(columns=[target_column]) if target_column in df.columns else df
-        profile = DataProfiler.profile(X=X, y=y, task_type=task_type)
+        profile = DataProfiler.profile_csv(csv_path, target_column, task_type=task_type)
         profile["is_time_series"] = is_ts_task(task_type)
         return json.dumps(profile, default=str)
     except Exception as e:

@@ -5,9 +5,8 @@ import os
 import time
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
-import pandas as pd
-
 from agents import Architect, ArchitectResult, Critic, CriticFeedback, DataContext, Engineer, EngineerResult, IterationRecord, Scribe
+from benchmarks import load_benchmark_artifact_metadata, profile_benchmark_artifact
 from data_profiler import DataProfiler
 from graph_engine import SUPPORTED_TASKS, PipelineGraph, is_industrial_native_model, is_ts_task
 from mcp_client import MCPToolClient
@@ -24,13 +23,10 @@ def _profile_data(csv_path: str, target_column: str, task_type: str, forecast_le
     csv_path = normalize_csv_path(csv_path)
     if not os.path.exists(csv_path):
         raise FileNotFoundError(describe_missing_csv(csv_path))
-    df = pd.read_csv(csv_path)
-    if target_column not in df.columns:
-        raise ValueError(f"Target '{target_column}' not found")
-
-    X = df.drop(columns=[target_column])
-    y = df[target_column]
-    profile = DataProfiler.profile(X=X, y=y, task_type=task_type)
+    if load_benchmark_artifact_metadata(csv_path) is not None:
+        profile = profile_benchmark_artifact(csv_path, target_column, task_type)
+    else:
+        profile = DataProfiler.profile_csv(csv_path, target_column, task_type=task_type)
     profile["is_time_series"] = is_ts_task(task_type)
     if forecast_length:
         profile["forecast_length"] = forecast_length

@@ -16,15 +16,15 @@ import pandas as pd
 from path_utils import normalize_csv_path
 
 try:
-    from m4_benchmark import (
-        M4_TARGET_COLUMN,
-        is_m4_artifact,
-        load_m4_artifact_data,
+    from benchmarks import (
+        DEFAULT_BENCHMARK_TARGET_COLUMN,
+        is_benchmark_artifact,
+        load_benchmark_artifact_data,
     )
-except Exception:  # pragma: no cover - M4 is optional for generic CSV flows
-    M4_TARGET_COLUMN = "frequency_group"
-    is_m4_artifact = None
-    load_m4_artifact_data = None
+except Exception:  # pragma: no cover - benchmark artifacts are optional for generic CSV flows
+    DEFAULT_BENCHMARK_TARGET_COLUMN = "frequency_group"
+    is_benchmark_artifact = None
+    load_benchmark_artifact_data = None
 
 logger = logging.getLogger("GraphEngine")
 
@@ -1502,20 +1502,20 @@ class PipelineGraph:
 
 # ============== Data loading ==============
 
-def _load_m4_optimized_tuple(
+def _load_benchmark_optimized_tuple(
     dataset_path: str,
     target: str,
     mmap_mode: Optional[str] = "r",
 ) -> Optional[Tuple[np.ndarray, np.ndarray, Dict[str, Any]]]:
-    if not load_m4_artifact_data or not is_m4_artifact:
+    if not load_benchmark_artifact_data or not is_benchmark_artifact:
         return None
     normalized = normalize_csv_path(dataset_path)
-    if not is_m4_artifact(normalized):
+    if not is_benchmark_artifact(normalized):
         return None
-    X, y, metadata = load_m4_artifact_data(normalized, mmap_mode=mmap_mode)
-    expected_target = metadata.get("target_column", M4_TARGET_COLUMN)
+    X, y, metadata = load_benchmark_artifact_data(normalized, mmap_mode=mmap_mode)
+    expected_target = metadata.get("target_column", DEFAULT_BENCHMARK_TARGET_COLUMN)
     if target != expected_target:
-        raise ValueError(f"Target column '{target}' not in M4 artifact; expected '{expected_target}'.")
+        raise ValueError(f"Target column '{target}' not in benchmark artifact; expected '{expected_target}'.")
     return X, y, metadata
 
 
@@ -1526,11 +1526,11 @@ def load_input_data(
     forecast_length: Optional[int] = None,
 ) -> InputData:
     """Load CSV into a Fedot InputData object."""
-    optimized = _load_m4_optimized_tuple(csv_path, target, mmap_mode="r")
+    optimized = _load_benchmark_optimized_tuple(csv_path, target, mmap_mode="r")
     if optimized is not None:
         X, y, metadata = optimized
         if task_type == "ts_forecasting":
-            raise ValueError("Optimized M4 artifacts are classification/regression windows, not forecasting series.")
+            raise ValueError("Optimized benchmark artifacts are classification/regression windows, not forecasting series.")
         if task_type in ("regression", "ts_regression"):
             try:
                 y = np.asarray(y).astype(float)
@@ -1643,7 +1643,7 @@ def load_industrial_tuple_data(
     into ``InputData``. Passing a prebuilt FEDOT ``InputData`` skips that layer
     and can leave Industrial preprocessing with shapes it does not expect.
     """
-    optimized = _load_m4_optimized_tuple(csv_path, target, mmap_mode="r")
+    optimized = _load_benchmark_optimized_tuple(csv_path, target, mmap_mode="r")
     if optimized is not None:
         X, y, _ = optimized
         if task_type in ("regression", "ts_regression"):

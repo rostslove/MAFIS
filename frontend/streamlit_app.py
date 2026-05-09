@@ -78,7 +78,6 @@ DEFAULT_METRICS_BY_TASK = {
     "ts_regression": ["r2", "rmse", "mae"],
     "ts_forecasting": ["rmse", "mae", "mape", "smape"],
 }
-DEFAULT_M4_GROUPS = ["Daily", "Weekly", "Monthly", "Quarterly", "Yearly"]
 METRIC_METADATA_KEYS = {
     "error",
     "primary_metric",
@@ -223,7 +222,7 @@ def adopt_path_dataset(result: Dict[str, Any]) -> None:
     st.session_state.result = {}
     st.session_state.evaluation_history = []
     st.session_state.uploaded_signature = f"path:{csv_path}"
-    st.session_state.m4_dataset_info = {}
+    st.session_state.benchmark_dataset_info = {}
 
     current_target = st.session_state.get("target_column")
     if current_target not in columns:
@@ -300,7 +299,7 @@ def adopt_graph_draft(graph: Dict[str, Any]) -> None:
 
 def require_dataset() -> bool:
     if not st.session_state.get("csv_path") or "df" not in st.session_state:
-        st.info("Upload a CSV file to start, or use the Benchmarks tab to run M4 without uploading a dataset.")
+        st.info("Upload a CSV file to start, or use the Benchmarks tab to load a registered benchmark dataset.")
         return False
     return True
 
@@ -1989,15 +1988,15 @@ def render_evaluation_history(current_result: Dict[str, Any]) -> None:
             )
 
 
-def adopt_m4_dataset(result: Dict[str, Any]) -> None:
-    """Promote a loaded M4 artifact to the active dataset using its preview."""
+def adopt_benchmark_dataset(result: Dict[str, Any]) -> None:
+    """Promote a loaded benchmark artifact to the active dataset using its preview."""
     csv_path = result.get("csv_path")
     if not csv_path:
-        raise RuntimeError("M4 loader did not return a CSV path.")
+        raise RuntimeError("Benchmark loader did not return a CSV path.")
 
     artifact_path = resolve_shared_data_path(csv_path)
     if not artifact_path.exists():
-        raise FileNotFoundError(f"Loaded M4 artifact not found at {csv_path}.")
+        raise FileNotFoundError(f"Loaded benchmark artifact not found at {csv_path}.")
 
     target_column = result.get("target_column", "frequency_group")
     preview_path_value = result.get("preview_csv_path") or csv_path
@@ -2023,7 +2022,7 @@ def adopt_m4_dataset(result: Dict[str, Any]) -> None:
     st.session_state.dataset_columns = ui_columns
     st.session_state.dataset_preview_only = True
     st.session_state.csv_path = csv_path if Path("/app/data").exists() else str(artifact_path)
-    st.session_state.uploaded_signature = f"m4:{artifact_path.name}"
+    st.session_state.uploaded_signature = f"benchmark:{result.get('benchmark_id', 'unknown')}:{artifact_path.name}"
     st.session_state.target_column = target_column
     st.session_state.task_type = result.get("task_type", "ts_classification")
     st.session_state.forecast_length = None
@@ -2034,13 +2033,15 @@ def adopt_m4_dataset(result: Dict[str, Any]) -> None:
     st.session_state.graph = {}
     st.session_state.approved_graph = None
     st.session_state.graph_approved = False
-    st.session_state.m4_dataset_info = result
+    st.session_state.benchmark_dataset_info = result
 
 
-def render_m4_dataset_info(info: Dict[str, Any]) -> None:
+def render_benchmark_dataset_info(info: Dict[str, Any]) -> None:
     if not info:
         return
-    st.markdown("#### Loaded M4 Dataset")
+    st.markdown("#### Loaded Benchmark Dataset")
+    benchmark_name = info.get("benchmark_name") or info.get("benchmark_id") or "Benchmark"
+    st.caption(f"Source: `{benchmark_name}`")
     cols = st.columns(4)
     window_label = str(info.get("window_length", 0))
     if info.get("window_length_mode") == "full_history":
@@ -2072,143 +2073,156 @@ def render_m4_dataset_info(info: Dict[str, Any]) -> None:
 
     source_files = info.get("source_files") or []
     if source_files:
-        with st.expander("M4 source files"):
+        with st.expander("Source files"):
             st.dataframe(pd.DataFrame(source_files), use_container_width=True, hide_index=True)
 
 
-def queue_m4_dataset_load(
-    groups: List[str],
-    n_per_group: Optional[int],
-    window_length: Optional[int],
-    standardize: bool,
-    all_samples: bool,
-    full_history: bool,
+def queue_benchmark_dataset_load(
+    benchmark_id: str,
+    benchmark_options: Dict[str, Any],
 ) -> None:
-    """Queue M4 loading so the next rerun handles it before rendering tabs."""
-    st.session_state.m4_pending_load = {
-        "groups": list(groups or DEFAULT_M4_GROUPS),
-        "n_per_group": None if all_samples else int(n_per_group or 100),
-        "window_length": None if full_history else int(window_length or 50),
-        "all_samples": bool(all_samples),
-        "full_history": bool(full_history),
-        "standardize": bool(standardize),
-    }
-    st.session_state.pop("m4_load_success", None)
-    st.session_state.pop("m4_load_error", None)
+    """Queue benchmark loading so the next rerun handles it before rendering tabs."""
+    st.session_state.benchmark_pending_load = {"benchmark_id": benchmark_id, **dict(benchmark_options or {})}
+    st.session_state.pop("benchmark_load_success", None)
+    st.session_state.pop("benchmark_load_error", None)
 
 
-def process_pending_m4_load() -> None:
-    """Apply queued M4 dataset changes before the rest of the UI renders."""
-    payload = st.session_state.pop("m4_pending_load", None)
+def process_pending_benchmark_load() -> None:
+    """Apply queued benchmark dataset changes before the rest of the UI renders."""
+    payload = st.session_state.pop("benchmark_pending_load", None)
     if not payload:
         return
 
     try:
-        with st.spinner("Downloading/loading M4 and preparing artifact..."):
-            result = post_json("/benchmarks/m4/load", payload, timeout=900)
-        adopt_m4_dataset(result)
-        st.session_state.m4_load_success = (
-            f"M4 dataset loaded: {result.get('n_samples', 0)} samples written as optimized artifact "
+        with st.spinner("Downloading/loading benchmark and preparing artifact..."):
+            result = post_json("/benchmarks/load", payload, timeout=900)
+        adopt_benchmark_dataset(result)
+        st.session_state.benchmark_load_success = (
+            f"Benchmark dataset loaded: {result.get('n_samples', 0)} samples written as optimized artifact "
             f"`{result.get('csv_filename', '')}`. Task type set to "
             f"`{result.get('task_type', 'ts_classification')}`. "
             "Switch to Architect or Graph Editor to continue."
         )
     except Exception as exc:
-        st.session_state.m4_load_error = f"M4 loading failed: {exc}"
+        st.session_state.benchmark_load_error = f"Benchmark loading failed: {exc}"
+
+
+def render_benchmark_options(benchmark_id: str, bench_config: Dict[str, Any]) -> tuple[Dict[str, Any], bool]:
+    options = bench_config.get("options", {}) or {}
+    values: Dict[str, Any] = {}
+    can_load = True
+
+    multiselect_items = [(name, spec) for name, spec in options.items() if (spec or {}).get("type") == "multiselect"]
+    checkbox_items = [(name, spec) for name, spec in options.items() if (spec or {}).get("type") == "checkbox"]
+    number_items = [(name, spec) for name, spec in options.items() if (spec or {}).get("type") == "number"]
+
+    for name, spec in multiselect_items:
+        spec = spec or {}
+        choices = list(spec.get("options") or bench_config.get(name) or [])
+        selected = st.multiselect(
+            spec.get("label") or name.replace("_", " ").title(),
+            choices,
+            default=list(spec.get("default") or choices),
+            key=f"benchmark_{benchmark_id}_{name}",
+            help=spec.get("help"),
+        )
+        values[name] = selected
+        minimum_selected = int(spec.get("minimum_selected", 0) or 0)
+        if minimum_selected and len(selected or []) < minimum_selected:
+            st.warning(f"Select at least {minimum_selected} values for `{spec.get('label') or name}`.")
+            can_load = False
+
+    if checkbox_items:
+        checkbox_cols = st.columns(min(3, len(checkbox_items)))
+        for idx, (name, spec) in enumerate(checkbox_items):
+            spec = spec or {}
+            value = checkbox_cols[idx % len(checkbox_cols)].checkbox(
+                spec.get("label") or name.replace("_", " ").title(),
+                value=bool(spec.get("default", False)),
+                key=f"benchmark_{benchmark_id}_{name}",
+                help=spec.get("help"),
+            )
+            values[name] = value
+            if value and spec.get("warning"):
+                st.warning(str(spec["warning"]))
+
+    if number_items:
+        number_cols = st.columns(min(3, len(number_items)))
+        for idx, (name, spec) in enumerate(number_items):
+            spec = spec or {}
+            disabled_when = spec.get("disabled_when")
+            disabled = bool(disabled_when and values.get(str(disabled_when)))
+            value = number_cols[idx % len(number_cols)].number_input(
+                spec.get("label") or name.replace("_", " ").title(),
+                min_value=int(spec.get("min", 0)),
+                max_value=int(spec.get("max", 1000000)),
+                value=int(spec.get("default", 0)),
+                step=int(spec.get("step", 1)),
+                key=f"benchmark_{benchmark_id}_{name}",
+                disabled=disabled,
+                help=spec.get("help"),
+            )
+            values[name] = None if disabled else int(value)
+
+    return values, can_load
 
 
 def benchmarks_tab(config: Dict[str, Any]) -> None:
     st.subheader("Benchmarks")
-    bench_config = (config.get("benchmarks", {}) or {}).get("m4_classification", {})
-    groups = bench_config.get("groups") or DEFAULT_M4_GROUPS
+    catalog = config.get("benchmarks", {}) or {}
+    if not catalog:
+        st.info("No benchmark loaders are registered by the backend.")
+        return
 
-    st.write("M4 frequency-group classification")
-    st.caption(
-        "Loads M4 train CSVs from the public M4 source and saves an optimized time-series "
-        "classification artifact. After loading, ask Architect for a graph, approve it, and evaluate."
+    benchmark_ids = list(catalog.keys())
+    default_id = config.get("default_benchmark") if config.get("default_benchmark") in catalog else benchmark_ids[0]
+    current_id = st.session_state.get("selected_benchmark_id", default_id)
+    if current_id not in catalog:
+        current_id = default_id
+    labels = {bench_id: catalog[bench_id].get("name") or bench_id for bench_id in benchmark_ids}
+    benchmark_id = st.selectbox(
+        "Benchmark",
+        benchmark_ids,
+        index=benchmark_ids.index(current_id),
+        key="benchmark_selector",
+        format_func=lambda bench_id: labels.get(bench_id, bench_id),
     )
+    st.session_state.selected_benchmark_id = benchmark_id
 
-    selected_groups = st.multiselect(
-        "M4 groups",
-        groups,
-        default=groups,
-        key="m4_groups",
-        help="At least two groups are recommended because the benchmark is classification by frequency group.",
-    )
-    option_cols = st.columns(2)
-    all_samples = option_cols[0].checkbox(
-        "Use all available series",
-        value=False,
-        key="m4_all_samples",
-        help="Load every available series from each selected M4 group instead of limiting rows per group.",
-    )
-    full_history = option_cols[1].checkbox(
-        "Use full available history",
-        value=False,
-        key="m4_full_history",
-        help="Use the longest loaded series as the window length and left-pad shorter series.",
-    )
+    bench_config = catalog[benchmark_id]
 
-    cols = st.columns(3)
-    n_per_group = cols[0].number_input(
-        "Series per group",
-        min_value=10,
-        max_value=1000,
-        value=int(bench_config.get("default_n_per_group", 100)),
-        step=10,
-        key="m4_n_per_group",
-        disabled=all_samples,
-    )
-    window_length = cols[1].number_input(
-        "Window length",
-        min_value=8,
-        max_value=500,
-        value=int(bench_config.get("default_window_length", 50)),
-        step=5,
-        key="m4_window_length",
-        disabled=full_history,
-    )
-    standardize = cols[2].checkbox("Standardize each series", value=True, key="m4_standardize")
+    st.write(bench_config.get("name") or benchmark_id)
+    if bench_config.get("description"):
+        st.caption(str(bench_config["description"]))
+    st.caption("After loading, ask Architect for a graph, approve it, and evaluate.")
 
-    if all_samples or full_history:
-        st.warning(
-            "Loading all samples or full history can create a much larger artifact and make Industrial time-series "
-            "feature extraction substantially slower."
-        )
-
-    if len(selected_groups or []) < 2:
-        st.warning("Select at least two M4 groups for a classification benchmark.")
-
-    can_load = len(selected_groups or []) >= 2
+    benchmark_options, can_load = render_benchmark_options(benchmark_id, bench_config)
     st.button(
-        "Load M4 Dataset",
+        "Load Benchmark Dataset",
         type="primary",
         use_container_width=True,
-        key="m4_load_dataset",
+        key=f"benchmark_{benchmark_id}_load_dataset",
         disabled=not can_load,
-        on_click=queue_m4_dataset_load,
+        on_click=queue_benchmark_dataset_load,
         args=(
-            selected_groups or groups,
-            None if all_samples else int(n_per_group),
-            None if full_history else int(window_length),
-            bool(standardize),
-            bool(all_samples),
-            bool(full_history),
+            benchmark_id,
+            benchmark_options,
         ),
     )
 
-    success_message = st.session_state.pop("m4_load_success", "")
+    success_message = st.session_state.pop("benchmark_load_success", "")
     if success_message:
         st.success(success_message)
-    error_message = st.session_state.pop("m4_load_error", "")
+    error_message = st.session_state.pop("benchmark_load_error", "")
     if error_message:
         st.error(error_message)
 
-    render_m4_dataset_info(st.session_state.get("m4_dataset_info") or {})
+    render_benchmark_dataset_info(st.session_state.get("benchmark_dataset_info") or {})
 
     st.divider()
-    st.write("Available ts_classification operations")
-    render_operation_catalog(config, "ts_classification", "m4_benchmark")
+    task_type = bench_config.get("task_type", "classification")
+    st.write(f"Available {task_type} operations")
+    render_operation_catalog(config, task_type, f"benchmark_{benchmark_id}")
 
 
 def results_tab() -> None:
@@ -2343,7 +2357,7 @@ def main() -> None:
         st.session_state.industrial_strategy = "default"
     if "industrial_strategy_params" not in st.session_state:
         st.session_state.industrial_strategy_params = {}
-    process_pending_m4_load()
+    process_pending_benchmark_load()
     config = load_config()
     sidebar(config)
     tools = load_tools()

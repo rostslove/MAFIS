@@ -11,6 +11,7 @@ from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
 from agents.base_agent import LLM_BASE_URL, LLM_MODEL
+from benchmarks import DEFAULT_BENCHMARK_ID, get_benchmark_catalog, prepare_benchmark_dataset
 from graph_engine import (
     DEFAULT_GRAPHS,
     FEDOT_IND_VERSION,
@@ -32,7 +33,6 @@ from orchestrator import (
     run_orchestration,
     run_orchestration_stream,
 )
-from m4_benchmark import M4_GROUPS, M4_TARGET_COLUMN, M4_TASK_TYPE, prepare_m4_dataset_csv
 from path_utils import describe_missing_csv, normalize_csv_path
 
 logging.basicConfig(level=logging.INFO)
@@ -99,17 +99,8 @@ async def get_config(request):
         "llm_configured": bool(os.getenv("LLM_API_KEY") or LLM_BASE_URL),
         "fedot_ind_version": FEDOT_IND_VERSION,
         "fedot_industrial_source": FEDOT_INDUSTRIAL_SOURCE,
-        "benchmarks": {
-            "m4_classification": {
-                "name": "M4 frequency-group classification",
-                "task_type": M4_TASK_TYPE,
-                "target_column": M4_TARGET_COLUMN,
-                "groups": list(M4_GROUPS),
-                "default_primary_metric": "f1",
-                "default_window_length": 50,
-                "default_n_per_group": 100,
-            }
-        },
+        "benchmarks": get_benchmark_catalog(),
+        "default_benchmark": DEFAULT_BENCHMARK_ID,
     })
 
 
@@ -260,24 +251,16 @@ async def orchestrate(request):
         return _error(str(exc), 500)
 
 
-async def benchmark_m4_load(request):
+async def benchmark_load(request):
     payload = await _json_body(request)
     try:
-        n_per_group_value = payload.get("n_per_group", 100)
-        window_length_value = payload.get("window_length", 50)
-        n_per_group = None if payload.get("all_samples") or n_per_group_value is None else int(n_per_group_value or 100)
-        window_length = None if payload.get("full_history") or window_length_value is None else int(window_length_value or 50)
+        benchmark_id = str(payload.get("benchmark_id") or DEFAULT_BENCHMARK_ID)
         result = await anyio.to_thread.run_sync(
-            lambda: prepare_m4_dataset_csv(
-                n_per_group=n_per_group,
-                window_length=window_length,
-                standardize=bool(payload.get("standardize", True)),
-                groups=payload.get("groups") or None,
-            )
+            lambda: prepare_benchmark_dataset(benchmark_id, payload)
         )
         return JSONResponse(result)
     except Exception as exc:
-        logger.exception("M4 dataset preparation failed")
+        logger.exception("Benchmark dataset preparation failed")
         return _error(str(exc), 500)
 
 
@@ -327,7 +310,7 @@ routes = [
     Route("/graph/mutate", graph_mutate, methods=["POST"]),
     Route("/orchestrate", orchestrate, methods=["POST"]),
     Route("/orchestrate/stream", orchestrate_stream, methods=["POST"]),
-    Route("/benchmarks/m4/load", benchmark_m4_load, methods=["POST"]),
+    Route("/benchmarks/load", benchmark_load, methods=["POST"]),
 ]
 
 app = Starlette(debug=False, routes=routes)
