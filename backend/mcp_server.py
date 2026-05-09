@@ -35,6 +35,12 @@ from graph_engine import (
     load_input_data, make_tabular_input_data_like, slice_input_data,
     split_industrial_tuple_data, split_input_data,
 )
+from m4_benchmark import (
+    M4_TARGET_COLUMN,
+    load_m4_artifact_data,
+    load_m4_artifact_metadata,
+    profile_m4_artifact,
+)
 from path_utils import normalize_csv_path
 
 logging.basicConfig(level=logging.INFO)
@@ -1250,6 +1256,31 @@ def _train_direct(
 
 def _target_info(csv_path: str, target_column: str, task_type: str) -> Dict[str, Any]:
     csv_path = normalize_csv_path(csv_path)
+    metadata = load_m4_artifact_metadata(csv_path)
+    if metadata is not None:
+        expected_target = metadata.get("target_column", M4_TARGET_COLUMN)
+        if target_column != expected_target:
+            raise ValueError(f"Target column '{target_column}' not in M4 artifact; expected '{expected_target}'.")
+        _, y, _ = load_m4_artifact_data(csv_path, mmap_mode="r")
+        y_arr = np.asarray(y).astype(str)
+        values = y_arr[y_arr != ""]
+        unique_values = np.unique(values)
+        info: Dict[str, Any] = {
+            "column": target_column,
+            "raw_dtype": str(y.dtype),
+            "unique_values": int(len(unique_values)),
+            "sample_values": [str(v) for v in values[:10].tolist()],
+            "fedot_receives_raw_target": task_type in ("classification", "ts_classification"),
+            "reference_encoded": False,
+            "storage_format": metadata.get("storage_format"),
+        }
+        if task_type in ("classification", "ts_classification"):
+            encoder = LabelEncoder()
+            encoder.fit(values.astype(str))
+            info["reference_encoded"] = True
+            info["reference_encoding"] = {str(label): int(code) for code, label in enumerate(encoder.classes_)}
+        return info
+
     df = pd.read_csv(csv_path, usecols=[target_column])
     y = df[target_column]
     values = y.dropna()
@@ -1278,6 +1309,12 @@ def get_data_profile(csv_path: str, target_column: str, task_type: str = "classi
     """Profile a CSV: returns factual dataset shape, target distribution and issues."""
     try:
         csv_path = normalize_csv_path(csv_path)
+        if load_m4_artifact_metadata(csv_path) is not None:
+            return json.dumps(profile_m4_artifact(csv_path, target_column, task_type), default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+    try:
         df = pd.read_csv(csv_path)
         y = df[target_column] if target_column in df.columns else None
         X = df.drop(columns=[target_column]) if target_column in df.columns else df

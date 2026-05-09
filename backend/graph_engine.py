@@ -15,6 +15,17 @@ import pandas as pd
 
 from path_utils import normalize_csv_path
 
+try:
+    from m4_benchmark import (
+        M4_TARGET_COLUMN,
+        is_m4_artifact,
+        load_m4_artifact_data,
+    )
+except Exception:  # pragma: no cover - M4 is optional for generic CSV flows
+    M4_TARGET_COLUMN = "frequency_group"
+    is_m4_artifact = None
+    load_m4_artifact_data = None
+
 logger = logging.getLogger("GraphEngine")
 
 
@@ -1491,6 +1502,23 @@ class PipelineGraph:
 
 # ============== Data loading ==============
 
+def _load_m4_optimized_tuple(
+    dataset_path: str,
+    target: str,
+    mmap_mode: Optional[str] = "r",
+) -> Optional[Tuple[np.ndarray, np.ndarray, Dict[str, Any]]]:
+    if not load_m4_artifact_data or not is_m4_artifact:
+        return None
+    normalized = normalize_csv_path(dataset_path)
+    if not is_m4_artifact(normalized):
+        return None
+    X, y, metadata = load_m4_artifact_data(normalized, mmap_mode=mmap_mode)
+    expected_target = metadata.get("target_column", M4_TARGET_COLUMN)
+    if target != expected_target:
+        raise ValueError(f"Target column '{target}' not in M4 artifact; expected '{expected_target}'.")
+    return X, y, metadata
+
+
 def load_input_data(
     csv_path: str,
     target: str,
@@ -1498,6 +1526,43 @@ def load_input_data(
     forecast_length: Optional[int] = None,
 ) -> InputData:
     """Load CSV into a Fedot InputData object."""
+    optimized = _load_m4_optimized_tuple(csv_path, target, mmap_mode="r")
+    if optimized is not None:
+        X, y, metadata = optimized
+        if task_type == "ts_forecasting":
+            raise ValueError("Optimized M4 artifacts are classification/regression windows, not forecasting series.")
+        if task_type in ("regression", "ts_regression"):
+            try:
+                y = np.asarray(y).astype(float)
+            except ValueError as exc:
+                raise ValueError(
+                    "Regression target contains non-numeric values. "
+                    "Choose classification or convert the target to numbers."
+                ) from exc
+        task = Task(TaskTypesEnum.classification) if task_type in ("classification", "ts_classification") else Task(TaskTypesEnum.regression)
+        if task_type in ("ts_classification", "ts_regression"):
+            return _input_data(
+                idx=np.arange(len(X)),
+                features=np.asarray(X)[np.newaxis, :, :],
+                target=np.asarray(y),
+                task=task,
+                data_type=DataTypesEnum.ts,
+            )
+        feature_names = [f"f_{i}" for i in range(int(np.asarray(X).shape[1]))]
+        metadata_kwargs = {
+            "features_names": np.asarray(feature_names, dtype=object),
+            "categorical_idx": np.asarray([], dtype=int),
+            "numerical_idx": np.arange(np.asarray(X).shape[1], dtype=int),
+        }
+        return _input_data(
+            idx=np.arange(len(X)),
+            features=np.asarray(X),
+            target=np.asarray(y),
+            task=task,
+            data_type=DataTypesEnum.table,
+            **metadata_kwargs,
+        )
+
     csv_path = normalize_csv_path(csv_path)
     df = pd.read_csv(csv_path)
     if target not in df.columns:
@@ -1578,6 +1643,19 @@ def load_industrial_tuple_data(
     into ``InputData``. Passing a prebuilt FEDOT ``InputData`` skips that layer
     and can leave Industrial preprocessing with shapes it does not expect.
     """
+    optimized = _load_m4_optimized_tuple(csv_path, target, mmap_mode="r")
+    if optimized is not None:
+        X, y, _ = optimized
+        if task_type in ("regression", "ts_regression"):
+            try:
+                y = np.asarray(y).astype(float)
+            except ValueError as exc:
+                raise ValueError(
+                    "Regression target contains non-numeric values. "
+                    "Choose classification or convert the target to numbers."
+                ) from exc
+        return X, y
+
     csv_path = normalize_csv_path(csv_path)
     df = pd.read_csv(csv_path)
     if target not in df.columns:
@@ -1624,13 +1702,16 @@ def split_industrial_tuple_data(
     """Train/validation split for native Fedot.Industrial tuple data."""
     test_size = min(max(float(test_size) if test_size is not None else 0.2, 0.05), 0.5)
     X, y = data
-    X_arr = np.asarray(X)
-    y_arr = np.asarray(y)
+    X_arr = X if isinstance(X, np.memmap) else np.asarray(X)
+    y_arr = y if isinstance(y, np.memmap) else np.asarray(y)
     n = len(X_arr)
     if n < 2:
         raise ValueError("At least two samples are required for a train/test split.")
     cut = int(n * (1 - test_size))
     cut = min(max(cut, 1), n - 1)
+
+    if isinstance(X_arr, np.memmap):
+        return (X_arr[:cut], y_arr[:cut]), (X_arr[cut:], y_arr[cut:])
 
     rng = np.random.default_rng(42)
     perm = rng.permutation(n)

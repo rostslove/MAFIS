@@ -97,6 +97,21 @@ def shared_data_dir() -> Path:
     return repo_data
 
 
+def resolve_shared_data_path(path_value: str) -> Path:
+    raw = Path(path_value)
+    if raw.exists():
+        return raw
+    data_dir = shared_data_dir()
+    candidates = [
+        data_dir / raw.name,
+        data_dir / "m4" / "artifacts" / raw.name,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return raw
+
+
 def load_config() -> Dict[str, Any]:
     try:
         response = requests.get(f"{BACKEND_URL}/config", timeout=5)
@@ -113,6 +128,20 @@ def load_tools() -> Dict[str, Any]:
         return response.json()
     except Exception:
         return {}
+
+
+def active_dataset_shape() -> tuple[int, int]:
+    df = st.session_state.get("df")
+    fallback = df.shape if df is not None else (0, 0)
+    return tuple(st.session_state.get("dataset_shape") or fallback)
+
+
+def active_dataset_columns() -> List[str]:
+    columns = st.session_state.get("dataset_columns")
+    if columns:
+        return list(columns)
+    df = st.session_state.get("df")
+    return list(df.columns) if df is not None else []
 
 
 def post_json(path: str, payload: Dict[str, Any], timeout: int = 120) -> Dict[str, Any]:
@@ -160,6 +189,9 @@ def save_uploaded_csv(uploaded_file) -> str:
 
     df = pd.read_csv(io.BytesIO(data))
     st.session_state.df = df
+    st.session_state.dataset_shape = tuple(df.shape)
+    st.session_state.dataset_columns = list(df.columns)
+    st.session_state.dataset_preview_only = False
     st.session_state.result = {}
     st.session_state.evaluation_history = []
     st.session_state.uploaded_signature = signature
@@ -1316,8 +1348,9 @@ def sidebar(config: Dict[str, Any]) -> None:
 
         if "df" in st.session_state:
             df = st.session_state.df
-            st.caption(f"{df.shape[0]} rows, {df.shape[1]} columns")
-            columns = list(df.columns)
+            n_rows, n_cols = active_dataset_shape()
+            st.caption(f"{n_rows} rows, {n_cols} columns")
+            columns = active_dataset_columns()
             current_target = st.session_state.get("target_column")
             target_index = columns.index(current_target) if current_target in columns else 0
             st.session_state.target_column = st.selectbox("Target column", columns, index=target_index)
@@ -1373,12 +1406,13 @@ def data_tab() -> None:
     if not require_dataset():
         return
     df = st.session_state.df
+    n_rows, n_cols = active_dataset_shape()
     preview = df.iloc[:10, :10]
     preview_columns = list(preview.columns)
     st.write(f"Path: `{st.session_state.csv_path}`")
     st.caption(
         f"Showing first {len(preview)} rows and {len(preview.columns)} columns "
-        f"of {len(df)} rows and {len(df.columns)} columns."
+        f"of {n_rows} rows and {n_cols} columns."
     )
     st.dataframe(preview, use_container_width=True)
     st.write("Numeric summary")
@@ -1914,22 +1948,41 @@ def render_evaluation_history(current_result: Dict[str, Any]) -> None:
 
 
 def adopt_m4_dataset(result: Dict[str, Any]) -> None:
-    """Promote a loaded M4 CSV to the active dataset (same shape as CSV upload)."""
+    """Promote a loaded M4 artifact to the active dataset using its preview."""
     csv_path = result.get("csv_path")
     if not csv_path:
         raise RuntimeError("M4 loader did not return a CSV path.")
 
-    local_path = Path(csv_path)
-    if not local_path.exists():
-        local_path = shared_data_dir() / Path(csv_path).name
-    if not local_path.exists():
-        raise FileNotFoundError(f"Loaded M4 CSV not found at {csv_path}.")
+    artifact_path = resolve_shared_data_path(csv_path)
+    if not artifact_path.exists():
+        raise FileNotFoundError(f"Loaded M4 artifact not found at {csv_path}.")
 
-    df = pd.read_csv(local_path)
+    target_column = result.get("target_column", "frequency_group")
+    preview_path_value = result.get("preview_csv_path") or csv_path
+    preview_path = resolve_shared_data_path(preview_path_value)
+    preview_feature_columns = list(result.get("feature_columns_preview") or result.get("feature_columns") or [])[:10]
+    preview_columns = preview_feature_columns + [target_column]
+    try:
+        df = pd.read_csv(preview_path, usecols=preview_columns, nrows=10)
+    except ValueError:
+        df = pd.read_csv(preview_path, nrows=10)
+        preview_columns = list(df.columns)
+        if target_column not in preview_columns:
+            preview_columns.append(target_column)
+
+    ui_columns = list(preview_columns)
+    if target_column not in ui_columns:
+        ui_columns.append(target_column)
     st.session_state.df = df
-    st.session_state.csv_path = csv_path if Path("/app/data").exists() else str(local_path)
-    st.session_state.uploaded_signature = f"m4:{local_path.name}"
-    st.session_state.target_column = result.get("target_column", "frequency_group")
+    st.session_state.dataset_shape = (
+        int(result.get("n_samples") or len(df)),
+        int(result.get("n_features") or max(len(df.columns) - 1, 0)) + 1,
+    )
+    st.session_state.dataset_columns = ui_columns
+    st.session_state.dataset_preview_only = True
+    st.session_state.csv_path = csv_path if Path("/app/data").exists() else str(artifact_path)
+    st.session_state.uploaded_signature = f"m4:{artifact_path.name}"
+    st.session_state.target_column = target_column
     st.session_state.task_type = result.get("task_type", "ts_classification")
     st.session_state.forecast_length = None
     st.session_state.industrial_strategy = "default"
@@ -1956,7 +2009,7 @@ def render_m4_dataset_info(info: Dict[str, Any]) -> None:
     cols[2].metric("Groups", len(info.get("groups", []) or []))
     cols[3].metric("Per group", per_group_label)
     st.caption(
-        f"CSV: `{info.get('csv_path', '')}` - target column: `{info.get('target_column', '')}`. "
+        f"Artifact: `{info.get('artifact_path') or info.get('csv_path', '')}` - target column: `{info.get('target_column', '')}`. "
         "Open the Data, Architect, Graph Editor and Feedback tabs to run the standard pipeline."
     )
     if info.get("window_length_mode") == "full_history":
@@ -2013,7 +2066,7 @@ def process_pending_m4_load() -> None:
             result = post_json("/benchmarks/m4/load", payload, timeout=900)
         adopt_m4_dataset(result)
         st.session_state.m4_load_success = (
-            f"M4 dataset loaded: {result.get('n_samples', 0)} samples written to "
+            f"M4 dataset loaded: {result.get('n_samples', 0)} samples written as optimized artifact "
             f"`{result.get('csv_filename', '')}`. Task type set to "
             f"`{result.get('task_type', 'ts_classification')}`. "
             "Switch to Architect or Graph Editor to continue."
