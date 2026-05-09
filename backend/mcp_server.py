@@ -24,7 +24,7 @@ if _backend_dir not in sys.path:
 
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import LabelEncoder, OneHotEncoder
+from sklearn.preprocessing import LabelEncoder, Normalizer, OneHotEncoder
 
 from data_profiler import DataProfiler
 from graph_engine import (
@@ -129,7 +129,7 @@ mcp = LocalMCPRegistry("MAFISTools")
 _LAST: Dict[str, Any] = {"pipeline": None, "graph": None, "input_data": None, "predictions": None}
 
 TRAIN_ONLY_OPS = {"resample", "class_decompose"}
-DATA_BOUNDARY_PREPROCESSING_OPS = {"one_hot_encoding", "label_encoding", "cat_features"}
+DATA_BOUNDARY_PREPROCESSING_OPS = {"one_hot_encoding", "label_encoding", "cat_features", "normalization"}
 EXECUTION_ADAPTER_OPS = TRAIN_ONLY_OPS | DATA_BOUNDARY_PREPROCESSING_OPS
 CATBOOST_OPS = {"catboost", "catboostreg"}
 LGBM_OPS = {"lgbm", "lgbmreg"}
@@ -475,6 +475,66 @@ def _apply_one_hot_boundary(train_data: Any, test_data: Any) -> tuple[Any, Any, 
     )
 
 
+def _apply_normalization_boundary(
+    train_data: Any,
+    test_data: Any,
+    params: Optional[Dict[str, Any]] = None,
+) -> tuple[Any, Any, str]:
+    params = dict(params or {})
+    norm = str(params.get("norm") or "l2")
+    if norm not in {"l1", "l2", "max"}:
+        norm = "l2"
+
+    train_features = np.asarray(train_data.features)
+    test_features = np.asarray(test_data.features)
+    if train_features.ndim != 2 or test_features.ndim != 2:
+        return (
+            train_data,
+            test_data,
+            f"Operation normalization was moved to the data boundary, but features were not 2D "
+            f"(train_shape={train_features.shape}, test_shape={test_features.shape}); no feature change was applied.",
+        )
+
+    feature_names = _input_feature_names(train_data)
+    categorical_idx = [int(idx) for idx in _input_metadata_indices(train_data, "categorical_idx")]
+    numerical_idx = [int(idx) for idx in _input_metadata_indices(train_data, "numerical_idx")]
+    if not numerical_idx:
+        numerical_idx = [idx for idx in range(train_features.shape[1]) if idx not in set(categorical_idx)]
+    if not numerical_idx:
+        return (
+            train_data,
+            test_data,
+            "Operation normalization was moved to the data boundary, but no numerical columns were available; no feature change was applied.",
+        )
+
+    train_normalized = np.asarray(train_features, dtype=float).copy()
+    test_normalized = np.asarray(test_features, dtype=float).copy()
+    normalizer = Normalizer(norm=norm)
+    train_normalized[:, numerical_idx] = normalizer.fit_transform(train_normalized[:, numerical_idx])
+    test_normalized[:, numerical_idx] = normalizer.transform(test_normalized[:, numerical_idx])
+
+    return (
+        make_tabular_input_data_like(
+            train_data,
+            train_normalized,
+            feature_names=feature_names,
+            categorical_idx=categorical_idx,
+            numerical_idx=numerical_idx,
+        ),
+        make_tabular_input_data_like(
+            test_data,
+            test_normalized,
+            feature_names=feature_names,
+            categorical_idx=categorical_idx,
+            numerical_idx=numerical_idx,
+        ),
+        (
+            "Operation normalization was executed as a 2D table data-boundary transform "
+            f"(norm={norm}, normalized_columns={len(numerical_idx)}) and removed from the executable initial_assumption graph."
+        ),
+    )
+
+
 def _apply_data_boundary_preprocessing(
     train_data: Any,
     test_data: Any,
@@ -487,6 +547,13 @@ def _apply_data_boundary_preprocessing(
         operation = node.get("operation")
         if operation == "one_hot_encoding":
             updated_train, updated_test, note = _apply_one_hot_boundary(updated_train, updated_test)
+            notes.append(f"Operation '{node.get('id')}' ({operation}) adapter: {note}")
+        elif operation == "normalization":
+            updated_train, updated_test, note = _apply_normalization_boundary(
+                updated_train,
+                updated_test,
+                node.get("params") or {},
+            )
             notes.append(f"Operation '{node.get('id')}' ({operation}) adapter: {note}")
         elif operation == "label_encoding":
             notes.append(
