@@ -703,6 +703,7 @@ def compact_result_for_agent(result: Dict[str, Any], source: str = "", saved_at:
         "train_metrics": train_metrics,
         "test_metrics": test_metrics,
         "critic_decision": critic.get("winner", ""),
+        "suggested_mutations": critic.get("suggested_mutations", []) or [],
         "graph": graph,
         "summary": (result.get("report", {}) or {}).get("summary", ""),
     }

@@ -73,6 +73,11 @@ attempt in recovery_attempts. Do not claim that removing one node cleanly solves
 the graph if another attempt exposes a different structural/runtime error. If
 multiple original nodes produce distinct failures, include the relevant node
 mutations or mention the remaining blocker in improvement_plan.
+Use mutation_memory as short-term graph-change memory. If it lists
+recently_removed_operations, do not suggest adding/replacing them back unless
+mutation_memory.allowed_reintroductions explicitly includes that operation. This
+prevents oscillating between "remove operation" and "add the same operation" on
+adjacent evaluations.
 Analyze traceback text when present. If traceback points to categorical encoder,
 one_hot_encoding, label_encoding, categorical_ids, or a similar categorical
 metadata failure, explicitly consider removing the explicit encoder from the
@@ -134,6 +139,11 @@ Return JSON only."""
                 node_importance = await self._maybe_get_node_importance(graph, graph_json, data_context)
 
             diagnostics = self._collect_diagnostics(engineer_result, validation, node_importance)
+            mutation_memory = self._mutation_memory(
+                current_graph=graph,
+                engineer=engineer_result,
+                history=data_context.iteration_history or [],
+            )
             llm_feedback, raw_response, parse_error = await self._ask_llm_for_feedback(
                 graph=graph,
                 dc=data_context,
@@ -142,6 +152,7 @@ Return JSON only."""
                 explanation=explanation if isinstance(explanation, dict) else {},
                 node_importance=node_importance if isinstance(node_importance, dict) else {},
                 diagnostics=diagnostics,
+                mutation_memory=mutation_memory,
             )
             if parse_error:
                 diagnostics.append(
@@ -171,6 +182,7 @@ Return JSON only."""
                 graph,
                 data_context,
                 feedback.diagnostics,
+                mutation_memory,
             )
             feedback.improvement_plan = llm_feedback.improvement_plan
             feedback.should_stop = self._safe_should_stop(
@@ -247,6 +259,7 @@ Return JSON only."""
         explanation: Dict[str, Any],
         node_importance: Dict[str, Any],
         diagnostics: List[Dict[str, Any]],
+        mutation_memory: Dict[str, Any],
     ) -> Tuple[CriticFeedbackObject, str, bool]:
         compact_engineer_diagnostics = self._compact_diagnostics(engineer.diagnostics)
         compact_collected_diagnostics = self._compact_diagnostics(diagnostics)
@@ -279,6 +292,7 @@ Return JSON only."""
             "explanation": explanation,
             "node_importance": node_importance,
             "collected_diagnostics": compact_collected_diagnostics,
+            "mutation_memory": mutation_memory,
             "iteration_history": [
                 {
                     "iteration": item.iteration,
@@ -386,12 +400,25 @@ Return JSON only."""
         graph: Dict[str, Any],
         dc: DataContext,
         diagnostics: List[Dict[str, Any]],
+        mutation_memory: Dict[str, Any] | None = None,
     ) -> List[Dict[str, Any]]:
         from graph_engine import PipelineGraph
 
         validated: List[Dict[str, Any]] = []
         current_graph = graph
         for mutation in mutations:
+            reversal_error = self._mutation_reversal_error(mutation, mutation_memory or {})
+            if reversal_error:
+                diagnostics.append(
+                    {
+                        "agent": "Critic",
+                        "kind": "critic_mutation_rejected_by_memory",
+                        "summary": "Critic proposed a mutation that reverses a recent graph edit.",
+                        "technical_message": f"{reversal_error}: {json.dumps(mutation, ensure_ascii=False)}",
+                        "recoverable": True,
+                    }
+                )
+                continue
             error = self._mutation_validation_error(mutation, current_graph, dc)
             if error:
                 diagnostics.append(
@@ -412,6 +439,98 @@ Return JSON only."""
             except Exception:
                 pass
         return validated[:3]
+
+    @classmethod
+    def _mutation_memory(
+        cls,
+        current_graph: Dict[str, Any],
+        engineer: EngineerResult,
+        history: List[Any],
+    ) -> Dict[str, Any]:
+        current_operations = {
+            str(node.get("operation"))
+            for node in (current_graph.get("nodes", []) or [])
+            if isinstance(node, dict) and node.get("operation")
+        }
+        current_score = float(engineer.graph_score or 0.0)
+        removed: List[Dict[str, Any]] = []
+        allowed_reintroductions: set[str] = set()
+
+        for item in history[-6:]:
+            prior_graph = getattr(item, "graph", {}) or {}
+            prior_score = float(getattr(item, "graph_score", 0.0) or 0.0)
+            node_ops = {
+                str(node.get("id")): str(node.get("operation"))
+                for node in (prior_graph.get("nodes", []) or [])
+                if isinstance(node, dict) and node.get("id") and node.get("operation")
+            }
+            for mutation in getattr(item, "suggested_mutations", []) or []:
+                if not isinstance(mutation, dict):
+                    continue
+                operation = ""
+                mutation_type = str(mutation.get("type") or "")
+                if mutation_type == "remove":
+                    operation = node_ops.get(str(mutation.get("node_id")), "")
+                elif mutation_type == "replace":
+                    operation = node_ops.get(str(mutation.get("node_id")), "")
+                if not operation or operation in current_operations:
+                    continue
+
+                score_delta = prior_score - current_score
+                record = {
+                    "operation": operation,
+                    "node_id": mutation.get("node_id", ""),
+                    "iteration": getattr(item, "iteration", 0),
+                    "previous_score": prior_score,
+                    "current_score": current_score,
+                    "score_delta_after_removal": score_delta,
+                }
+                removed.append(record)
+                if engineer.graph_error or engineer.finetune_error or current_score <= 0 or score_delta >= 0.03:
+                    allowed_reintroductions.add(operation)
+
+        unique_removed: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in reversed(removed):
+            operation = str(item.get("operation") or "")
+            if operation and operation not in seen:
+                seen.add(operation)
+                unique_removed.append(item)
+        unique_removed.reverse()
+
+        return {
+            "recently_removed_operations": unique_removed,
+            "tabu_reintroductions": [
+                item["operation"]
+                for item in unique_removed
+                if item.get("operation") not in allowed_reintroductions
+            ],
+            "allowed_reintroductions": sorted(allowed_reintroductions),
+            "policy": (
+                "Do not re-add tabu_reintroductions in the next Critic mutation set. "
+                "They were removed by earlier Critic feedback and have not shown a material failed-run regression."
+            ),
+        }
+
+    @staticmethod
+    def _mutation_reversal_error(mutation: Dict[str, Any], mutation_memory: Dict[str, Any]) -> str:
+        tabu = {
+            str(operation)
+            for operation in (mutation_memory.get("tabu_reintroductions", []) or [])
+            if operation
+        }
+        if not tabu:
+            return ""
+        kind = mutation.get("type")
+        operation = ""
+        if kind == "add":
+            node = mutation.get("node") if isinstance(mutation.get("node"), dict) else {}
+            operation = str(node.get("operation") or "")
+        elif kind == "replace":
+            operation = str(mutation.get("new_operation") or "")
+        if operation in tabu:
+            return f"operation '{operation}' was recently removed by Critic feedback"
+        return ""
 
     @staticmethod
     def _mutation_validation_error(mutation: Dict[str, Any], graph: Dict[str, Any], dc: DataContext) -> str:

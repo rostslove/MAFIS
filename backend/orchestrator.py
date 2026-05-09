@@ -98,6 +98,8 @@ async def run_orchestration_stream(
         industrial_strategy=(str(industrial_strategy or "default").strip().lower() or "default"),
         industrial_strategy_params=dict(industrial_strategy_params or {}),
     )
+    normalized_previous_evaluations = _normalize_previous_evaluations(previous_evaluations or [])
+    data_context.iteration_history = _iteration_records_from_previous_evaluations(normalized_previous_evaluations)
     yield _event(
         "status",
         message=f"Data profiled: {profile.get('n_samples')} samples, {profile.get('n_features')} numeric features",
@@ -316,7 +318,7 @@ async def run_orchestration_stream(
                 yield _event("error", message=f"Evaluation failed: {str(exc)[:200]}")
 
         yield _event("agent_start", agent="Scribe", iteration=0, step="final")
-        previous_evaluations = _normalize_previous_evaluations(previous_evaluations or [])
+        previous_evaluations = normalized_previous_evaluations
         best_evaluation = _get_best_evaluation(all_results, previous_evaluations)
         current_vs_best = _compare_current_to_best(all_results, best_evaluation)
         scribe_result = await scribe.execute(
@@ -713,6 +715,7 @@ def _compact_current_evaluation(item: Dict[str, Any], source: str = "current") -
     engineer = item.get("engineer", {}) or {}
     metrics = engineer.get("test_metrics", {}) or engineer.get("graph_metrics", {}) or {}
     train_metrics = engineer.get("train_metrics", {}) or {}
+    critic = item.get("critic", {}) or {}
     return {
         "source": source,
         "iteration": item.get("iteration"),
@@ -721,7 +724,8 @@ def _compact_current_evaluation(item: Dict[str, Any], source: str = "current") -
         "primary_metric": _metric_name_from_evaluation(item, "score"),
         "test_metrics": metrics,
         "train_metrics": train_metrics,
-        "critic_decision": (item.get("critic", {}) or {}).get("winner", ""),
+        "critic_decision": critic.get("winner", ""),
+        "suggested_mutations": critic.get("suggested_mutations", []) or [],
         "graph": _graph_from_evaluation(item),
         "summary": item.get("summary", ""),
     }
@@ -744,10 +748,33 @@ def _normalize_previous_evaluations(items: List[Dict[str, Any]]) -> List[Dict[st
             "test_metrics": item.get("test_metrics", {}) or {},
             "train_metrics": item.get("train_metrics", {}) or {},
             "critic_decision": item.get("critic_decision", ""),
+            "suggested_mutations": item.get("suggested_mutations", []) or [],
             "graph": _graph_from_evaluation(item),
             "summary": item.get("summary", ""),
         })
     return normalized[:10]
+
+
+def _iteration_records_from_previous_evaluations(items: List[Dict[str, Any]]) -> List[IterationRecord]:
+    records: List[IterationRecord] = []
+    for idx, item in enumerate(items or []):
+        graph = _graph_from_evaluation(item)
+        if not graph:
+            continue
+        records.append(
+            IterationRecord(
+                iteration=-(idx + 1),
+                graph=graph,
+                graph_score=float(item.get("score") or 0.0),
+                winner=str(item.get("critic_decision") or ""),
+                suggested_mutations=[
+                    mutation
+                    for mutation in (item.get("suggested_mutations", []) or [])
+                    if isinstance(mutation, dict)
+                ],
+            )
+        )
+    return records[:10]
 
 
 def _get_best_evaluation(current_results: List[Dict[str, Any]], previous_evaluations: List[Dict[str, Any]]) -> Dict[str, Any]:
