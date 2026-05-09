@@ -128,8 +128,8 @@ mcp = LocalMCPRegistry("MAFISTools")
 
 _LAST: Dict[str, Any] = {"pipeline": None, "graph": None, "input_data": None, "predictions": None}
 
-TRAIN_ONLY_OPS = {"resample"}
-DATA_BOUNDARY_PREPROCESSING_OPS = {"one_hot_encoding", "label_encoding"}
+TRAIN_ONLY_OPS = {"resample", "class_decompose"}
+DATA_BOUNDARY_PREPROCESSING_OPS = {"one_hot_encoding", "label_encoding", "cat_features"}
 EXECUTION_ADAPTER_OPS = TRAIN_ONLY_OPS | DATA_BOUNDARY_PREPROCESSING_OPS
 CATBOOST_OPS = {"catboost", "catboostreg"}
 LGBM_OPS = {"lgbm", "lgbmreg"}
@@ -352,6 +352,13 @@ def _apply_train_only_operations(train_data: Any, train_only_nodes: List[Dict[st
     updated = train_data
     for node in train_only_nodes:
         operation = node.get("operation")
+        if operation == "class_decompose":
+            notes.append(
+                f"Operation '{node.get('id')}' (class_decompose) was removed from the executable graph: "
+                "FEDOT class decomposition requires both a model-prediction parent and a data parent, "
+                "which is not supported by the current linear initial_assumption graph dialect."
+            )
+            continue
         if operation != "resample":
             continue
         before = _sample_count(updated)
@@ -485,6 +492,11 @@ def _apply_data_boundary_preprocessing(
             notes.append(
                 f"Operation '{node.get('id')}' (label_encoding) was executed by the data loader's "
                 "categorical factorization and removed from the executable initial_assumption graph."
+            )
+        elif operation == "cat_features":
+            notes.append(
+                f"Operation '{node.get('id')}' (cat_features) was treated as a categorical metadata marker: "
+                "backend loaded FEDOT InputData with categorical_idx/numerical_idx metadata and removed the dummy upstream node."
             )
     return updated_train, updated_test, notes
 
@@ -1185,7 +1197,7 @@ def get_available_operations(task_type: str) -> str:
 
 @mcp.tool()
 def propose_graph(graph_json: str) -> str:
-    """Validate and register a structure-only graph. Node params are ignored."""
+    """Validate and register a graph. Node params are preserved as fixed runtime hints."""
     try:
         graph = PipelineGraph.from_dict(json.loads(graph_json))
         ok, msg = graph.validate()

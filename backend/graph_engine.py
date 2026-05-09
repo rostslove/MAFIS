@@ -350,6 +350,25 @@ def _is_industrial_native_model(operation: str) -> bool:
 
 
 def _operation_runtime_contract(operation: str) -> Dict[str, str]:
+    if operation == "cat_features":
+        return {
+            "runtime_family": "fedot_data_boundary_preprocessing",
+            "data_contract": "categorical_metadata_marker",
+            "compatibility_note": (
+                "Fedot.Industrial registers cat_features as a dummy/excluded operation. "
+                "MAFIS treats it as a data-boundary marker: categorical_idx/numerical_idx "
+                "metadata is preserved and the dummy graph node is removed before finetune."
+            ),
+        }
+    if operation == "class_decompose":
+        return {
+            "runtime_family": "unsupported_current_graph_dialect",
+            "data_contract": "requires_model_and_data_parents",
+            "compatibility_note": (
+                "FEDOT class decomposition requires a model-prediction parent and a data parent. "
+                "The current initial_assumption graph dialect cannot execute it as a linear preprocessing node."
+            ),
+        }
     if operation == "resample":
         return {
             "runtime_family": "fedot_train_only_preprocessing",
@@ -414,6 +433,12 @@ def _operation_runtime_contract(operation: str) -> Dict[str, str]:
 
 def _operation_execution_hints(operation: str) -> Dict[str, Any]:
     hints: Dict[str, Any] = {}
+    if operation == "cat_features":
+        hints["requires_categorical_metadata"] = True
+        hints["runtime_adapter"] = "data_boundary_categorical_metadata"
+    if operation == "class_decompose":
+        hints["unsupported_initial_assumption"] = True
+        hints["runtime_adapter"] = "drop_unsupported_class_decompose"
     if operation in {"one_hot_encoding", "label_encoding"}:
         hints["requires_categorical_metadata"] = True
         hints["runtime_adapter"] = "data_boundary_categorical_encoding"
@@ -1213,8 +1238,8 @@ def get_operation_catalog(task_type: str) -> Dict[str, List[Dict[str, Any]]]:
 class GraphNode:
     id: str
     operation: str
-    # MAFIS graphs are structural assumptions only. Fedot.Industrial owns
-    # operation/model hyperparameter tuning during finetune.
+    # Graph params are fixed runtime hints. Fedot.Industrial still owns model
+    # hyperparameter tuning during finetune unless the backend adapts a value.
     params: Dict[str, Any] = field(default_factory=dict)
     inputs: List[str] = field(default_factory=list)
 
@@ -1237,7 +1262,8 @@ class PipelineGraph:
         nodes = []
         for raw_node in d.get("nodes", []):
             spec = dict(raw_node)
-            spec["params"] = {}
+            params = spec.get("params", {})
+            spec["params"] = dict(params) if isinstance(params, dict) else {}
             spec["inputs"] = list(spec.get("inputs", []) or [])
             nodes.append(GraphNode(**spec))
         task_type = d.get("task_type", "classification")
@@ -1390,10 +1416,11 @@ class PipelineGraph:
 
         if op == "add":
             spec = mutation.get("node", {})
+            params = spec.get("params", {})
             nodes.append(GraphNode(
                 id=spec["id"],
                 operation=spec["operation"],
-                params={},
+                params=dict(params) if isinstance(params, dict) else {},
                 inputs=spec.get("inputs", []),
             ))
             # Optionally re-route an existing node to consume the new node
@@ -1426,10 +1453,11 @@ class PipelineGraph:
         elif op == "replace":
             nid = mutation["node_id"]
             new_op = mutation["new_operation"]
+            params = mutation.get("params", {})
             for n in nodes:
                 if n.id == nid:
                     n.operation = new_op
-                    n.params = {}
+                    n.params = dict(params) if isinstance(params, dict) else {}
 
         elif op == "connect":
             nid = mutation["node_id"]

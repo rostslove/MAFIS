@@ -609,7 +609,6 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
             "summary": "Fedot.Industrial failed across multiple graph variants; review the attempt sequence before applying graph mutations.",
             "technical_message": original_error[:2000],
             "recovery_attempts": rows,
-            "recommendations": cls._runtime_recommendations(rows),
             "recoverable": True,
         }
 
@@ -637,48 +636,6 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
             return f"{' + '.join(inputs)} -> {op}" if inputs else op
 
         return " | ".join(render(str(root)) for root in roots if root) or "empty_graph"
-
-    @classmethod
-    def _runtime_recommendations(cls, attempts: List[Dict[str, Any]]) -> List[str]:
-        signatures = {str(item.get("error_signature") or "") for item in attempts if isinstance(item, dict)}
-        recommendations: List[str] = []
-        if "categorical_encoder_metadata" in signatures:
-            recommendations.append(
-                "Retry with automatically detected categorical metadata; if the encoder still fails, remove or replace the explicit categorical encoder node."
-            )
-        if "catboost_border_count_max_bin" in signatures:
-            recommendations.append(
-                "Sanitize CatBoost tuning search space so border_count is not tuned while max_bin is present in upstream defaults."
-            )
-        if "resample_train_only_transform" in signatures:
-            recommendations.append(
-                "Execute resample as a train-only data-boundary step instead of keeping it as a predict-time graph node."
-            )
-        if "fedot_output_mode_api" in signatures:
-            recommendations.append(
-                "Execute explicit FEDOT preprocessing nodes through a data-boundary adapter when Fedot.Industrial predict_for_fit passes output_mode to an incompatible upstream strategy."
-            )
-        if "model_eval_set_required" in signatures:
-            recommendations.append(
-                "Disable eval-set early stopping for model nodes in this Fedot.Industrial finetune path unless an eval_set and eval_metric are provided."
-            )
-        if "sklearn_dimensionality" in signatures:
-            recommendations.append(
-                "Do not keep the shape-changing preprocessing path with a sklearn tabular model until a shape adapter is available."
-            )
-        if "fedot_predict_preprocessor_state" in signatures:
-            recommendations.append(
-                "Treat the finetune result as failed at prediction time; direct-fit metrics are only fallback baseline metrics."
-            )
-        if "object_array_to_tensor" in signatures:
-            recommendations.append(
-                "Encode categorical feature values numerically before Fedot.Industrial finetune while preserving categorical column metadata for graph preprocessors."
-            )
-        if "feature_names_indexing" in signatures:
-            recommendations.append(
-                "Pass feature names as an indexable array in FEDOT InputData metadata before relying on direct-fit fallback."
-            )
-        return recommendations
 
     @classmethod
     def _append_failure_localization(
@@ -865,9 +822,6 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
             "evidence": cls._unique_text(evidence),
             "ruled_out_nodes": cls._unique_node_records(ruled_out_nodes),
             "runtime_issue": runtime_issue,
-            "recommendations": cls._runtime_recommendations([
-                {"error_signature": cls._error_signature(error_text)}
-            ]),
             "recoverable": True,
         }
 
@@ -882,6 +836,10 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
             return "categorical_encoder_metadata"
         if "only one of the parameters border_count, max_bin" in text:
             return "catboost_border_count_max_bin"
+        if "impossible to obtain custom preprocessing strategy" in text:
+            return "custom_preprocessing_strategy_unavailable"
+        if "no attribute 'transform'" in text and "class_decompose" in text:
+            return "class_decompose_unsupported"
         if "no attribute 'transform'" in text and "resample" in text:
             return "resample_train_only_transform"
         if (
