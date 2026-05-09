@@ -9,7 +9,7 @@ import pandas as pd
 
 from agents import Architect, ArchitectResult, Critic, CriticFeedback, DataContext, Engineer, EngineerResult, IterationRecord, Scribe
 from data_profiler import DataProfiler
-from graph_engine import SUPPORTED_TASKS, PipelineGraph, is_ts_task
+from graph_engine import SUPPORTED_TASKS, PipelineGraph, is_industrial_native_model, is_ts_task
 from mcp_client import MCPToolClient
 from path_utils import describe_missing_csv, normalize_csv_path
 
@@ -51,6 +51,14 @@ def _execute_engineer_sync(
 ) -> EngineerResult:
     """Run long local MCP training away from the SSE event loop."""
     return asyncio.run(engineer.execute(architect_result, data_context))
+
+
+def _graph_has_industrial_native_model(graph: Dict[str, Any]) -> bool:
+    return any(
+        is_industrial_native_model(str(node.get("operation") or ""))
+        for node in graph.get("nodes", [])
+        if isinstance(node, dict)
+    )
 
 
 async def run_orchestration_stream(
@@ -193,7 +201,16 @@ async def run_orchestration_stream(
                     data_context.task_type,
                     data_context.primary_metric or "",
                 )
-                if strategy_name != "default":
+                industrial_fit_only = _graph_has_industrial_native_model(architect_result.graph)
+                if industrial_fit_only:
+                    yield _event(
+                        "status",
+                        message=(
+                            "Engineer is fitting the Industrial-native model through Fedot.Industrial. "
+                            "The tuner is skipped for this graph."
+                        ),
+                    )
+                elif strategy_name != "default":
                     yield _event(
                         "status",
                         message=(
@@ -218,7 +235,9 @@ async def run_orchestration_stream(
                     if engineer_task.done():
                         break
                     elapsed = int(time.monotonic() - engineer_started)
-                    if strategy_name != "default":
+                    if industrial_fit_only:
+                        message = "Still fitting the Industrial-native model through Fedot.Industrial."
+                    elif strategy_name != "default":
                         message = (
                             f"Still running '{strategy_name}'. Fedot.Industrial may be fitting "
                             "several internal branch pipelines."

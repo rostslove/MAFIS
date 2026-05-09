@@ -349,6 +349,11 @@ def _is_industrial_native_model(operation: str) -> bool:
     )
 
 
+def is_industrial_native_model(operation: str) -> bool:
+    """Return True for model operations backed by Fedot.Industrial repositories."""
+    return _is_industrial_native_model(operation)
+
+
 def _operation_runtime_contract(operation: str) -> Dict[str, str]:
     if operation == "cat_features":
         return {

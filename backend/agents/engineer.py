@@ -54,6 +54,9 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
                 result.graph_error = graph_run.get("error", "") or ""
                 result.finetune_error = graph_run.get("finetune_error", "") or ""
                 result.finetune_traceback = graph_run.get("finetune_traceback", "") or ""
+                result.fit_mode = graph_run.get("fit_mode", "") or ""
+                result.finetune_skipped = bool(graph_run.get("finetune_skipped", False))
+                result.finetune_skip_reason = graph_run.get("finetune_skip_reason", "") or ""
                 result.fallback_used = graph_run.get("fallback_used", "") or ""
                 result.target_info = graph_run.get("target_info", {}) or result.target_info
                 result.training_notes.extend(graph_run.get("training_notes", []) or [])

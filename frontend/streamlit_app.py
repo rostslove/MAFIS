@@ -575,11 +575,15 @@ def render_training_journal(engineer: Dict[str, Any]) -> None:
     strategy = engineer.get("industrial_strategy") or "default"
     context = engineer.get("industrial_repository_context") or "fedot_industrial"
     data_type = engineer.get("industrial_data_type") or ""
+    fit_mode = engineer.get("fit_mode") or ""
+    finetune_skipped = bool(engineer.get("finetune_skipped"))
     n_jobs = engineer.get("n_jobs") or (engineer.get("industrial_strategy_params", {}) or {}).get("n_jobs")
 
     summary_bits = [f"strategy={strategy}", f"context={context}"]
     if data_type:
         summary_bits.append(f"data_type={data_type}")
+    if fit_mode:
+        summary_bits.append(f"fit_mode={fit_mode}")
     if n_jobs:
         summary_bits.append(f"n_jobs={n_jobs}")
     if split:
@@ -588,9 +592,14 @@ def render_training_journal(engineer: Dict[str, Any]) -> None:
     blocks.append(
         "<div class='training-journal-entry done'>"
         "<div class='training-journal-label'>Execution</div>"
-        "<div class='training-journal-text'>Fedot.Industrial training path</div>"
+        "<div class='training-journal-text'>{path_text}</div>"
         "<div class='training-journal-meta'>{meta}</div>"
-        "</div>".format(meta=_escape(", ".join(bit for bit in summary_bits if bit and not bit.endswith("="))))
+        "</div>".format(
+            path_text=_escape(
+                "Fedot.Industrial fit-only path" if finetune_skipped else "Fedot.Industrial training path"
+            ),
+            meta=_escape(", ".join(bit for bit in summary_bits if bit and not bit.endswith("="))),
+        )
     )
 
     for row in log_rows:
@@ -2053,6 +2062,7 @@ def results_tab() -> None:
     primary_metric = metrics.get("primary_metric") or result.get("primary_metric") or "score"
     primary_value = metrics.get("primary_metric_value", engineer.get("graph_score", 0))
     fallback_used = engineer.get("fallback_used", "")
+    finetune_skipped = bool(engineer.get("finetune_skipped"))
     finetune_error = engineer.get("finetune_error", "")
     has_runtime_failure = bool(engineer.get("graph_error")) or bool(finetune_error)
 
@@ -2061,7 +2071,7 @@ def results_tab() -> None:
     col1.metric(
         f"Test {primary_metric}",
         format_number(primary_value),
-        delta=("(fallback)" if fallback_used else None),
+        delta=("(fallback)" if fallback_used else ("(fit-only)" if finetune_skipped else None)),
     )
     col2.metric("Critic decision", decision_label(critic.get("winner", "")))
     col3.metric("Suggested changes", len(critic.get("suggested_mutations", []) or []))

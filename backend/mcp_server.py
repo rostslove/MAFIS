@@ -30,7 +30,7 @@ from data_profiler import DataProfiler
 from graph_engine import (
     OPERATIONS, METRICS_BY_TASK, SUPPORTED_TASKS, DEFAULT_GRAPHS, INDUSTRIAL_GRAPH_TEMPLATES,
     PipelineGraph, compute_metrics, get_operation_catalog, get_training_strategies,
-    get_training_strategy_hints, is_ts_task,
+    get_training_strategy_hints, is_industrial_native_model, is_ts_task,
     industrial_tuple_sample_count, input_sample_count, load_industrial_tuple_data,
     load_input_data, make_tabular_input_data_like, slice_input_data,
     split_industrial_tuple_data, split_input_data,
@@ -157,6 +157,14 @@ def _predict_pipeline(pipeline, data, task_type: str) -> np.ndarray:
 
 def _graph_operation_names(graph: PipelineGraph) -> List[str]:
     return [node.operation for node in graph.nodes]
+
+
+def _industrial_native_model_ops(graph: PipelineGraph) -> List[str]:
+    return [
+        node.operation
+        for node in graph.nodes
+        if is_industrial_native_model(node.operation)
+    ]
 
 
 def _is_tuple_data(data: Any) -> bool:
@@ -845,13 +853,14 @@ def _train_via_finetune(
     industrial_strategy: str,
     industrial_strategy_params: Optional[Dict[str, Any]],
     timeout: int,
+    fit_only: bool = False,
+    fit_only_reason: str = "",
 ) -> Dict[str, Any]:
-    """Run the architect-approved graph as ``initial_assumption`` through
-    Fedot.Industrial's finetune flow.
+    """Run the architect-approved graph through Fedot.Industrial.
 
-    The graph is treated as a hypothesis; FedotIndustrial.finetune polishes its
-    hyperparameters and returns a fitted solver we then score on the held-out
-    test split.
+    The usual path treats the graph as a hypothesis and tunes it. ``fit_only``
+    keeps Fedot.Industrial's data/backend lifecycle but asks it to only fit the
+    supplied graph via the ``return_only_fitted`` path, without running a tuner.
     """
     from fedot_ind.api.main import FedotIndustrial
 
@@ -932,7 +941,7 @@ def _train_via_finetune(
         )
 
     industrial = FedotIndustrial(**api_config)
-    patched_search_space = _catboost_search_space_adapter(executable_graph)
+    patched_search_space = [] if fit_only else _catboost_search_space_adapter(executable_graph)
     if patched_search_space:
         _record_training_event(
             training_events,
@@ -944,35 +953,65 @@ def _train_via_finetune(
         )
     builder = _graph_to_pipeline_builder(executable_graph)
     try:
-        finetune_kwargs = {
-            "tuning_params": {"tuning_iterations": 5, "n_jobs": n_jobs},
-            "model_to_tune": builder,
-            "return_only_fitted": False,
-        }
-        _record_training_event(
-            training_events,
-            "finetune",
-            "running",
-            "Fedot.Industrial finetune started.",
-            run_started_at,
-            n_jobs=n_jobs,
-            tuning_iterations=5,
-        )
-        heartbeat_stop = _start_training_heartbeat(run_label, "finetune")
-        try:
-            industrial.finetune(
-                train_data=train,
-                **finetune_kwargs,
+        if fit_only:
+            fit_kwargs = {
+                "tuning_params": {"tuning_iterations": 0, "n_jobs": n_jobs},
+                "model_to_tune": builder,
+                "return_only_fitted": True,
+            }
+            _record_training_event(
+                training_events,
+                "industrial_fit",
+                "running",
+                "Fedot.Industrial fit-only started.",
+                run_started_at,
+                n_jobs=n_jobs,
             )
-        finally:
-            heartbeat_stop.set()
-        _record_training_event(
-            training_events,
-            "finetune",
-            "done",
-            "Fedot.Industrial finetune completed.",
-            run_started_at,
-        )
+            heartbeat_stop = _start_training_heartbeat(run_label, "industrial_fit")
+            try:
+                industrial.finetune(
+                    train_data=train,
+                    **fit_kwargs,
+                )
+            finally:
+                heartbeat_stop.set()
+            _record_training_event(
+                training_events,
+                "industrial_fit",
+                "done",
+                "Fedot.Industrial fit-only completed.",
+                run_started_at,
+            )
+        else:
+            finetune_kwargs = {
+                "tuning_params": {"tuning_iterations": 5, "n_jobs": n_jobs},
+                "model_to_tune": builder,
+                "return_only_fitted": False,
+            }
+            _record_training_event(
+                training_events,
+                "finetune",
+                "running",
+                "Fedot.Industrial finetune started.",
+                run_started_at,
+                n_jobs=n_jobs,
+                tuning_iterations=5,
+            )
+            heartbeat_stop = _start_training_heartbeat(run_label, "finetune")
+            try:
+                industrial.finetune(
+                    train_data=train,
+                    **finetune_kwargs,
+                )
+            finally:
+                heartbeat_stop.set()
+            _record_training_event(
+                training_events,
+                "finetune",
+                "done",
+                "Fedot.Industrial finetune completed.",
+                run_started_at,
+            )
 
         fitted_pipeline = industrial.manager.solver
         _record_training_event(
@@ -1024,10 +1063,18 @@ def _train_via_finetune(
     _store_run(fitted_pipeline, executable_graph, train, test_preds)
     target_info = _target_info(csv_path, target_column, executable_graph.task_type)
 
-    notes = [
-        "Engineer ran Fedot.Industrial finetune over the architect's graph as the initial assumption.",
-        f"Fedot.Industrial tuning ran with n_jobs={n_jobs}.",
-    ]
+    if fit_only:
+        notes = [
+            "Engineer ran the graph through Fedot.Industrial fit-only lifecycle without hyperparameter tuning.",
+            f"Fedot.Industrial fit ran with n_jobs={n_jobs}.",
+        ]
+        if fit_only_reason:
+            notes.append(f"Finetune was skipped: {fit_only_reason}")
+    else:
+        notes = [
+            "Engineer ran Fedot.Industrial finetune over the architect's graph as the initial assumption.",
+            f"Fedot.Industrial tuning ran with n_jobs={n_jobs}.",
+        ]
     notes.extend(preprocessing_notes)
     notes.extend(train_only_notes)
     if data_boundary == "fedot_input_data_with_boundary_preprocessing":
@@ -1077,6 +1124,9 @@ def _train_via_finetune(
         "industrial_strategy_params": industrial_strategy_params or {},
         "industrial_data_type": data_type,
         "industrial_repository_context": repository_context,
+        "fit_mode": "fedot_industrial_fit_no_tune" if fit_only else "fedot_industrial_finetune",
+        "finetune_skipped": bool(fit_only),
+        "finetune_skip_reason": fit_only_reason if fit_only else "",
         "target_info": target_info,
         "training_notes": notes,
         "training_log": training_events,
@@ -1093,7 +1143,7 @@ def _train_direct(
     test_size: float,
     n_jobs: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Fallback path: fit the graph as-is without Fedot.Industrial finetune."""
+    """Fit the graph as-is without Fedot.Industrial finetune."""
     run_started_at = time.monotonic()
     training_events: List[Dict[str, Any]] = []
     resolved_n_jobs = n_jobs or _resolve_training_n_jobs()
@@ -1331,6 +1381,9 @@ def train_graph(
     - Runs ``FedotIndustrial.finetune`` with the task data_type attached to
       ``industrial_config``. ``industrial_strategy`` is only used for explicit
       strategy-specific execution such as ``federated_automl``.
+    - Fedot.Industrial-native model operations use Fedot.Industrial fit-only
+      execution: MAFIS skips the tuner but still trains and predicts through
+      the Fedot.Industrial lifecycle.
     - When finetune raises, returns the Fedot.Industrial failure by default.
       ``allow_direct_fallback`` is an explicit diagnostic baseline mode, not
       the normal Engineer path.
@@ -1354,6 +1407,31 @@ def train_graph(
         data_type = _fedot_config_data_type(graph.task_type)
         repository_context = _fedot_repository_context(strategy_name)
         n_jobs = _resolve_training_n_jobs(industrial_strategy_params)
+        industrial_model_ops = _industrial_native_model_ops(graph)
+
+        if industrial_model_ops:
+            logger.info(
+                "Skipping Fedot.Industrial finetune for Industrial-native model(s): %s",
+                ", ".join(industrial_model_ops),
+            )
+            skip_reason = (
+                "Graph contains Fedot.Industrial-native model operation(s): "
+                f"{', '.join(industrial_model_ops)}."
+            )
+            result = _train_via_finetune(
+                graph=graph,
+                csv_path=csv_path,
+                target_column=target_column,
+                forecast_length=forecast_length,
+                primary_metric=primary_metric,
+                test_size=ts,
+                industrial_strategy=strategy_name,
+                industrial_strategy_params=industrial_strategy_params,
+                timeout=timeout,
+                fit_only=True,
+                fit_only_reason=skip_reason,
+            )
+            return json.dumps(result)
 
         try:
             result = _train_via_finetune(

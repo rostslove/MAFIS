@@ -89,6 +89,9 @@ class EngineerResult:
     graph_error: str = ""
     finetune_error: str = ""
     finetune_traceback: str = ""
+    fit_mode: str = ""
+    finetune_skipped: bool = False
+    finetune_skip_reason: str = ""
     fallback_used: str = ""
     target_info: Dict[str, Any] = field(default_factory=dict)
     training_notes: List[str] = field(default_factory=list)
@@ -112,6 +115,9 @@ class EngineerResult:
             "graph_error": self.graph_error,
             "finetune_error": self.finetune_error,
             "finetune_traceback": self.finetune_traceback,
+            "fit_mode": self.fit_mode,
+            "finetune_skipped": self.finetune_skipped,
+            "finetune_skip_reason": self.finetune_skip_reason,
             "fallback_used": self.fallback_used,
             "target_info": self.target_info,
             "training_notes": self.training_notes,
