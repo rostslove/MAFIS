@@ -1,9 +1,11 @@
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Any, Dict
 
 import anyio
+import pandas as pd
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
@@ -31,6 +33,7 @@ from orchestrator import (
     run_orchestration_stream,
 )
 from m4_benchmark import M4_GROUPS, M4_TARGET_COLUMN, M4_TASK_TYPE, prepare_m4_dataset_csv
+from path_utils import describe_missing_csv, normalize_csv_path
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -126,6 +129,47 @@ def _payload_strategy(payload: Dict[str, Any]):
     if not isinstance(params, dict):
         params = {}
     return name, params
+
+
+async def dataset_path_load(request):
+    payload = await _json_body(request)
+    raw_path = str(payload.get("csv_path") or payload.get("path") or "").strip()
+    if not raw_path:
+        return _error("CSV path is required.", 400)
+
+    csv_path = normalize_csv_path(raw_path)
+    path = Path(csv_path)
+    if not path.exists() or not path.is_file():
+        return _error(describe_missing_csv(raw_path), 404)
+
+    try:
+        preview_rows = min(max(int(payload.get("preview_rows", 10) or 10), 1), 50)
+        preview_cols = min(max(int(payload.get("preview_columns", 10) or 10), 1), 50)
+        header = pd.read_csv(path, nrows=0)
+        columns = [str(column) for column in header.columns]
+        if not columns:
+            return _error("CSV has no columns.", 400)
+
+        shown_columns = columns[:preview_cols]
+        preview = pd.read_csv(path, usecols=shown_columns, nrows=preview_rows)
+
+        with path.open("rb") as handle:
+            row_count = max(sum(1 for _ in handle) - 1, 0)
+
+        return JSONResponse({
+            "csv_path": csv_path,
+            "csv_filename": path.name,
+            "n_samples": row_count,
+            "n_features": max(len(columns) - 1, 0),
+            "n_columns": len(columns),
+            "columns": columns,
+            "preview_columns": shown_columns,
+            "preview_records": preview.to_dict(orient="records"),
+            "size_mb": round(path.stat().st_size / (1024 * 1024), 2),
+        })
+    except Exception as exc:
+        logger.exception("Dataset path loading failed")
+        return _error(str(exc), 500)
 
 
 async def architect_chat(request):
@@ -277,6 +321,7 @@ routes = [
     Route("/health", health, methods=["GET"]),
     Route("/config", get_config, methods=["GET"]),
     Route("/tools", get_tools, methods=["GET"]),
+    Route("/datasets/path/load", dataset_path_load, methods=["POST"]),
     Route("/architect/chat", architect_chat, methods=["POST"]),
     Route("/architect/revise", architect_revise, methods=["POST"]),
     Route("/graph/mutate", graph_mutate, methods=["POST"]),

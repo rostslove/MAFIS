@@ -203,6 +203,33 @@ def save_uploaded_csv(uploaded_file) -> str:
     return str(path)
 
 
+def adopt_path_dataset(result: Dict[str, Any]) -> None:
+    """Use an existing backend-visible CSV path as the active dataset."""
+    csv_path = result.get("csv_path")
+    columns = list(result.get("columns") or [])
+    preview_columns = list(result.get("preview_columns") or columns[:10])
+    preview_records = list(result.get("preview_records") or [])
+    if not csv_path or not columns:
+        raise RuntimeError("Dataset loader did not return a usable CSV descriptor.")
+
+    st.session_state.df = pd.DataFrame(preview_records, columns=preview_columns)
+    st.session_state.dataset_shape = (
+        int(result.get("n_samples") or len(st.session_state.df)),
+        int(result.get("n_columns") or len(columns)),
+    )
+    st.session_state.dataset_columns = columns
+    st.session_state.dataset_preview_only = True
+    st.session_state.csv_path = csv_path
+    st.session_state.result = {}
+    st.session_state.evaluation_history = []
+    st.session_state.uploaded_signature = f"path:{csv_path}"
+    st.session_state.m4_dataset_info = {}
+
+    current_target = st.session_state.get("target_column")
+    if current_target not in columns:
+        st.session_state.target_column = "frequency_group" if "frequency_group" in columns else columns[-1]
+
+
 def current_payload(extra: Dict[str, Any] | None = None) -> Dict[str, Any]:
     payload = {
         "csv_path": st.session_state.get("csv_path", ""),
@@ -1346,6 +1373,21 @@ def sidebar(config: Dict[str, Any]) -> None:
             except Exception as exc:
                 st.error(f"Cannot read CSV: {exc}")
 
+        with st.expander("Load CSV by path"):
+            path_value = st.text_input(
+                "CSV path",
+                key="dataset_path_input",
+                placeholder="/app/data/my_dataset.csv",
+                help="Path must be visible to the backend container. For Docker, ./data is mounted as /app/data.",
+            )
+            if st.button("Load DataFrame", key="load_dataset_path", use_container_width=True):
+                try:
+                    result = post_json("/datasets/path/load", {"csv_path": path_value}, timeout=120)
+                    adopt_path_dataset(result)
+                    st.success(f"Loaded: {result.get('csv_filename', Path(path_value).name)}")
+                except Exception as exc:
+                    st.error(f"Cannot load CSV path: {exc}")
+
         if "df" in st.session_state:
             df = st.session_state.df
             n_rows, n_cols = active_dataset_shape()
@@ -2062,7 +2104,7 @@ def process_pending_m4_load() -> None:
         return
 
     try:
-        with st.spinner("Downloading/loading M4 and saving CSV..."):
+        with st.spinner("Downloading/loading M4 and preparing artifact..."):
             result = post_json("/benchmarks/m4/load", payload, timeout=900)
         adopt_m4_dataset(result)
         st.session_state.m4_load_success = (
@@ -2082,9 +2124,8 @@ def benchmarks_tab(config: Dict[str, Any]) -> None:
 
     st.write("M4 frequency-group classification")
     st.caption(
-        "Loads M4 train CSVs from the public M4 source and saves a fixed-length classification CSV "
-        "into the shared data directory. After loading, the rest of the pipeline is exactly the same "
-        "as for any uploaded CSV: pick a target, ask Architect for a graph, approve it, evaluate."
+        "Loads M4 train CSVs from the public M4 source and saves an optimized time-series "
+        "classification artifact. After loading, ask Architect for a graph, approve it, and evaluate."
     )
 
     selected_groups = st.multiselect(
@@ -2131,7 +2172,7 @@ def benchmarks_tab(config: Dict[str, Any]) -> None:
 
     if all_samples or full_history:
         st.warning(
-            "Loading all samples or full history can create a much larger CSV and make Industrial time-series "
+            "Loading all samples or full history can create a much larger artifact and make Industrial time-series "
             "feature extraction substantially slower."
         )
 
