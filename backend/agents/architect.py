@@ -49,6 +49,12 @@ explicitly say otherwise. For CSV feature matrices, the backend prepares numeric
 feature values before handing the native (X, y) tuple to Fedot.Industrial.
 Use runtime_contracts and fedot_industrial_meta_groups from available_operations
 to keep preprocessing/model contracts compatible.
+For ordinary non-time-series classification/regression over CSV feature
+matrices, do not propose Fedot.Industrial-native model operations such as
+industrial_* or models from fedot_automl_* / fedot_NN_* repository groups unless
+the user explicitly asks for Industrial models or the previous approved graph
+already uses them. They are valid but heavy, so prefer lighter tabular model
+families by default.
 Apply senior ML judgement when choosing preprocessing. Consider the data
 profile, model family assumptions, feature semantics, leakage risk,
 dimensionality, sparsity, missingness, categorical structure, and whether a
@@ -225,6 +231,11 @@ Return JSON only."""
             "runtime_contracts, runtime_adapters, and fedot_industrial_meta_groups from "
             "available_operations to avoid invalid contracts. Adapter-backed operations are allowed, "
             "but explain why their adapter semantics are useful for this graph.\n"
+            "For ordinary non-time-series classification/regression over CSV feature matrices, avoid "
+            "Fedot.Industrial-native model operations (for example industrial_* and models listed under "
+            "fedot_automl_* or fedot_NN_* meta groups) unless feedback/user notes explicitly ask for "
+            "Industrial models or the previous graph already uses them. These models are valid but "
+            "expensive; prefer lighter tabular model families by default.\n"
             "Act like an expert ML architect: choose preprocessing by reasoning about the data profile, "
             "model family assumptions, feature semantics, missingness, categorical structure, dimensionality, "
             "and whether the transform has a plausible benefit for the selected downstream model. "

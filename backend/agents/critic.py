@@ -59,6 +59,12 @@ profile, feature semantics, model family assumptions, leakage risk,
 dimensionality, missingness, and categorical structure. If a transform appears
 generic, redundant, or weakly connected to the selected downstream model,
 suggest simplifying the graph and explain the ML rationale.
+For ordinary non-time-series classification/regression over CSV feature
+matrices, do not suggest adding or replacing the model with Fedot.Industrial-
+native model operations such as industrial_* or models from fedot_automl_* /
+fedot_NN_* repository groups unless the user explicitly asked for Industrial
+models or the current graph already uses one. They are valid but heavy and slow,
+so prefer lighter tabular model families for default revisions.
 When operation catalog diagnostics include runtime_family, data_contract, or
 compatibility_note, treat those as the execution contract for Fedot.Industrial
 finetune and prefer fixes that keep Industrial repository operations compatible.
