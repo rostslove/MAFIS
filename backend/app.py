@@ -219,10 +219,14 @@ async def orchestrate(request):
 async def benchmark_m4_load(request):
     payload = await _json_body(request)
     try:
+        n_per_group_value = payload.get("n_per_group", 100)
+        window_length_value = payload.get("window_length", 50)
+        n_per_group = None if payload.get("all_samples") or n_per_group_value is None else int(n_per_group_value or 100)
+        window_length = None if payload.get("full_history") or window_length_value is None else int(window_length_value or 50)
         result = await anyio.to_thread.run_sync(
             lambda: prepare_m4_dataset_csv(
-                n_per_group=int(payload.get("n_per_group", 100) or 100),
-                window_length=int(payload.get("window_length", 50) or 50),
+                n_per_group=n_per_group,
+                window_length=window_length,
                 standardize=bool(payload.get("standardize", True)),
                 groups=payload.get("groups") or None,
             )

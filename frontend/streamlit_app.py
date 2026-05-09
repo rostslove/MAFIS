@@ -5,7 +5,7 @@ import hashlib
 import html
 import io
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import requests
@@ -1938,14 +1938,24 @@ def render_m4_dataset_info(info: Dict[str, Any]) -> None:
         return
     st.markdown("#### Loaded M4 Dataset")
     cols = st.columns(4)
+    window_label = str(info.get("window_length", 0))
+    if info.get("window_length_mode") == "full_history":
+        window_label = f"{window_label} (full)"
+    per_group_label = "All" if info.get("all_samples") else str(info.get("n_per_group", 0))
     cols[0].metric("Samples", info.get("n_samples", 0))
-    cols[1].metric("Window", info.get("window_length", 0))
+    cols[1].metric("Window", window_label)
     cols[2].metric("Groups", len(info.get("groups", []) or []))
-    cols[3].metric("Per group", info.get("n_per_group", 0))
+    cols[3].metric("Per group", per_group_label)
     st.caption(
         f"CSV: `{info.get('csv_path', '')}` - target column: `{info.get('target_column', '')}`. "
         "Open the Data, Architect, Graph Editor and Feedback tabs to run the standard pipeline."
     )
+    if info.get("window_length_mode") == "full_history":
+        st.caption(
+            "Full history mode: shorter series were padded on the left; "
+            f"source lengths min/mean/max = {info.get('min_series_length', '?')}/"
+            f"{info.get('mean_series_length', '?')}/{info.get('max_series_length', '?')}."
+        )
 
     balance = info.get("class_balance") or {}
     if balance:
@@ -1962,6 +1972,47 @@ def render_m4_dataset_info(info: Dict[str, Any]) -> None:
             st.dataframe(pd.DataFrame(source_files), use_container_width=True, hide_index=True)
 
 
+def queue_m4_dataset_load(
+    groups: List[str],
+    n_per_group: Optional[int],
+    window_length: Optional[int],
+    standardize: bool,
+    all_samples: bool,
+    full_history: bool,
+) -> None:
+    """Queue M4 loading so the next rerun handles it before rendering tabs."""
+    st.session_state.m4_pending_load = {
+        "groups": list(groups or DEFAULT_M4_GROUPS),
+        "n_per_group": None if all_samples else int(n_per_group or 100),
+        "window_length": None if full_history else int(window_length or 50),
+        "all_samples": bool(all_samples),
+        "full_history": bool(full_history),
+        "standardize": bool(standardize),
+    }
+    st.session_state.pop("m4_load_success", None)
+    st.session_state.pop("m4_load_error", None)
+
+
+def process_pending_m4_load() -> None:
+    """Apply queued M4 dataset changes before the rest of the UI renders."""
+    payload = st.session_state.pop("m4_pending_load", None)
+    if not payload:
+        return
+
+    try:
+        with st.spinner("Downloading/loading M4 and saving CSV..."):
+            result = post_json("/benchmarks/m4/load", payload, timeout=900)
+        adopt_m4_dataset(result)
+        st.session_state.m4_load_success = (
+            f"M4 dataset loaded: {result.get('n_samples', 0)} samples written to "
+            f"`{result.get('csv_filename', '')}`. Task type set to "
+            f"`{result.get('task_type', 'ts_classification')}`. "
+            "Switch to Architect or Graph Editor to continue."
+        )
+    except Exception as exc:
+        st.session_state.m4_load_error = f"M4 loading failed: {exc}"
+
+
 def benchmarks_tab(config: Dict[str, Any]) -> None:
     st.subheader("Benchmarks")
     bench_config = (config.get("benchmarks", {}) or {}).get("m4_classification", {})
@@ -1969,7 +2020,7 @@ def benchmarks_tab(config: Dict[str, Any]) -> None:
 
     st.write("M4 frequency-group classification")
     st.caption(
-        "Loads M4 train CSVs through datasetsforecast and saves a fixed-window classification CSV "
+        "Loads M4 train CSVs from the public M4 source and saves a fixed-length classification CSV "
         "into the shared data directory. After loading, the rest of the pipeline is exactly the same "
         "as for any uploaded CSV: pick a target, ask Architect for a graph, approve it, evaluate."
     )
@@ -1978,8 +2029,23 @@ def benchmarks_tab(config: Dict[str, Any]) -> None:
         "M4 groups",
         groups,
         default=groups,
+        key="m4_groups",
         help="At least two groups are recommended because the benchmark is classification by frequency group.",
     )
+    option_cols = st.columns(2)
+    all_samples = option_cols[0].checkbox(
+        "Use all available series",
+        value=False,
+        key="m4_all_samples",
+        help="Load every available series from each selected M4 group instead of limiting rows per group.",
+    )
+    full_history = option_cols[1].checkbox(
+        "Use full available history",
+        value=False,
+        key="m4_full_history",
+        help="Use the longest loaded series as the window length and left-pad shorter series.",
+    )
+
     cols = st.columns(3)
     n_per_group = cols[0].number_input(
         "Series per group",
@@ -1987,6 +2053,8 @@ def benchmarks_tab(config: Dict[str, Any]) -> None:
         max_value=1000,
         value=int(bench_config.get("default_n_per_group", 100)),
         step=10,
+        key="m4_n_per_group",
+        disabled=all_samples,
     )
     window_length = cols[1].number_input(
         "Window length",
@@ -1994,43 +2062,44 @@ def benchmarks_tab(config: Dict[str, Any]) -> None:
         max_value=500,
         value=int(bench_config.get("default_window_length", 50)),
         step=5,
+        key="m4_window_length",
+        disabled=full_history,
     )
-    standardize = cols[2].checkbox("Standardize each series", value=True)
+    standardize = cols[2].checkbox("Standardize each series", value=True, key="m4_standardize")
+
+    if all_samples or full_history:
+        st.warning(
+            "Loading all samples or full history can create a much larger CSV and make Industrial time-series "
+            "feature extraction substantially slower."
+        )
 
     if len(selected_groups or []) < 2:
         st.warning("Select at least two M4 groups for a classification benchmark.")
 
     can_load = len(selected_groups or []) >= 2
-    if st.button(
+    st.button(
         "Load M4 Dataset",
         type="primary",
         use_container_width=True,
         key="m4_load_dataset",
         disabled=not can_load,
-    ):
-        payload = {
-            "groups": selected_groups or groups,
-            "n_per_group": int(n_per_group),
-            "window_length": int(window_length),
-            "standardize": bool(standardize),
-        }
-        try:
-            with st.spinner("Downloading/loading M4 and saving CSV..."):
-                result = post_json("/benchmarks/m4/load", payload, timeout=900)
-            adopt_m4_dataset(result)
-            st.session_state.m4_load_success = (
-                f"M4 dataset loaded: {result.get('n_samples', 0)} samples written to "
-                f"`{result.get('csv_filename', '')}`. Task type set to "
-                f"`{result.get('task_type', 'ts_classification')}`. "
-                "Switch to Architect or Graph Editor to continue."
-            )
-            st.rerun()
-        except Exception as exc:
-            st.error(f"M4 loading failed: {exc}")
+        on_click=queue_m4_dataset_load,
+        args=(
+            selected_groups or groups,
+            None if all_samples else int(n_per_group),
+            None if full_history else int(window_length),
+            bool(standardize),
+            bool(all_samples),
+            bool(full_history),
+        ),
+    )
 
     success_message = st.session_state.pop("m4_load_success", "")
     if success_message:
         st.success(success_message)
+    error_message = st.session_state.pop("m4_load_error", "")
+    if error_message:
+        st.error(error_message)
 
     render_m4_dataset_info(st.session_state.get("m4_dataset_info") or {})
 
@@ -2171,6 +2240,7 @@ def main() -> None:
         st.session_state.industrial_strategy = "default"
     if "industrial_strategy_params" not in st.session_state:
         st.session_state.industrial_strategy_params = {}
+    process_pending_m4_load()
     config = load_config()
     sidebar(config)
     tools = load_tools()
