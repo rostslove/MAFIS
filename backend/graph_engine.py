@@ -1519,6 +1519,53 @@ def _load_benchmark_optimized_tuple(
     return X, y, metadata
 
 
+def _encode_benchmark_classification_target(y: np.ndarray, metadata: Dict[str, Any]) -> np.ndarray:
+    """Return numeric class ids for benchmark artifacts with string labels.
+
+    Fedot.Industrial neural models convert targets with ``torch.from_numpy``;
+    string/object labels fail there. Benchmark manifests keep the readable
+    labels, so we encode them at the data boundary before training.
+    """
+    y_arr = np.asarray(y)
+    if np.issubdtype(y_arr.dtype, np.number) or np.issubdtype(y_arr.dtype, np.bool_):
+        return y_arr
+
+    labels: List[str] = []
+    groups = metadata.get("groups") if isinstance(metadata, dict) else None
+    if isinstance(groups, list):
+        labels.extend(str(item) for item in groups)
+
+    group_labels = metadata.get("group_labels") if isinstance(metadata, dict) else None
+    if isinstance(group_labels, dict):
+        try:
+            ordered = [
+                value
+                for _, value in sorted(group_labels.items(), key=lambda item: int(item[0]))
+            ]
+        except (TypeError, ValueError):
+            ordered = list(group_labels.values())
+        labels.extend(str(item) for item in ordered)
+
+    observed = [str(item) for item in np.unique(y_arr.astype(str))]
+    labels.extend(item for item in observed if item not in labels)
+    labels = _unique(labels)
+    mapping = {label: code for code, label in enumerate(labels)}
+    encoded = np.fromiter(
+        (mapping[str(value)] for value in y_arr.astype(str)),
+        dtype=np.int64,
+        count=len(y_arr),
+    )
+    if isinstance(metadata, dict):
+        metadata["target_encoding"] = dict(mapping)
+        metadata["fedot_receives_encoded_target"] = True
+    logger.info(
+        "Encoded benchmark classification target for Fedot.Industrial: classes=%s dtype=%s",
+        mapping,
+        encoded.dtype,
+    )
+    return encoded
+
+
 def load_input_data(
     csv_path: str,
     target: str,
@@ -1531,7 +1578,9 @@ def load_input_data(
         X, y, metadata = optimized
         if task_type == "ts_forecasting":
             raise ValueError("Optimized benchmark artifacts are classification/regression windows, not forecasting series.")
-        if task_type in ("regression", "ts_regression"):
+        if task_type in ("classification", "ts_classification"):
+            y = _encode_benchmark_classification_target(y, metadata)
+        elif task_type in ("regression", "ts_regression"):
             try:
                 y = np.asarray(y).astype(float)
             except ValueError as exc:
@@ -1645,8 +1694,10 @@ def load_industrial_tuple_data(
     """
     optimized = _load_benchmark_optimized_tuple(csv_path, target, mmap_mode="r")
     if optimized is not None:
-        X, y, _ = optimized
-        if task_type in ("regression", "ts_regression"):
+        X, y, metadata = optimized
+        if task_type in ("classification", "ts_classification"):
+            y = _encode_benchmark_classification_target(y, metadata)
+        elif task_type in ("regression", "ts_regression"):
             try:
                 y = np.asarray(y).astype(float)
             except ValueError as exc:

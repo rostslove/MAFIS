@@ -1083,6 +1083,11 @@ def _train_via_finetune(
         ]
     notes.extend(preprocessing_notes)
     notes.extend(train_only_notes)
+    if target_info.get("fedot_receives_encoded_target") and target_info.get("reference_encoded"):
+        notes.append(
+            "Classification target labels were encoded to integer class ids before Fedot.Industrial training; "
+            "reference label mapping is shown in diagnostics."
+        )
     if data_boundary == "fedot_input_data_with_boundary_preprocessing":
         notes.append(
             "Explicit categorical preprocessing node detected; backend used FEDOT InputData at the data boundary instead of executing the upstream encoder as a graph node."
@@ -1224,6 +1229,11 @@ def _train_direct(
         notes.append(
             "LGBM eval-set early stopping was disabled for this fit path because no eval_set/eval_metric is supplied."
         )
+    if target_info.get("fedot_receives_encoded_target") and target_info.get("reference_encoded"):
+        notes.append(
+            "Classification target labels were encoded to integer class ids before FEDOT training; "
+            "reference label mapping is shown in diagnostics."
+        )
     if target_info.get("fedot_receives_raw_target") and target_info.get("reference_encoded"):
         notes.append(
             "Fedot graph received the raw string classification target; reference mapping is shown only for readable diagnostics."
@@ -1270,15 +1280,30 @@ def _target_info(csv_path: str, target_column: str, task_type: str) -> Dict[str,
             "raw_dtype": str(y.dtype),
             "unique_values": int(len(unique_values)),
             "sample_values": [str(v) for v in values[:10].tolist()],
-            "fedot_receives_raw_target": task_type in ("classification", "ts_classification"),
+            "fedot_receives_raw_target": False,
+            "fedot_receives_encoded_target": task_type in ("classification", "ts_classification"),
             "reference_encoded": False,
             "storage_format": metadata.get("storage_format"),
         }
         if task_type in ("classification", "ts_classification"):
-            encoder = LabelEncoder()
-            encoder.fit(values.astype(str))
+            labels: List[str] = []
+            groups = metadata.get("groups") if isinstance(metadata, dict) else None
+            if isinstance(groups, list):
+                labels.extend(str(item) for item in groups)
+            group_labels = metadata.get("group_labels") if isinstance(metadata, dict) else None
+            if isinstance(group_labels, dict):
+                try:
+                    ordered = [
+                        value
+                        for _, value in sorted(group_labels.items(), key=lambda item: int(item[0]))
+                    ]
+                except (TypeError, ValueError):
+                    ordered = list(group_labels.values())
+                labels.extend(str(item) for item in ordered)
+            labels.extend(str(item) for item in unique_values if str(item) not in labels)
+            labels = list(dict.fromkeys(labels))
             info["reference_encoded"] = True
-            info["reference_encoding"] = {str(label): int(code) for code, label in enumerate(encoder.classes_)}
+            info["reference_encoding"] = {str(label): int(code) for code, label in enumerate(labels)}
         return info
 
     df = pd.read_csv(csv_path, usecols=[target_column])
