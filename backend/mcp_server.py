@@ -1344,10 +1344,7 @@ def get_data_profile(csv_path: str, target_column: str, task_type: str = "classi
             profile["benchmark_id"] = metadata.get("benchmark_id")
             profile["benchmark_name"] = metadata.get("benchmark_name")
         else:
-            df = pd.read_csv(csv_path)
-            y = df[target_column] if target_column in df.columns else None
-            X = df.drop(columns=[target_column]) if target_column in df.columns else df
-            profile = DataProfiler.profile(X=X, y=y, task_type=task_type)
+            profile = DataProfiler.profile_csv(csv_path, target_column, task_type=task_type)
         profile["is_time_series"] = is_ts_task(task_type)
         return json.dumps(profile, default=str)
     except Exception as e:

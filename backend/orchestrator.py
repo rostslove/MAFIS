@@ -5,8 +5,6 @@ import os
 import time
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
-import pandas as pd
-
 from agents import Architect, ArchitectResult, Critic, CriticFeedback, DataContext, Engineer, EngineerResult, IterationRecord, Scribe
 from benchmarks import load_benchmark_artifact_data, load_benchmark_artifact_metadata
 from data_profiler import DataProfiler
@@ -36,12 +34,7 @@ def _profile_data(csv_path: str, target_column: str, task_type: str, forecast_le
         profile["benchmark_id"] = metadata.get("benchmark_id")
         profile["benchmark_name"] = metadata.get("benchmark_name")
     else:
-        df = pd.read_csv(csv_path)
-        if target_column not in df.columns:
-            raise ValueError(f"Target '{target_column}' not found")
-        X = df.drop(columns=[target_column])
-        y = df[target_column]
-        profile = DataProfiler.profile(X=X, y=y, task_type=task_type)
+        profile = DataProfiler.profile_csv(csv_path, target_column, task_type=task_type)
     profile["is_time_series"] = is_ts_task(task_type)
     if forecast_length:
         profile["forecast_length"] = forecast_length
