@@ -1461,10 +1461,14 @@ def data_tab() -> None:
     if not require_dataset():
         return
     df = st.session_state.df
+    n_rows, n_cols = active_dataset_shape()
+    preview = df.iloc[:10, :10]
     st.write(f"Path: `{st.session_state.csv_path}`")
-    st.dataframe(df.head(50), use_container_width=True)
-    st.write("Numeric summary")
-    st.dataframe(df.describe(include="all").transpose(), use_container_width=True)
+    st.caption(
+        f"Showing first {len(preview)} rows and {len(preview.columns)} columns "
+        f"of {n_rows} rows and {n_cols} columns."
+    )
+    st.dataframe(preview, use_container_width=True)
 
 
 def architect_tab(config: Dict[str, Any]) -> None:
