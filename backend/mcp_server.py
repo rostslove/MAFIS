@@ -422,6 +422,13 @@ def _to_dense_array(values: Any) -> np.ndarray:
 
 
 def _apply_one_hot_boundary(train_data: Any, test_data: Any) -> tuple[Any, Any, str]:
+    if _is_tuple_data(train_data):
+        return (
+            train_data,
+            test_data,
+            "Operation one_hot_encoding was moved to the data boundary, but native Industrial tuple data has no categorical metadata; no feature change was applied.",
+        )
+
     categorical_idx = _input_metadata_indices(train_data, "categorical_idx")
     train_features = np.asarray(train_data.features)
     test_features = np.asarray(test_data.features)
@@ -488,6 +495,23 @@ def _apply_one_hot_boundary(train_data: Any, test_data: Any) -> tuple[Any, Any, 
     )
 
 
+def _normalize_2d_rows(features: Any, norm: str, chunk_size: int = 2048) -> np.ndarray:
+    source = np.asarray(features)
+    dtype = np.float32 if np.issubdtype(source.dtype, np.floating) and source.dtype.itemsize <= 4 else float
+    normalized = np.empty(source.shape, dtype=dtype)
+    for start in range(0, source.shape[0], chunk_size):
+        stop = min(start + chunk_size, source.shape[0])
+        block = np.asarray(source[start:stop], dtype=dtype)
+        if norm == "l1":
+            denominator = np.sum(np.abs(block), axis=1, keepdims=True)
+        elif norm == "max":
+            denominator = np.max(np.abs(block), axis=1, keepdims=True)
+        else:
+            denominator = np.sqrt(np.sum(block * block, axis=1, keepdims=True))
+        normalized[start:stop] = block / np.where(denominator > 0, denominator, 1.0)
+    return normalized
+
+
 def _apply_normalization_boundary(
     train_data: Any,
     test_data: Any,
@@ -497,6 +521,28 @@ def _apply_normalization_boundary(
     norm = str(params.get("norm") or "l2")
     if norm not in {"l1", "l2", "max"}:
         norm = "l2"
+
+    if _is_tuple_data(train_data):
+        train_features, train_target = train_data
+        test_features, test_target = test_data
+        train_features_arr = np.asarray(train_features)
+        test_features_arr = np.asarray(test_features)
+        if train_features_arr.ndim != 2 or test_features_arr.ndim != 2:
+            return (
+                train_data,
+                test_data,
+                f"Operation normalization was moved to the data boundary, but native tuple features were not 2D "
+                f"(train_shape={train_features_arr.shape}, test_shape={test_features_arr.shape}); no feature change was applied.",
+            )
+        return (
+            (_normalize_2d_rows(train_features_arr, norm), train_target),
+            (_normalize_2d_rows(test_features_arr, norm), test_target),
+            (
+                "Operation normalization was executed as a native Industrial tuple row-wise transform "
+                f"(norm={norm}, train_shape={train_features_arr.shape}, test_shape={test_features_arr.shape}) "
+                "and removed from the executable initial_assumption graph."
+            ),
+        )
 
     train_features = np.asarray(train_data.features)
     test_features = np.asarray(test_data.features)
