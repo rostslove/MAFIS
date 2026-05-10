@@ -20,7 +20,6 @@ from m4_benchmark import (
     load_m4_artifact_data,
     load_m4_artifact_metadata,
     prepare_m4_dataset_csv,
-    profile_m4_artifact,
 )
 
 
@@ -143,20 +142,4 @@ def load_benchmark_artifact_data(
         loaded_metadata.setdefault("benchmark_id", M4_BENCHMARK_ID)
         loaded_metadata.setdefault("benchmark_name", get_benchmark_catalog()[M4_BENCHMARK_ID]["name"])
         return X, y, loaded_metadata
-    raise ValueError(f"Benchmark artifact kind is not supported: {metadata.get('kind')}")
-
-
-def profile_benchmark_artifact(
-    path: str,
-    target_column: str = DEFAULT_BENCHMARK_TARGET_COLUMN,
-    task_type: str = M4_TASK_TYPE,
-) -> Dict[str, Any]:
-    metadata = load_benchmark_artifact_metadata(path)
-    if metadata is None:
-        raise ValueError(f"Not a registered benchmark artifact manifest: {path}")
-    if metadata.get("kind") == M4_ARTIFACT_KIND:
-        profile = profile_m4_artifact(path, target_column, task_type)
-        profile["benchmark_id"] = M4_BENCHMARK_ID
-        profile["benchmark_name"] = get_benchmark_catalog()[M4_BENCHMARK_ID]["name"]
-        return profile
     raise ValueError(f"Benchmark artifact kind is not supported: {metadata.get('kind')}")

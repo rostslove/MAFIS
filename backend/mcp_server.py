@@ -30,7 +30,6 @@ from benchmarks import (
     DEFAULT_BENCHMARK_TARGET_COLUMN,
     load_benchmark_artifact_data,
     load_benchmark_artifact_metadata,
-    profile_benchmark_artifact,
 )
 from data_profiler import DataProfiler
 from graph_engine import (
@@ -1334,13 +1333,21 @@ def get_data_profile(csv_path: str, target_column: str, task_type: str = "classi
     """Profile a CSV: returns factual dataset shape, target distribution and issues."""
     try:
         csv_path = normalize_csv_path(csv_path)
-        if load_benchmark_artifact_metadata(csv_path) is not None:
-            return json.dumps(profile_benchmark_artifact(csv_path, target_column, task_type), default=str)
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-
-    try:
-        profile = DataProfiler.profile_csv(csv_path, target_column, task_type=task_type)
+        metadata = load_benchmark_artifact_metadata(csv_path)
+        if metadata is not None:
+            expected_target = metadata.get("target_column", DEFAULT_BENCHMARK_TARGET_COLUMN)
+            if target_column != expected_target:
+                raise ValueError(f"Target '{target_column}' not found; benchmark artifact target is '{expected_target}'")
+            X, y, _ = load_benchmark_artifact_data(csv_path, mmap_mode="r")
+            profile = DataProfiler.profile(X=X, y=y, task_type=task_type)
+            profile["storage_format"] = metadata.get("storage_format")
+            profile["benchmark_id"] = metadata.get("benchmark_id")
+            profile["benchmark_name"] = metadata.get("benchmark_name")
+        else:
+            df = pd.read_csv(csv_path)
+            y = df[target_column] if target_column in df.columns else None
+            X = df.drop(columns=[target_column]) if target_column in df.columns else df
+            profile = DataProfiler.profile(X=X, y=y, task_type=task_type)
         profile["is_time_series"] = is_ts_task(task_type)
         return json.dumps(profile, default=str)
     except Exception as e:

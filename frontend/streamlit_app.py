@@ -211,13 +211,27 @@ def adopt_path_dataset(result: Dict[str, Any]) -> None:
     if not csv_path or not columns:
         raise RuntimeError("Dataset loader did not return a usable CSV descriptor.")
 
-    st.session_state.df = pd.DataFrame(preview_records, columns=preview_columns)
-    st.session_state.dataset_shape = (
-        int(result.get("n_samples") or len(st.session_state.df)),
-        int(result.get("n_columns") or len(columns)),
-    )
-    st.session_state.dataset_columns = columns
-    st.session_state.dataset_preview_only = True
+    full_df = None
+    try:
+        local_path = resolve_shared_data_path(csv_path)
+        if local_path.exists() and local_path.suffix.lower() == ".csv":
+            full_df = pd.read_csv(local_path)
+    except Exception:
+        full_df = None
+
+    if full_df is not None:
+        st.session_state.df = full_df
+        st.session_state.dataset_shape = tuple(full_df.shape)
+        st.session_state.dataset_columns = list(full_df.columns)
+        st.session_state.dataset_preview_only = False
+    else:
+        st.session_state.df = pd.DataFrame(preview_records, columns=preview_columns)
+        st.session_state.dataset_shape = (
+            int(result.get("n_samples") or len(st.session_state.df)),
+            int(result.get("n_columns") or len(columns)),
+        )
+        st.session_state.dataset_columns = columns
+        st.session_state.dataset_preview_only = True
     st.session_state.csv_path = csv_path
     st.session_state.result = {}
     st.session_state.evaluation_history = []
@@ -1447,20 +1461,10 @@ def data_tab() -> None:
     if not require_dataset():
         return
     df = st.session_state.df
-    n_rows, n_cols = active_dataset_shape()
-    preview = df.iloc[:10, :10]
-    preview_columns = list(preview.columns)
     st.write(f"Path: `{st.session_state.csv_path}`")
-    st.caption(
-        f"Showing first {len(preview)} rows and {len(preview.columns)} columns "
-        f"of {n_rows} rows and {n_cols} columns."
-    )
-    st.dataframe(preview, use_container_width=True)
+    st.dataframe(df.head(50), use_container_width=True)
     st.write("Numeric summary")
-    if preview_columns:
-        st.dataframe(df.loc[:, preview_columns].describe(include="all").transpose(), use_container_width=True)
-    else:
-        st.info("No columns available.")
+    st.dataframe(df.describe(include="all").transpose(), use_container_width=True)
 
 
 def architect_tab(config: Dict[str, Any]) -> None:
