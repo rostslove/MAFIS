@@ -11,7 +11,7 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 
-from m4_benchmark import (
+from .m4_benchmark import (
     M4_ARTIFACT_KIND,
     M4_GROUPS,
     M4_TARGET_COLUMN,

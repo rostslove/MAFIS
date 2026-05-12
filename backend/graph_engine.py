@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from path_utils import normalize_csv_path
+from utils.path_utils import normalize_csv_path
 
 try:
     from benchmarks import (
@@ -480,7 +480,7 @@ def _operation_execution_hints(operation: str) -> Dict[str, Any]:
     return hints
 
 
-# Local fallback is used only when Fedot.Industrial repository introspection is unavailable.
+# Used when repository introspection is unavailable.
 FALLBACK_OPERATIONS: Dict[str, Dict[str, List[str]]] = {
     "classification": {
         "preprocessing": [
@@ -688,7 +688,7 @@ def _build_framework_operations() -> Dict[str, Dict[str, List[str]]]:
     }
 
 
-# Atomic operations available per task type. Used for validation and proposal.
+# Operations accepted by validation and graph proposals.
 OPERATIONS: Dict[str, Dict[str, List[str]]] = _build_framework_operations()
 
 METRICS_BY_TASK: Dict[str, List[str]] = {
@@ -700,7 +700,7 @@ METRICS_BY_TASK: Dict[str, List[str]] = {
 }
 
 
-# Sensible default graph per task - used as starter / fallback.
+# Starter graph per task.
 DEFAULT_GRAPHS: Dict[str, List[Dict[str, Any]]] = {
     "classification": [
         {"id": "model", "operation": "industrial_stat_clf", "params": {}, "inputs": []},
@@ -1266,8 +1266,6 @@ def get_operation_catalog(task_type: str) -> Dict[str, List[Dict[str, Any]]]:
 class GraphNode:
     id: str
     operation: str
-    # Graph params are fixed runtime hints. Fedot.Industrial still owns model
-    # hyperparameter tuning during finetune unless the backend adapts a value.
     params: Dict[str, Any] = field(default_factory=dict)
     inputs: List[str] = field(default_factory=list)
 
@@ -1329,7 +1327,6 @@ class PipelineGraph:
                         "use inputs=[] when a node consumes raw data."
                     )
 
-        # Single root (node with no children)
         children: set[str] = set()
         for n in self.nodes:
             children.update(n.inputs)
@@ -1337,7 +1334,6 @@ class PipelineGraph:
         if len(roots) != 1:
             return False, f"Pipeline must have exactly one root, got {len(roots)}"
 
-        # Acyclicity check via topological sort
         try:
             self._topo_sorted()
         except ValueError as e:
@@ -1451,7 +1447,6 @@ class PipelineGraph:
                 params=dict(params) if isinstance(params, dict) else {},
                 inputs=spec.get("inputs", []),
             ))
-            # Optionally re-route an existing node to consume the new node
             after = mutation.get("rewire_input_of")
             if after:
                 for n in nodes:
@@ -1469,8 +1464,6 @@ class PipelineGraph:
                 rewired: List[str] = []
                 for inp in n.inputs:
                     if inp == nid:
-                        # Rewire children of the removed node to its parents so
-                        # the graph stays connected and keeps a single root.
                         for parent_id in bypass_inputs:
                             if parent_id != n.id and parent_id not in rewired:
                                 rewired.append(parent_id)
@@ -1500,7 +1493,7 @@ class PipelineGraph:
         return PipelineGraph(task_type=self.task_type, nodes=nodes)
 
 
-# ============== Data loading ==============
+# Data loading
 
 def _load_benchmark_optimized_tuple(
     dataset_path: str,
@@ -1662,8 +1655,6 @@ def load_input_data(
     if task_type in ("ts_classification", "ts_regression"):
         return _input_data(
             idx=np.arange(len(X)),
-            # Fedot.Industrial channel-independent TS operations expect
-            # channel-first tensors; one CSV row is one fixed-window series.
             features=X[np.newaxis, :, :],
             target=y,
             task=task,
@@ -1881,7 +1872,7 @@ def split_input_data(input_data: InputData, test_size: float = 0.2) -> Tuple[Inp
     return _basic_split_input_data(input_data, test_size=test_size)
 
 
-# ============== Metrics ==============
+# Metrics
 
 def compute_metrics(task_type: str, y_true, y_pred, primary_metric: Optional[str] = None) -> Dict[str, Any]:
     """Compute metrics for the task.

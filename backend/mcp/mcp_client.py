@@ -1,11 +1,4 @@
-"""
-Local MCP-style client for the multi-agent system.
-
-The official Python MCP SDK currently depends on Pydantic v2. Fedot.Industrial
-0.5.0 pulls spacy 3.5.x, which requires Pydantic v1. To keep one stable Poetry
-environment, this client calls the local tool registry in-process while exposing
-the same tool-call interface to agents.
-"""
+"""In-process client for the local tool registry."""
 
 import importlib.util
 import json
@@ -18,16 +11,18 @@ logger = logging.getLogger("MCP-Client")
 
 
 class MCPToolClient:
-    """Client that exposes MCP-style tool metadata and direct local calls."""
+    """Loads tool metadata and dispatches local calls."""
 
     def __init__(self):
         self._server_module: Optional[Any] = None
         self._tools_cache: Optional[List[Dict[str, Any]]] = None
         self._connected = False
 
-    async def connect(self, server_script: str = "mcp_server.py"):
+    async def connect(self, server_script: Optional[str] = None):
         """Load the local MCP tool registry."""
         try:
+            if server_script is None:
+                server_script = os.path.join(os.path.dirname(__file__), "mcp_server.py")
             server_path = os.path.abspath(server_script)
             server_dir = os.path.dirname(server_path)
             if server_dir not in sys.path:

@@ -48,27 +48,24 @@ Input: validated graph from Architect.
 
 Main tools:
 
-- `get_baselines`
-- `train_baseline`
 - `train_graph`
 
-Output: graph score, metrics, training notes, baseline comparison.
+Output: graph score, train/test metrics, training notes, and runtime diagnostics.
 
 Engineer does not tune node hyperparameters. It fits the graph as proposed and reports recovery feedback when an optional node fails.
 Operation catalogs include Fedot.Industrial search-space metadata, so Architect and Critic can choose explicit parameters from framework-supported ranges. Time-series starter graphs use Fedot.Industrial feature-fusion templates with parallel extractor branches where available.
 
 ### Critic
 
-Input: graph, Engineer metrics, baseline metrics.
+Input: graph and Engineer metrics.
 
 Main tools:
 
 - `validate_graph`
-- `analyze_errors`
 - `get_node_importance`
 - `explain_graph`
 
-Output: assessment, winner (`graph` or `baseline`), strengths, weaknesses, suggested graph mutations, stop decision.
+Output: assessment, winner decision, strengths, weaknesses, suggested graph mutations, stop decision.
 
 ### Scribe
 
@@ -141,7 +138,10 @@ The Streamlit app is organized around graph approval:
 ## Main Files
 
 - `backend/graph_engine.py` - graph schema, validation, mutation, Fedot conversion, metrics.
-- `backend/mcp_server.py` - MCP tools for profiling, graph validation, training, validation, reporting.
+- `backend/mcp/mcp_server.py` - MCP tools for profiling, graph validation, training, validation, reporting.
+- `backend/mcp/mcp_client.py` - local MCP-style adapter used by agents.
+- `backend/benchmarks/` - benchmark registry and dataset-specific loaders.
+- `backend/utils/` - shared backend utility modules.
 - `backend/orchestrator.py` - agent loop and Architect chat helper.
 - `backend/agents/` - agent implementations and shared dataclasses.
 - `backend/app.py` - Starlette HTTP and SSE endpoints.

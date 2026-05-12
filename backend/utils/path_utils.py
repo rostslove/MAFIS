@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import List
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONTAINER_DATA_DIR = Path("/app/data")
 PROJECT_DATA_DIR = PROJECT_ROOT / "data"
 

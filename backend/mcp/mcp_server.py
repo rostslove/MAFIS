@@ -1,10 +1,4 @@
-"""
-MCP server hosting all tools for the MAFIS multi-agent system.
-
-Tools call Fedot.Industrial directly (no HTTP proxy). The registry is loaded
-in-process by mcp_client.py to avoid the Pydantic v2 dependency of the
-official MCP SDK.
-"""
+"""Local tool registry for graph profiling, training and reporting."""
 
 import json
 import logging
@@ -17,8 +11,8 @@ from inspect import Parameter, signature
 from threading import Event, Thread
 from typing import Any, Dict, List, Optional, Union, get_args, get_origin
 
-# Make backend importable when launched as subprocess
-_backend_dir = os.path.dirname(os.path.abspath(__file__))
+# Import backend modules when this file is loaded directly.
+_backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _backend_dir not in sys.path:
     sys.path.insert(0, _backend_dir)
 
@@ -40,7 +34,7 @@ from graph_engine import (
     load_input_data, make_tabular_input_data_like, slice_input_data,
     split_industrial_tuple_data, split_input_data,
 )
-from path_utils import normalize_csv_path
+from utils.path_utils import normalize_csv_path
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("MCP")
@@ -129,7 +123,7 @@ class LocalMCPRegistry:
 mcp = LocalMCPRegistry("MAFISTools")
 
 
-# ============== Trained-model store (single-process) ==============
+# Trained-model store
 
 _LAST: Dict[str, Any] = {"pipeline": None, "graph": None, "input_data": None, "predictions": None}
 
@@ -691,9 +685,6 @@ def _start_training_heartbeat(run_label: str, stage: str) -> Event:
 
 
 def _fedot_config_data_type(task_type: str) -> str:
-    # Classification/regression CSVs stay feature-table data, but the default
-    # strategy is still Fedot.Industrial unless the strategy name contains
-    # "tabular" in upstream IndustrialConfig.
     return "time_series" if task_type in ("ts_classification", "ts_regression", "ts_forecasting") else "table"
 
 
@@ -719,8 +710,6 @@ def _graph_to_pipeline_builder(graph: PipelineGraph):
         )
         return builder
 
-    # Each direct input of the root spawns its own branch; the chain back to a
-    # leaf becomes the body of that branch.
     for branch_idx, head_input_id in enumerate(root.inputs):
         chain: List[Any] = []
         current_id = head_input_id
@@ -1370,9 +1359,7 @@ def _target_info(csv_path: str, target_column: str, task_type: str) -> Dict[str,
     return info
 
 
-# ================================================================
-#                          DATA / OPERATIONS
-# ================================================================
+# Data and operations
 
 @mcp.tool()
 def get_data_profile(csv_path: str, target_column: str, task_type: str = "classification") -> str:
@@ -1417,9 +1404,7 @@ def get_available_operations(task_type: str) -> str:
     })
 
 
-# ================================================================
-#                          GRAPH OPS (no training)
-# ================================================================
+# Graph operations
 
 @mcp.tool()
 def propose_graph(graph_json: str) -> str:
@@ -1465,9 +1450,7 @@ def visualize_graph(graph_json: str) -> str:
         return json.dumps({"error": str(e)})
 
 
-# ================================================================
-#                          GRAPH TRAIN
-# ================================================================
+# Training
 
 @mcp.tool()
 def train_graph(
@@ -1649,7 +1632,6 @@ def validate_graph(
         executable_graph = _graph_with_runtime_model_params(executable_graph, n_jobs)
         input_data = load_input_data(csv_path, target_column, graph.task_type, forecast_length)
 
-        # Simple CV: rotate validation cuts
         n = input_sample_count(input_data)
         scores: List[float] = []
         adapter_notes: List[str] = []
@@ -1690,9 +1672,7 @@ def validate_graph(
         return json.dumps({"error": str(e)})
 
 
-# ================================================================
-#                          ANALYSIS
-# ================================================================
+# Analysis
 
 @mcp.tool()
 def get_node_importance(
@@ -1728,12 +1708,10 @@ def get_node_importance(
                 primary_metric,
             )["primary_score"]
 
-        # Reference score: full graph
         full_score = _score_graph(graph)
 
         importances: Dict[str, float] = {}
         for node in graph.nodes:
-            # Skip the root model - removing it breaks the pipeline
             if node.id == graph.root_id():
                 continue
             try:
@@ -1766,7 +1744,6 @@ def explain_graph(top_k: int = 10) -> str:
         return json.dumps({"error": "No trained graph yet. Call train_graph first."})
 
     try:
-        # Find the root (model) node and try to extract feature_importances_
         out: Dict[str, Any] = {"graph": graph.to_dict()}
         try:
             root_fn = pipeline.root_node
@@ -1785,9 +1762,7 @@ def explain_graph(top_k: int = 10) -> str:
         return json.dumps({"error": str(e)})
 
 
-# ================================================================
-#                          REPORT
-# ================================================================
+# Report
 
 @mcp.tool()
 def generate_report(evaluations_json: str) -> str:
@@ -1835,7 +1810,7 @@ def generate_report(evaluations_json: str) -> str:
         return json.dumps({"error": str(e)})
 
 
-# ================================================================
+# CLI
 
 if __name__ == "__main__":
     print(json.dumps({"server": mcp.name, "tools": mcp.list_tools()}, ensure_ascii=False, indent=2))

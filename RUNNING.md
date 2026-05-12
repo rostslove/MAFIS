@@ -87,7 +87,7 @@ cd D:\Diploma\Fedot.Industrial
 $env:FEDOT_INDUSTRIAL_PATH="$HOME/Fedot.Industrial"
 $env:LLM_BASE_URL="http://localhost:11434/v1"
 $env:LLM_API_KEY="ollama"
-$env:LLM_MODEL="qwen2.5-coder:14b"
+$env:LLM_MODEL="qwen2.5-coder:32b"
 poetry run python ../industrial-learning-agent/backend/app.py
 ```
 

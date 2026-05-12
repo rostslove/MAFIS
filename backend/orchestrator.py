@@ -9,8 +9,8 @@ from agents import Architect, ArchitectResult, Critic, CriticFeedback, DataConte
 from benchmarks import load_benchmark_artifact_data, load_benchmark_artifact_metadata
 from data_profiler import DataProfiler
 from graph_engine import SUPPORTED_TASKS, PipelineGraph, is_industrial_native_model, is_ts_task
-from mcp_client import MCPToolClient
-from path_utils import describe_missing_csv, normalize_csv_path
+from mcp.mcp_client import MCPToolClient
+from utils.path_utils import describe_missing_csv, normalize_csv_path
 
 logger = logging.getLogger("Orchestrator")
 
@@ -43,7 +43,7 @@ def _profile_data(csv_path: str, target_column: str, task_type: str, forecast_le
 
 async def _connect_mcp() -> MCPToolClient:
     client = MCPToolClient()
-    server_script = os.path.join(os.path.dirname(__file__), "mcp_server.py")
+    server_script = os.path.join(os.path.dirname(__file__), "mcp", "mcp_server.py")
     await client.connect(server_script=server_script)
     return client
 

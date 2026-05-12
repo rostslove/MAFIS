@@ -19,7 +19,7 @@ from urllib.request import Request, urlopen
 import numpy as np
 import pandas as pd
 
-from path_utils import data_dir
+from utils.path_utils import data_dir
 
 
 M4_GROUPS: Tuple[str, ...] = ("Daily", "Weekly", "Monthly", "Quarterly", "Yearly")

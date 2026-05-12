@@ -473,7 +473,6 @@ def runtime_failure_details(engineer: Dict[str, Any], critic: Dict[str, Any]) ->
             f"{technical}"
         )
     if not summary or summary == technical:
-        # Build a more helpful summary instead of a generic "training failed"
         if "finetune failed" in error.lower() or finetune_error:
             summary = (
                 "Fedot.Industrial finetune raised an exception. "
@@ -537,7 +536,6 @@ def render_runtime_failure_once(iteration: Dict[str, Any]) -> bool:
                 hide_index=True,
             )
     if details.get("technical"):
-        # Open by default so the user immediately sees what actually broke.
         with st.expander("Technical exception (full message)", expanded=True):
             st.code(details["technical"][:6000])
     return True
@@ -1272,8 +1270,6 @@ def mutate_graph(mutation: Dict[str, Any]) -> None:
 
 
 def update_node(node_id: str, new_operation: str) -> None:
-    # Graph edits are structural only. Fedot.Industrial handles parameter
-    # polishing during finetune.
     mutate_graph({
         "type": "replace",
         "node_id": node_id,
@@ -2260,7 +2256,6 @@ def results_tab() -> None:
     finetune_error = engineer.get("finetune_error", "")
     has_runtime_failure = bool(engineer.get("graph_error")) or bool(finetune_error)
 
-    # Header summary: always visible.
     col1, col2, col3 = st.columns(3)
     col1.metric(
         f"Test {primary_metric}",
@@ -2271,11 +2266,8 @@ def results_tab() -> None:
     col3.metric("Suggested changes", len(critic.get("suggested_mutations", []) or []))
 
     if has_runtime_failure:
-        # Show the error banner up front so it's the first thing the user sees.
         render_runtime_failure_once(item)
 
-    # Split the long page into focused sub-tabs so the user does not have to
-    # scroll through everything at once.
     sub_tabs = st.tabs([
         "Engineer",
         "Critic",
@@ -2288,8 +2280,6 @@ def results_tab() -> None:
         render_graph(item.get("architect", {}).get("graph", {}), show_details=False)
         render_engineer_report(
             engineer,
-            # When the runtime failure banner is already shown above, suppress
-            # the duplicate inline error inside the Engineer report.
             show_failure_details=not has_runtime_failure,
             show_training_notes=True,
             show_diagnostics=False,

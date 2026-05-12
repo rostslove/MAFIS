@@ -33,7 +33,7 @@ from orchestrator import (
     run_orchestration,
     run_orchestration_stream,
 )
-from path_utils import describe_missing_csv, normalize_csv_path
+from utils.path_utils import describe_missing_csv, normalize_csv_path
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
