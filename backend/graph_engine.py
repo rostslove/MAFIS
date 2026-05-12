@@ -90,6 +90,12 @@ except Exception as exc:
     logger.warning("Fedot.Industrial model repository import failed: %s", exc)
 
 try:
+    from fedot_ind.core.repository.excluded import TEMPORARY_EXCLUDED as FEDOT_TEMPORARY_EXCLUDED
+except Exception as exc:
+    FEDOT_TEMPORARY_EXCLUDED = {}
+    logger.warning("Fedot.Industrial exclusion list import failed: %s", exc)
+
+try:
     from fedot_ind.api.utils.industrial_strategy import IndustrialStrategy
 except Exception as exc:
     IndustrialStrategy = None
@@ -305,6 +311,24 @@ def _only_framework_ops(names: List[str]) -> List[str]:
     if not framework_names:
         return _unique(names)
     return _unique([name for name in names if name in framework_names])
+
+
+CATALOG_ALLOWED_EXCLUDED_OPS = {"one_hot_encoding", "label_encoding", "cat_features"}
+
+
+def _temporarily_excluded_operations() -> set[str]:
+    excluded: set[str] = set()
+    if not isinstance(FEDOT_TEMPORARY_EXCLUDED, dict):
+        return excluded
+    for operations in FEDOT_TEMPORARY_EXCLUDED.values():
+        if isinstance(operations, dict):
+            excluded.update(str(name) for name in operations)
+    return excluded
+
+
+def _filter_runtime_available_ops(names: List[str]) -> List[str]:
+    excluded = _temporarily_excluded_operations() - CATALOG_ALLOWED_EXCLUDED_OPS
+    return [name for name in names if name not in excluded]
 
 
 def _operation_repository_info(operation: str) -> Dict[str, Any]:
@@ -660,29 +684,29 @@ def _build_framework_operations() -> Dict[str, Dict[str, List[str]]]:
 
     return {
         "classification": {
-            "preprocessing": _only_framework_ops(classification_preproc),
+            "preprocessing": _only_framework_ops(_filter_runtime_available_ops(classification_preproc)),
             "models": _only_framework_ops(industrial_class_models + [
                 name for name in sorted(sklearn_class)
                 if name not in tabular_class_excluded and not name.startswith("industrial_")
             ]),
         },
         "regression": {
-            "preprocessing": _only_framework_ops(regression_preproc),
+            "preprocessing": _only_framework_ops(_filter_runtime_available_ops(regression_preproc)),
             "models": _only_framework_ops(industrial_reg_models + [
                 name for name in sorted(sklearn_reg)
                 if name not in tabular_reg_excluded and not name.startswith("industrial_")
             ]),
         },
         "ts_classification": {
-            "preprocessing": _only_framework_ops(ts_scalers + industrial_preproc),
+            "preprocessing": _only_framework_ops(_filter_runtime_available_ops(ts_scalers + industrial_preproc)),
             "models": _only_framework_ops(ts_class_models),
         },
         "ts_regression": {
-            "preprocessing": _only_framework_ops(ts_scalers + industrial_preproc),
+            "preprocessing": _only_framework_ops(_filter_runtime_available_ops(ts_scalers + industrial_preproc)),
             "models": _only_framework_ops(ts_reg_models),
         },
         "ts_forecasting": {
-            "preprocessing": _only_framework_ops(forecasting_preproc + ["eigen_basis"]),
+            "preprocessing": _only_framework_ops(_filter_runtime_available_ops(forecasting_preproc + ["eigen_basis"])),
             "models": _only_framework_ops(forecasting_models),
         },
     }
