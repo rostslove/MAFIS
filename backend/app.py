@@ -126,12 +126,20 @@ async def dataset_path_load(request):
     payload = await _json_body(request)
     raw_path = str(payload.get("csv_path") or payload.get("path") or "").strip()
     if not raw_path:
-        return _error("CSV path is required.", 400)
+        return _error("Train CSV path is required.", 400)
+    raw_test_path = str(payload.get("test_csv_path") or payload.get("test_path") or "").strip()
 
     csv_path = normalize_csv_path(raw_path)
     path = Path(csv_path)
     if not path.exists() or not path.is_file():
         return _error(describe_missing_csv(raw_path), 404)
+    test_path = None
+    test_csv_path = ""
+    if raw_test_path:
+        test_csv_path = normalize_csv_path(raw_test_path)
+        test_path = Path(test_csv_path)
+        if not test_path.exists() or not test_path.is_file():
+            return _error(describe_missing_csv(raw_test_path), 404)
 
     try:
         preview_rows = min(max(int(payload.get("preview_rows", 10) or 10), 1), 50)
@@ -140,6 +148,24 @@ async def dataset_path_load(request):
         columns = [str(column) for column in header.columns]
         if not columns:
             return _error("CSV has no columns.", 400)
+        test_row_count = None
+        if test_path is not None:
+            test_header = pd.read_csv(test_path, nrows=0)
+            test_columns = [str(column) for column in test_header.columns]
+            if test_columns != columns:
+                missing_in_test = [column for column in columns if column not in test_columns]
+                extra_in_test = [column for column in test_columns if column not in columns]
+                detail = "Test CSV columns must match train CSV columns exactly and in the same order."
+                if missing_in_test:
+                    detail += f" Missing: {', '.join(missing_in_test[:10])}."
+                if extra_in_test:
+                    detail += f" Extra: {', '.join(extra_in_test[:10])}."
+                return _error(
+                    detail,
+                    400,
+                )
+            with test_path.open("rb") as handle:
+                test_row_count = max(sum(1 for _ in handle) - 1, 0)
 
         shown_columns = columns[:preview_cols]
         preview = pd.read_csv(path, usecols=shown_columns, nrows=preview_rows)
@@ -149,8 +175,11 @@ async def dataset_path_load(request):
 
         return JSONResponse({
             "csv_path": csv_path,
+            "test_csv_path": test_csv_path,
             "csv_filename": path.name,
+            "test_csv_filename": test_path.name if test_path is not None else "",
             "n_samples": row_count,
+            "n_test_samples": test_row_count,
             "n_features": max(len(columns) - 1, 0),
             "n_columns": len(columns),
             "columns": columns,
@@ -169,12 +198,14 @@ async def architect_chat(request):
     try:
         result = await propose_architecture(
             csv_path=payload.get("csv_path", ""),
+            test_csv_path=payload.get("test_csv_path") or None,
             target_column=payload.get("target_column", ""),
             task_type=payload.get("task_type", "classification"),
             message=payload.get("message", ""),
             current_graph=payload.get("current_graph"),
             forecast_length=payload.get("forecast_length"),
             primary_metric=payload.get("primary_metric"),
+            test_size=_payload_test_size(payload),
             industrial_strategy=strategy_name,
             industrial_strategy_params=strategy_params,
         )
@@ -192,6 +223,7 @@ async def architect_revise(request):
     try:
         result = await propose_revision_from_critic(
             csv_path=payload.get("csv_path", ""),
+            test_csv_path=payload.get("test_csv_path") or None,
             target_column=payload.get("target_column", ""),
             task_type=payload.get("task_type", "classification"),
             current_graph=payload.get("current_graph") or {},
@@ -199,6 +231,7 @@ async def architect_revise(request):
             message=payload.get("message", ""),
             forecast_length=payload.get("forecast_length"),
             primary_metric=payload.get("primary_metric"),
+            test_size=_payload_test_size(payload),
             selected_mutations=payload.get("selected_mutations"),
             industrial_strategy=strategy_name,
             industrial_strategy_params=strategy_params,
@@ -234,6 +267,7 @@ async def orchestrate(request):
     try:
         result = await run_orchestration(
             csv_path=payload.get("csv_path", ""),
+            test_csv_path=payload.get("test_csv_path") or None,
             target_column=payload.get("target_column", ""),
             task_type=payload.get("task_type", "classification"),
             iterations=int(payload.get("iterations", 1) or 1),
@@ -272,6 +306,7 @@ async def orchestrate_stream(request):
         try:
             async for evt in run_orchestration_stream(
                 csv_path=payload.get("csv_path", ""),
+                test_csv_path=payload.get("test_csv_path") or None,
                 target_column=payload.get("target_column", ""),
                 task_type=payload.get("task_type", "classification"),
                 iterations=int(payload.get("iterations", 1) or 1),

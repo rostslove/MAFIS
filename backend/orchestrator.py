@@ -8,7 +8,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional
 from agents import Architect, ArchitectResult, Critic, CriticFeedback, DataContext, Engineer, EngineerResult, IterationRecord, Scribe
 from benchmarks import load_benchmark_artifact_data, load_benchmark_artifact_metadata
 from data_profiler import DataProfiler
-from graph_engine import SUPPORTED_TASKS, PipelineGraph, is_industrial_native_model, is_ts_task
+from graph_engine import SUPPORTED_TASKS, PipelineGraph, is_industrial_native_model, is_ts_task, split_industrial_tuple_data
 from mcp.mcp_client import MCPToolClient
 from utils.path_utils import describe_missing_csv, normalize_csv_path
 
@@ -19,22 +19,46 @@ def _event(event_type: str, **data) -> Dict[str, Any]:
     return {"event": event_type, **data}
 
 
-def _profile_data(csv_path: str, target_column: str, task_type: str, forecast_length: Optional[int]) -> Dict[str, Any]:
+def _profile_data(
+    csv_path: str,
+    target_column: str,
+    task_type: str,
+    forecast_length: Optional[int],
+    test_size: float = 0.2,
+    test_csv_path: Optional[str] = None,
+) -> Dict[str, Any]:
     csv_path = normalize_csv_path(csv_path)
+    test_csv_path = normalize_csv_path(test_csv_path) if test_csv_path else None
     if not os.path.exists(csv_path):
         raise FileNotFoundError(describe_missing_csv(csv_path))
+    if test_csv_path and not os.path.exists(test_csv_path):
+        raise FileNotFoundError(describe_missing_csv(test_csv_path))
     metadata = load_benchmark_artifact_metadata(csv_path)
     if metadata is not None:
         expected_target = metadata.get("target_column", target_column)
         if target_column != expected_target:
             raise ValueError(f"Target '{target_column}' not found; benchmark artifact target is '{expected_target}'")
         X, y, _ = load_benchmark_artifact_data(csv_path, mmap_mode="r")
-        profile = DataProfiler.profile(X=X, y=y, task_type=task_type)
+        if test_csv_path:
+            train_X, train_y = X, y
+        else:
+            train, _ = split_industrial_tuple_data((X, y), test_size=test_size)
+            train_X, train_y = train
+        profile = DataProfiler.profile(X=train_X, y=train_y, task_type=task_type)
         profile["storage_format"] = metadata.get("storage_format")
         profile["benchmark_id"] = metadata.get("benchmark_id")
         profile["benchmark_name"] = metadata.get("benchmark_name")
+        profile["profile_source"] = "train_file" if test_csv_path else "train_split"
     else:
-        profile = DataProfiler.profile_csv(csv_path, target_column, task_type=task_type)
+        profile = DataProfiler.profile_csv(
+            csv_path,
+            target_column,
+            task_type=task_type,
+            test_size=None if test_csv_path else test_size,
+        )
+        profile["profile_source"] = "train_file" if test_csv_path else profile.get("profile_source", "train_split")
+    if test_csv_path:
+        profile["test_csv_path"] = test_csv_path
     profile["is_time_series"] = is_ts_task(task_type)
     if forecast_length:
         profile["forecast_length"] = forecast_length
@@ -69,6 +93,7 @@ async def run_orchestration_stream(
     csv_path: str,
     target_column: str,
     task_type: str = "classification",
+    test_csv_path: Optional[str] = None,
     fedot_url: str = "",
     iterations: int = 2,
     initial_graph: Optional[Dict[str, Any]] = None,
@@ -91,16 +116,18 @@ async def run_orchestration_stream(
         yield _event("error", message="ts_forecasting requires forecast_length")
         return
     csv_path = normalize_csv_path(csv_path)
+    test_csv_path = normalize_csv_path(test_csv_path) if test_csv_path else None
 
     try:
         yield _event("status", message="Loading and profiling data...")
-        profile = _profile_data(csv_path, target_column, task_type, forecast_length)
+        profile = _profile_data(csv_path, target_column, task_type, forecast_length, test_size, test_csv_path)
     except Exception as exc:
         yield _event("error", message=f"Failed to load data: {exc}")
         return
 
     data_context = DataContext(
         csv_path=csv_path,
+        test_csv_path=test_csv_path,
         target_column=target_column,
         task_type=task_type,
         profile=profile,
@@ -116,7 +143,10 @@ async def run_orchestration_stream(
         "status",
         message=f"Data profiled: {profile.get('n_samples')} samples, {profile.get('n_features')} numeric features",
     )
-    yield _event("status", message=f"Train/test split: test_size={test_size:.2f}")
+    if test_csv_path:
+        yield _event("status", message="Train/test split: explicit train and test files")
+    else:
+        yield _event("status", message=f"Train/test split: test_size={test_size:.2f}")
     if primary_metric:
         yield _event("status", message=f"Primary metric: {primary_metric}")
     if data_context.industrial_strategy != "default":
@@ -363,6 +393,8 @@ async def run_orchestration_stream(
         final_result = {
             "status": "success",
             "task_type": task_type,
+            "csv_path": csv_path,
+            "test_csv_path": test_csv_path or "",
             "primary_metric": primary_metric,
             "is_time_series": is_ts_task(task_type),
             "forecast_length": forecast_length,
@@ -387,6 +419,7 @@ async def run_orchestration(
     csv_path: str,
     target_column: str,
     task_type: str = "classification",
+    test_csv_path: Optional[str] = None,
     fedot_url: str = "",
     iterations: int = 2,
     initial_graph: Optional[Dict[str, Any]] = None,
@@ -402,6 +435,7 @@ async def run_orchestration(
     final_result: Dict[str, Any] = {"status": "failed", "error": "No result"}
     async for evt in run_orchestration_stream(
         csv_path=csv_path,
+        test_csv_path=test_csv_path,
         target_column=target_column,
         task_type=task_type,
         fedot_url=fedot_url,
@@ -426,26 +460,31 @@ async def propose_architecture(
     csv_path: str,
     target_column: str,
     task_type: str,
+    test_csv_path: Optional[str] = None,
     message: str = "",
     current_graph: Optional[Dict[str, Any]] = None,
     forecast_length: Optional[int] = None,
     primary_metric: Optional[str] = None,
+    test_size: float = 0.2,
     industrial_strategy: str = "default",
     industrial_strategy_params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """One-shot Architect interaction for the frontend graph approval flow."""
     csv_path = normalize_csv_path(csv_path)
+    test_csv_path = normalize_csv_path(test_csv_path) if test_csv_path else None
     if task_type not in SUPPORTED_TASKS:
         return {"error": f"Unknown task type: {task_type}"}
 
-    profile = _profile_data(csv_path, target_column, task_type, forecast_length)
+    profile = _profile_data(csv_path, target_column, task_type, forecast_length, test_size=test_size, test_csv_path=test_csv_path)
     data_context = DataContext(
         csv_path=csv_path,
+        test_csv_path=test_csv_path,
         target_column=target_column,
         task_type=task_type,
         profile=profile,
         forecast_length=forecast_length,
         primary_metric=primary_metric,
+        test_size=test_size,
         industrial_strategy=(str(industrial_strategy or "default").strip().lower() or "default"),
         industrial_strategy_params=dict(industrial_strategy_params or {}),
     )
@@ -492,9 +531,11 @@ async def propose_revision_from_critic(
     task_type: str,
     current_graph: Dict[str, Any],
     critic_feedback: Dict[str, Any],
+    test_csv_path: Optional[str] = None,
     message: str = "",
     forecast_length: Optional[int] = None,
     primary_metric: Optional[str] = None,
+    test_size: float = 0.2,
     selected_mutations: Optional[list] = None,
     industrial_strategy: str = "default",
     industrial_strategy_params: Optional[Dict[str, Any]] = None,
@@ -506,10 +547,11 @@ async def propose_revision_from_critic(
     returns the revised graph. Strategy changes are selected outside Critic and
     outside the graph."""
     csv_path = normalize_csv_path(csv_path)
+    test_csv_path = normalize_csv_path(test_csv_path) if test_csv_path else None
     if task_type not in SUPPORTED_TASKS:
         return {"error": f"Unknown task type: {task_type}"}
 
-    profile = _profile_data(csv_path, target_column, task_type, forecast_length)
+    profile = _profile_data(csv_path, target_column, task_type, forecast_length, test_size=test_size, test_csv_path=test_csv_path)
     graph = PipelineGraph.from_dict(current_graph)
     ok, validation_message = graph.validate()
     if not ok:
@@ -582,11 +624,13 @@ async def propose_revision_from_critic(
 
     data_context = DataContext(
         csv_path=csv_path,
+        test_csv_path=test_csv_path,
         target_column=target_column,
         task_type=task_type,
         profile=profile,
         forecast_length=forecast_length,
         primary_metric=primary_metric,
+        test_size=test_size,
         industrial_strategy=(str(applied_strategy or "default").strip().lower() or "default"),
         industrial_strategy_params=dict(applied_strategy_params or {}),
     )

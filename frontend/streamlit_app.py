@@ -4,6 +4,7 @@ import copy
 import hashlib
 import html
 import io
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -184,6 +185,7 @@ def save_uploaded_csv(uploaded_file) -> str:
         and st.session_state.get("csv_path")
         and "df" in st.session_state
     ):
+        st.session_state.test_csv_path = ""
         return st.session_state.csv_path
 
     df = pd.read_csv(io.BytesIO(data))
@@ -199,40 +201,29 @@ def save_uploaded_csv(uploaded_file) -> str:
     path = data_dir / filename
     df.to_csv(path, index=False)
     st.session_state.csv_path = f"/app/data/{filename}" if Path("/app/data").exists() else str(path)
+    st.session_state.test_csv_path = ""
     return str(path)
 
 
 def adopt_path_dataset(result: Dict[str, Any]) -> None:
     """Use an existing backend-visible CSV path as the active dataset."""
     csv_path = result.get("csv_path")
+    test_csv_path = result.get("test_csv_path") or ""
     columns = list(result.get("columns") or [])
     preview_columns = list(result.get("preview_columns") or columns[:10])
     preview_records = list(result.get("preview_records") or [])
     if not csv_path or not columns:
         raise RuntimeError("Dataset loader did not return a usable CSV descriptor.")
 
-    full_df = None
-    try:
-        local_path = resolve_shared_data_path(csv_path)
-        if local_path.exists() and local_path.suffix.lower() == ".csv":
-            full_df = pd.read_csv(local_path)
-    except Exception:
-        full_df = None
-
-    if full_df is not None:
-        st.session_state.df = full_df
-        st.session_state.dataset_shape = tuple(full_df.shape)
-        st.session_state.dataset_columns = list(full_df.columns)
-        st.session_state.dataset_preview_only = False
-    else:
-        st.session_state.df = pd.DataFrame(preview_records, columns=preview_columns)
-        st.session_state.dataset_shape = (
-            int(result.get("n_samples") or len(st.session_state.df)),
-            int(result.get("n_columns") or len(columns)),
-        )
-        st.session_state.dataset_columns = columns
-        st.session_state.dataset_preview_only = True
+    st.session_state.df = pd.DataFrame(preview_records, columns=preview_columns)
+    st.session_state.dataset_shape = (
+        int(result.get("n_samples") or len(st.session_state.df)),
+        int(result.get("n_columns") or len(columns)),
+    )
+    st.session_state.dataset_columns = columns
+    st.session_state.dataset_preview_only = True
     st.session_state.csv_path = csv_path
+    st.session_state.test_csv_path = test_csv_path
     st.session_state.result = {}
     st.session_state.evaluation_history = []
     st.session_state.uploaded_signature = f"path:{csv_path}"
@@ -246,6 +237,7 @@ def adopt_path_dataset(result: Dict[str, Any]) -> None:
 def current_payload(extra: Dict[str, Any] | None = None) -> Dict[str, Any]:
     payload = {
         "csv_path": st.session_state.get("csv_path", ""),
+        "test_csv_path": st.session_state.get("test_csv_path", ""),
         "target_column": st.session_state.get("target_column", ""),
         "task_type": st.session_state.get("task_type", "classification"),
         "primary_metric": st.session_state.get("primary_metric", ""),
@@ -1065,6 +1057,59 @@ def render_best_graph_assessment(result: Dict[str, Any]) -> None:
             st.rerun()
 
 
+def json_from_text(value: Any) -> Any:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", value, re.DOTALL)
+    candidates = [fenced.group(1)] if fenced else []
+    candidates.append(value)
+    start, end = value.find("{"), value.rfind("}")
+    if start != -1 and end > start:
+        candidates.append(value[start:end + 1])
+    for candidate in candidates:
+        try:
+            return json.loads(candidate.strip())
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def unwrap_report_payload(report: Dict[str, Any]) -> Dict[str, Any]:
+    for key in ("report", "scribe_report", "final_report", "result"):
+        nested = report.get(key)
+        if isinstance(nested, dict):
+            return {**report, **nested}
+    return report
+
+
+def normalize_report_payload(report: Any) -> Dict[str, Any]:
+    if isinstance(report, str):
+        parsed = json_from_text(report)
+        if parsed is None:
+            return {"title": "MAFIS report", "summary": report}
+        report = parsed
+    if isinstance(report, list):
+        report = next((item for item in report if isinstance(item, dict)), {})
+    if not isinstance(report, dict):
+        return {}
+    report = unwrap_report_payload(report)
+    if not any(report.get(key) for key in ("title", "summary", "methodology", "results", "recommendations")):
+        nested = json_from_text(report.get("full_response"))
+        if isinstance(nested, dict):
+            report = unwrap_report_payload({**report, **nested})
+    recommendations = report.get("recommendations", [])
+    if isinstance(recommendations, str):
+        try:
+            parsed = json.loads(recommendations)
+            recommendations = parsed if isinstance(parsed, list) else [recommendations]
+        except json.JSONDecodeError:
+            recommendations = [recommendations]
+    elif not isinstance(recommendations, list):
+        recommendations = []
+    report["recommendations"] = [str(item) for item in recommendations if str(item).strip()]
+    return report
+
+
 def industrial_strategies_for_task(config: Dict[str, Any], task_type: str) -> List[Dict[str, Any]]:
     catalog = config.get("industrial_strategies") or config.get("training_strategies") or {}
     return list(catalog.get(task_type, []) or [])
@@ -1384,14 +1429,24 @@ def sidebar(config: Dict[str, Any]) -> None:
 
         with st.expander("Load CSV by path"):
             path_value = st.text_input(
-                "CSV path",
+                "Train CSV path",
                 key="dataset_path_input",
-                placeholder="/app/data/my_dataset.csv",
+                placeholder="/app/data/train.csv",
                 help="Path must be visible to the backend container. For Docker, ./data is mounted as /app/data.",
+            )
+            test_path_value = st.text_input(
+                "Test CSV path",
+                key="dataset_test_path_input",
+                placeholder="/app/data/test.csv",
+                help="Optional. When set, the backend uses this file as hold-out test instead of splitting train.",
             )
             if st.button("Load DataFrame", key="load_dataset_path", use_container_width=True):
                 try:
-                    result = post_json("/datasets/path/load", {"csv_path": path_value}, timeout=120)
+                    result = post_json(
+                        "/datasets/path/load",
+                        {"csv_path": path_value, "test_csv_path": test_path_value},
+                        timeout=120,
+                    )
                     adopt_path_dataset(result)
                     st.success(f"Loaded: {result.get('csv_filename', Path(path_value).name)}")
                 except Exception as exc:
@@ -1436,6 +1491,8 @@ def sidebar(config: Dict[str, Any]) -> None:
                 step=0.05,
                 help="Share of the dataset reserved for the test split. Train metrics and test metrics are reported separately.",
             )
+            if st.session_state.get("test_csv_path"):
+                st.caption("Explicit test CSV is loaded; the hold-out slider is ignored for training and profiling.")
 
             st.markdown("**Industrial strategy**")
             render_industrial_strategy_picker(config, st.session_state.task_type, key_suffix="sidebar")
@@ -1459,7 +1516,9 @@ def data_tab() -> None:
     df = st.session_state.df
     n_rows, n_cols = active_dataset_shape()
     preview = df.iloc[:10, :10]
-    st.write(f"Path: `{st.session_state.csv_path}`")
+    st.write(f"Train path: `{st.session_state.csv_path}`")
+    if st.session_state.get("test_csv_path"):
+        st.write(f"Test path: `{st.session_state.test_csv_path}`")
     st.caption(
         f"Showing first {len(preview)} rows and {len(preview.columns)} columns "
         f"of {n_rows} rows and {n_cols} columns."
@@ -2026,6 +2085,7 @@ def adopt_benchmark_dataset(result: Dict[str, Any]) -> None:
     st.session_state.dataset_columns = ui_columns
     st.session_state.dataset_preview_only = True
     st.session_state.csv_path = csv_path if Path("/app/data").exists() else str(artifact_path)
+    st.session_state.test_csv_path = ""
     st.session_state.uploaded_signature = f"benchmark:{result.get('benchmark_id', 'unknown')}:{artifact_path.name}"
     st.session_state.target_column = target_column
     st.session_state.task_type = result.get("task_type", "ts_classification")
@@ -2317,7 +2377,7 @@ def report_tab() -> None:
 
     item = latest_iteration(result)
     critic = item.get("critic", {}) if item else {}
-    report = result.get("report", {})
+    report = normalize_report_payload(result.get("report", {}))
     st.markdown(f"### {report.get('title', 'MAFIS report')}")
     st.write(report.get("summary", ""))
     if report.get("methodology"):

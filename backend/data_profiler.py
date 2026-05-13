@@ -14,6 +14,7 @@ class TaskType(Enum):
 
 PROFILE_ROWS = 5000
 PROFILE_COLUMNS = 200
+DEFAULT_TEST_SIZE = 0.2
 
 
 def _pick(total: int, limit: int) -> np.ndarray:
@@ -40,6 +41,25 @@ def _shape_issues(n_samples: int, n_features: int) -> list[str]:
 def _csv_rows(path: Path) -> int:
     with path.open("rb") as handle:
         return max(sum(1 for _ in handle) - 1, 0)
+
+
+def _bounded_test_size(test_size: Optional[float]) -> float:
+    try:
+        value = float(test_size if test_size is not None else DEFAULT_TEST_SIZE)
+    except (TypeError, ValueError):
+        value = DEFAULT_TEST_SIZE
+    return min(max(value, 0.05), 0.5)
+
+
+def _train_indices(total: int, test_size: Optional[float]) -> np.ndarray:
+    if test_size is None:
+        return np.arange(max(total, 0), dtype=int)
+    if total < 2:
+        return np.arange(max(total, 0), dtype=int)
+    cut = int(total * (1 - _bounded_test_size(test_size)))
+    cut = min(max(cut, 1), total - 1)
+    rng = np.random.default_rng(42)
+    return rng.permutation(total)[:cut]
 
 
 class DataProfiler:
@@ -159,29 +179,48 @@ class DataProfiler:
         return profile
 
     @staticmethod
-    def profile_csv(csv_path: str | Path, target_column: str, task_type: Optional[str] = None) -> Dict[str, Any]:
+    def profile_csv(
+        csv_path: str | Path,
+        target_column: str,
+        task_type: Optional[str] = None,
+        *,
+        test_size: Optional[float] = None,
+    ) -> Dict[str, Any]:
         path = Path(csv_path)
         columns = [str(column) for column in pd.read_csv(path, nrows=0).columns]
         if target_column not in columns:
             raise ValueError(f"Target '{target_column}' not found")
 
         row_count = _csv_rows(path)
+        train_idx = _train_indices(row_count, test_size)
         features = [column for column in columns if column != target_column]
         selected = [features[int(idx)] for idx in _pick(len(features), PROFILE_COLUMNS)]
+        sample_idx = set(int(idx) for idx in train_idx[_pick(len(train_idx), PROFILE_ROWS)])
         sample = (
-            pd.read_csv(path, usecols=selected, nrows=PROFILE_ROWS, low_memory=False)
+            pd.read_csv(
+                path,
+                usecols=selected,
+                skiprows=lambda row: row > 0 and (row - 1) not in sample_idx,
+                low_memory=False,
+            )
             if selected
-            else pd.DataFrame(index=range(min(row_count, PROFILE_ROWS)))
+            else pd.DataFrame(index=range(min(len(train_idx), PROFILE_ROWS)))
         )
-        target = pd.read_csv(path, usecols=[target_column], low_memory=False)[target_column]
-        return DataProfiler.profile(
+        target = pd.read_csv(path, usecols=[target_column], low_memory=False)[target_column].iloc[train_idx]
+        profile = DataProfiler.profile(
             sample,
             target,
             task_type,
-            n_samples=row_count,
+            n_samples=len(train_idx),
             n_features=len(features),
             feature_names=features,
         )
+        profile["profile_source"] = "train_split" if test_size is not None else "train_file"
+        profile["source_rows"] = row_count
+        if test_size is not None:
+            profile["test_size"] = _bounded_test_size(test_size)
+            profile["held_out_rows"] = row_count - len(train_idx)
+        return profile
 
     @staticmethod
     def _infer_task_type(y) -> str:

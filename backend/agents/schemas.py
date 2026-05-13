@@ -43,6 +43,7 @@ class DataContext:
     forecast_length: Optional[int] = None
     primary_metric: Optional[str] = None
     test_size: float = 0.2
+    test_csv_path: Optional[str] = None
     industrial_strategy: str = "default"
     industrial_strategy_params: Dict[str, Any] = field(default_factory=dict)
     iteration_history: List[IterationRecord] = field(default_factory=list)

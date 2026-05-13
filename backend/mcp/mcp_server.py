@@ -625,16 +625,23 @@ def _load_finetune_train_test(
     graph: PipelineGraph,
     preprocessing_nodes: List[Dict[str, Any]],
     csv_path: str,
+    test_csv_path: Optional[str],
     target_column: str,
     forecast_length: Optional[int],
     test_size: float,
 ) -> tuple[Any, Any, str]:
     if graph.task_type in ("classification", "regression") and preprocessing_nodes:
         input_data = load_input_data(csv_path, target_column, graph.task_type, forecast_length)
+        if test_csv_path:
+            test_data = load_input_data(test_csv_path, target_column, graph.task_type, forecast_length)
+            return input_data, test_data, "fedot_input_data_explicit_train_test_with_boundary_preprocessing"
         train, test = split_input_data(input_data, test_size=test_size)
-        return train, test, "fedot_input_data_with_boundary_preprocessing"
+        return train, test, "fedot_input_data_split_with_boundary_preprocessing"
 
     industrial_data = load_industrial_tuple_data(csv_path, target_column, graph.task_type, forecast_length)
+    if test_csv_path:
+        test_data = load_industrial_tuple_data(test_csv_path, target_column, graph.task_type, forecast_length)
+        return industrial_data, test_data, "industrial_tuple_explicit_train_test"
     train, test = split_industrial_tuple_data(industrial_data, test_size=test_size)
     return train, test, "industrial_tuple"
 
@@ -886,6 +893,7 @@ def _build_api_config(
 def _train_via_finetune(
     graph: PipelineGraph,
     csv_path: str,
+    test_csv_path: Optional[str],
     target_column: str,
     forecast_length: Optional[int],
     primary_metric: Optional[str],
@@ -920,6 +928,7 @@ def _train_via_finetune(
         graph=executable_graph,
         preprocessing_nodes=preprocessing_nodes,
         csv_path=csv_path,
+        test_csv_path=test_csv_path,
         target_column=target_column,
         forecast_length=forecast_length,
         test_size=test_size,
@@ -930,12 +939,13 @@ def _train_via_finetune(
         training_events,
         "data",
         "done",
-        "Loaded CSV and created hold-out split.",
+        "Loaded explicit train/test CSV files." if test_csv_path else "Loaded CSV and created hold-out split.",
         run_started_at,
         boundary=data_boundary,
+        split_mode="explicit_train_test" if test_csv_path else "holdout",
         train_samples=_sample_count(train),
         test_samples=_sample_count(test),
-        test_size=test_size,
+        test_size=None if test_csv_path else test_size,
     )
     adapted_nodes = preprocessing_nodes + train_only_nodes
     if adapted_nodes:
@@ -1122,7 +1132,7 @@ def _train_via_finetune(
             "Classification target labels were encoded to integer class ids before Fedot.Industrial training; "
             "reference label mapping is shown in diagnostics."
         )
-    if data_boundary == "fedot_input_data_with_boundary_preprocessing":
+    if "boundary_preprocessing" in data_boundary:
         notes.append(
             "Explicit categorical preprocessing node detected; backend used FEDOT InputData at the data boundary instead of executing the upstream encoder as a graph node."
         )
@@ -1156,10 +1166,12 @@ def _train_via_finetune(
         "train_metrics": train_metrics,
         "test_metrics": test_metrics,
         "split_info": {
-            "test_size": test_size,
+            "split_mode": "explicit_train_test" if test_csv_path else "holdout",
+            "test_size": None if test_csv_path else test_size,
             "n_train": _sample_count(train),
             "n_test": _sample_count(test),
             "data_boundary": data_boundary,
+            "test_csv_path": test_csv_path or "",
         },
         "graph": graph.to_dict(),
         "effective_graph": executable_graph.to_dict(),
@@ -1182,6 +1194,7 @@ def _train_via_finetune(
 def _train_direct(
     graph: PipelineGraph,
     csv_path: str,
+    test_csv_path: Optional[str],
     target_column: str,
     forecast_length: Optional[int],
     primary_metric: Optional[str],
@@ -1201,18 +1214,22 @@ def _train_direct(
     executable_graph, preprocessing_nodes, train_only_nodes = _adapt_initial_assumption_graph(graph)
     executable_graph = _graph_with_runtime_model_params(executable_graph, resolved_n_jobs)
     input_data = load_input_data(csv_path, target_column, graph.task_type, forecast_length)
-    train, val = split_input_data(input_data, test_size=test_size)
+    if test_csv_path:
+        train, val = input_data, load_input_data(test_csv_path, target_column, graph.task_type, forecast_length)
+    else:
+        train, val = split_input_data(input_data, test_size=test_size)
     train, val, preprocessing_notes = _apply_data_boundary_preprocessing(train, val, preprocessing_nodes)
     train, train_only_notes = _apply_train_only_operations(train, train_only_nodes)
     _record_training_event(
         training_events,
         "data",
         "done",
-        "Loaded CSV and created hold-out split for direct baseline.",
+        "Loaded explicit train/test CSV files for direct baseline." if test_csv_path else "Loaded CSV and created hold-out split for direct baseline.",
         run_started_at,
+        split_mode="explicit_train_test" if test_csv_path else "holdout",
         train_samples=input_sample_count(train),
         test_samples=input_sample_count(val),
-        test_size=test_size,
+        test_size=None if test_csv_path else test_size,
     )
     adapted_nodes = preprocessing_nodes + train_only_nodes
     if adapted_nodes:
@@ -1279,9 +1296,11 @@ def _train_direct(
         "train_metrics": train_metrics,
         "test_metrics": test_metrics,
         "split_info": {
-            "test_size": test_size,
+            "split_mode": "explicit_train_test" if test_csv_path else "holdout",
+            "test_size": None if test_csv_path else test_size,
             "n_train": input_sample_count(train),
             "n_test": input_sample_count(val),
+            "test_csv_path": test_csv_path or "",
         },
         "graph": graph.to_dict(),
         "effective_graph": executable_graph.to_dict(),
@@ -1362,22 +1381,43 @@ def _target_info(csv_path: str, target_column: str, task_type: str) -> Dict[str,
 # Data and operations
 
 @mcp.tool()
-def get_data_profile(csv_path: str, target_column: str, task_type: str = "classification") -> str:
+def get_data_profile(
+    csv_path: str,
+    target_column: str,
+    task_type: str = "classification",
+    test_size: float = 0.2,
+    test_csv_path: Optional[str] = None,
+) -> str:
     """Profile a CSV: returns factual dataset shape, target distribution and issues."""
     try:
         csv_path = normalize_csv_path(csv_path)
+        test_csv_path = normalize_csv_path(test_csv_path) if test_csv_path else None
         metadata = load_benchmark_artifact_metadata(csv_path)
         if metadata is not None:
             expected_target = metadata.get("target_column", DEFAULT_BENCHMARK_TARGET_COLUMN)
             if target_column != expected_target:
                 raise ValueError(f"Target '{target_column}' not found; benchmark artifact target is '{expected_target}'")
             X, y, _ = load_benchmark_artifact_data(csv_path, mmap_mode="r")
-            profile = DataProfiler.profile(X=X, y=y, task_type=task_type)
+            if test_csv_path:
+                train_X, train_y = X, y
+            else:
+                train, _ = split_industrial_tuple_data((X, y), test_size=test_size)
+                train_X, train_y = train
+            profile = DataProfiler.profile(X=train_X, y=train_y, task_type=task_type)
             profile["storage_format"] = metadata.get("storage_format")
             profile["benchmark_id"] = metadata.get("benchmark_id")
             profile["benchmark_name"] = metadata.get("benchmark_name")
+            profile["profile_source"] = "train_file" if test_csv_path else "train_split"
         else:
-            profile = DataProfiler.profile_csv(csv_path, target_column, task_type=task_type)
+            profile = DataProfiler.profile_csv(
+                csv_path,
+                target_column,
+                task_type=task_type,
+                test_size=None if test_csv_path else test_size,
+            )
+            profile["profile_source"] = "train_file" if test_csv_path else profile.get("profile_source", "train_split")
+        if test_csv_path:
+            profile["test_csv_path"] = test_csv_path
         profile["is_time_series"] = is_ts_task(task_type)
         return json.dumps(profile, default=str)
     except Exception as e:
@@ -1457,6 +1497,7 @@ def train_graph(
     graph_json: str,
     csv_path: str,
     target_column: str,
+    test_csv_path: Optional[str] = None,
     forecast_length: Optional[int] = None,
     primary_metric: Optional[str] = None,
     test_size: float = 0.2,
@@ -1485,6 +1526,7 @@ def train_graph(
     """
     try:
         csv_path = normalize_csv_path(csv_path)
+        test_csv_path = normalize_csv_path(test_csv_path) if test_csv_path else None
         graph = PipelineGraph.from_dict(json.loads(graph_json))
         ok, msg = graph.validate()
         if not ok:
@@ -1513,6 +1555,7 @@ def train_graph(
             result = _train_via_finetune(
                 graph=graph,
                 csv_path=csv_path,
+                test_csv_path=test_csv_path,
                 target_column=target_column,
                 forecast_length=forecast_length,
                 primary_metric=primary_metric,
@@ -1529,6 +1572,7 @@ def train_graph(
             result = _train_via_finetune(
                 graph=graph,
                 csv_path=csv_path,
+                test_csv_path=test_csv_path,
                 target_column=target_column,
                 forecast_length=forecast_length,
                 primary_metric=primary_metric,
@@ -1568,6 +1612,7 @@ def train_graph(
                 fallback = _train_direct(
                     graph=graph,
                     csv_path=csv_path,
+                    test_csv_path=test_csv_path,
                     target_column=target_column,
                     forecast_length=forecast_length,
                     primary_metric=primary_metric,

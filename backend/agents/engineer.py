@@ -123,6 +123,7 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
         args = {
             "graph_json": graph_json,
             "csv_path": dc.csv_path,
+            "test_csv_path": dc.test_csv_path,
             "target_column": dc.target_column,
             "test_size": dc.test_size,
             "industrial_strategy": dc.industrial_strategy or "default",

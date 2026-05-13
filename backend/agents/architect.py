@@ -119,8 +119,10 @@ Return JSON only."""
             "get_data_profile",
             {
                 "csv_path": data_context.csv_path,
+                "test_csv_path": data_context.test_csv_path,
                 "target_column": data_context.target_column,
                 "task_type": data_context.task_type,
+                "test_size": data_context.test_size,
             },
         )
         operations = await self.call_mcp_tool("get_available_operations", {"task_type": data_context.task_type})

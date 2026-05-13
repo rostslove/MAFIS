@@ -4,7 +4,7 @@ import json
 import logging
 from typing import Any, Dict, List
 
-from .base_agent import BaseAgent, extract_json_block
+from .base_agent import BaseAgent, extract_json_block, extract_json_value
 from .schemas import DataContext, ScribeReport
 from .structured import parse_scribe_report_object
 
@@ -81,14 +81,16 @@ latest accepted run as the best result. Return JSON only."""
                 use_tools=False,
             )
             raw_text = response.get("full_response", "") or response.get("error", "")
-            parsed = extract_json_block(raw_text)
+            parsed = self._report_payload_from_model_text(raw_text)
             llm_report = parse_scribe_report_object(parsed) if parsed else None
-            if llm_report:
+            if llm_report and self._has_report_content(llm_report.dict()):
                 report.title = llm_report.title
                 report.summary = llm_report.summary
                 report.methodology = llm_report.methodology
                 report.results = llm_report.results
                 report.recommendations = llm_report.recommendations
+            else:
+                self._fill_from_tool_report(report, tool_report)
             self._attach_best_comparison(report, current_vs_best)
             report.best_graph_mermaid = tool_report.get("best_graph_mermaid", "")
             report.full_response = raw_text
@@ -101,6 +103,42 @@ latest accepted run as the best result. Return JSON only."""
             report.full_response = str(exc)
             report.tool_calls = self.get_tool_calls()
             return report
+
+    @staticmethod
+    def _report_payload_from_model_text(raw_text: str) -> Dict[str, Any] | None:
+        parsed = extract_json_value(raw_text) or extract_json_block(raw_text)
+        if isinstance(parsed, list):
+            parsed = next((item for item in parsed if isinstance(item, dict)), None)
+        if not isinstance(parsed, dict):
+            return None
+        fields = {"title", "summary", "methodology", "results", "recommendations"}
+        if fields.intersection(parsed):
+            return parsed
+        for key in ("report", "scribe_report", "final_report", "result"):
+            nested = parsed.get(key)
+            if isinstance(nested, dict) and fields.intersection(nested):
+                return nested
+        return None
+
+    @staticmethod
+    def _has_report_content(payload: Dict[str, Any]) -> bool:
+        return bool(
+            str(payload.get("title") or payload.get("summary") or payload.get("methodology") or payload.get("results") or "").strip()
+            or payload.get("recommendations")
+        )
+
+    @staticmethod
+    def _fill_from_tool_report(report: ScribeReport, tool_report: Dict[str, Any]) -> None:
+        if not isinstance(tool_report, dict):
+            return
+        summaries = tool_report.get("evaluation_summaries") or tool_report.get("iteration_summaries") or []
+        best_score = tool_report.get("best_score")
+        report.title = report.title or "MAFIS report"
+        report.summary = report.summary or f"Evaluated {tool_report.get('n_evaluations', len(summaries) or 0)} graph run(s)."
+        if best_score is not None:
+            report.results = report.results or f"Best observed score: {best_score}."
+        if not report.recommendations:
+            report.recommendations = ["Review train/test metrics and keep the graph with the best hold-out score."]
 
     @staticmethod
     def _attach_best_comparison(report: ScribeReport, comparison: Dict[str, Any]) -> None:
