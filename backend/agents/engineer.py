@@ -1013,10 +1013,16 @@ remaining graph, and report skipped nodes as recovery feedback for Critic."""
             )
         elif result.finetune_error:
             technical_message = f"Fedot.Industrial finetune failed: {result.finetune_error}"
-            kind = "finetune_fallback"
-            summary = (
-                "Fedot.Industrial finetune failed, so Engineer reported direct-fit fallback metrics."
-            )
+            if result.fallback_used:
+                kind = "finetune_fallback"
+                summary = (
+                    "Fedot.Industrial finetune failed, so Engineer reported fallback metrics."
+                )
+            else:
+                kind = "finetune_failure"
+                summary = (
+                    "Fedot.Industrial finetune failed before producing a fitted graph."
+                )
         else:
             return
 

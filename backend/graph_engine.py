@@ -636,6 +636,7 @@ def _build_framework_operations() -> Dict[str, Dict[str, List[str]]]:
         "industrial_manifold_clf",
     }
     tabular_reg_excluded = {
+        "linear",
         "pdl_reg",
         "industrial_stat_reg",
         "industrial_freq_reg",

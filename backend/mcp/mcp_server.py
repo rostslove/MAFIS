@@ -1855,6 +1855,7 @@ def train_graph(
             if not allow_direct_fallback:
                 return json.dumps({
                     "score": 0,
+                    "error": f"Fedot.Industrial finetune failed: {finetune_error}",
                     "metrics": {
                         "primary_score": 0.0,
                         "primary_metric": primary_metric or "",
