@@ -429,12 +429,12 @@ def _operation_runtime_contract(operation: str) -> Dict[str, str]:
                 "predict_for_fit output_mode handling."
             ),
         }
-    if operation == "normalization":
+    if operation in {"simple_imputation", "normalization"}:
         return {
             "runtime_family": "fedot_data_boundary_preprocessing",
             "data_contract": "table_boundary_transform",
             "compatibility_note": (
-                "FEDOT normalization is executed by MAFIS at the train/test data boundary "
+                f"FEDOT {operation} is executed by MAFIS at the train/test data boundary "
                 "as a 2D table transform and removed from the executable Fedot.Industrial graph, "
                 "because the Industrial multidim dispatcher can pass one feature column as a 1D array."
             ),
@@ -501,6 +501,8 @@ def _operation_execution_hints(operation: str) -> Dict[str, Any]:
     if operation in {"one_hot_encoding", "label_encoding"}:
         hints["requires_categorical_metadata"] = True
         hints["runtime_adapter"] = "data_boundary_categorical_encoding"
+    if operation == "simple_imputation":
+        hints["runtime_adapter"] = "data_boundary_simple_imputation"
     if operation == "normalization":
         hints["runtime_adapter"] = "data_boundary_normalization"
     if operation == "resample":

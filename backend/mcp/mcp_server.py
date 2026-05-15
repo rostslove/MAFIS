@@ -18,6 +18,7 @@ if _backend_dir not in sys.path:
 
 import numpy as np
 import pandas as pd
+from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import LabelEncoder, Normalizer, OneHotEncoder
 
 from benchmarks import (
@@ -128,7 +129,13 @@ mcp = LocalMCPRegistry("MAFISTools")
 _LAST: Dict[str, Any] = {"pipeline": None, "graph": None, "input_data": None, "predictions": None}
 
 TRAIN_ONLY_OPS = {"resample", "class_decompose"}
-DATA_BOUNDARY_PREPROCESSING_OPS = {"one_hot_encoding", "label_encoding", "cat_features", "normalization"}
+DATA_BOUNDARY_PREPROCESSING_OPS = {
+    "one_hot_encoding",
+    "label_encoding",
+    "cat_features",
+    "simple_imputation",
+    "normalization",
+}
 EXECUTION_ADAPTER_OPS = TRAIN_ONLY_OPS | DATA_BOUNDARY_PREPROCESSING_OPS
 CATBOOST_OPS = {"catboost", "catboostreg"}
 LGBM_OPS = {"lgbm", "lgbmreg"}
@@ -238,6 +245,10 @@ def _graph_with_runtime_model_params(
         if node.operation in FEDOT_AUTOML_OPS:
             params.setdefault("timeout", max(1, int(fedot_automl_timeout or 5)))
             params.setdefault("logging_level", 30)
+            if node.operation == "fedot_cls":
+                params.setdefault("problem", "classification")
+            elif node.operation == "fedot_regr":
+                params.setdefault("problem", "regression")
         node.params = params
     return adapted
 
@@ -520,6 +531,100 @@ def _normalize_2d_rows(features: Any, norm: str, chunk_size: int = 2048) -> np.n
     return normalized
 
 
+def _finite_float_features(features: Any) -> np.ndarray:
+    feature_array = np.asarray(features, dtype=float).copy()
+    feature_array[~np.isfinite(feature_array)] = np.nan
+    return feature_array
+
+
+def _new_simple_imputer(strategy: str, params: Optional[Dict[str, Any]] = None) -> SimpleImputer:
+    params = dict(params or {})
+    strategy = str(params.get("strategy") or strategy)
+    if strategy not in {"mean", "median", "most_frequent", "constant"}:
+        strategy = "mean"
+    kwargs: Dict[str, Any] = {"strategy": strategy, "keep_empty_features": True}
+    if strategy == "constant" and "fill_value" in params:
+        kwargs["fill_value"] = params.get("fill_value")
+    try:
+        return SimpleImputer(**kwargs)
+    except TypeError:
+        kwargs.pop("keep_empty_features", None)
+        return SimpleImputer(**kwargs)
+
+
+def _apply_simple_imputation_boundary(
+    train_data: Any,
+    test_data: Any,
+    params: Optional[Dict[str, Any]] = None,
+) -> tuple[Any, Any, str]:
+    params = dict(params or {})
+    if _is_tuple_data(train_data):
+        train_features, train_target = train_data
+        test_features, test_target = test_data
+        train_features_arr = np.asarray(train_features)
+        test_features_arr = np.asarray(test_features)
+        if train_features_arr.ndim != 2 or test_features_arr.ndim != 2:
+            return (
+                train_data,
+                test_data,
+                "Operation simple_imputation was moved to the data boundary, but tuple features were not 2D; no feature change was applied.",
+            )
+        imputer = _new_simple_imputer("mean", params)
+        return (
+            (imputer.fit_transform(_finite_float_features(train_features_arr)), train_target),
+            (imputer.transform(_finite_float_features(test_features_arr)), test_target),
+            "Operation simple_imputation was executed as a data-boundary tuple transform and removed from the executable graph.",
+        )
+
+    train_features = np.asarray(train_data.features)
+    test_features = np.asarray(test_data.features)
+    if train_features.ndim != 2 or test_features.ndim != 2:
+        return (
+            train_data,
+            test_data,
+            "Operation simple_imputation was moved to the data boundary, but features were not 2D; no feature change was applied.",
+        )
+
+    feature_names = _input_feature_names(train_data)
+    categorical_idx = [int(idx) for idx in _input_metadata_indices(train_data, "categorical_idx")]
+    numerical_idx = [int(idx) for idx in _input_metadata_indices(train_data, "numerical_idx")]
+    if not categorical_idx and not numerical_idx:
+        numerical_idx = list(range(train_features.shape[1]))
+
+    train_imputed = _finite_float_features(train_features)
+    test_imputed = _finite_float_features(test_features)
+    for indices, imputer in (
+        (numerical_idx, _new_simple_imputer("mean", params)),
+        (categorical_idx, _new_simple_imputer("most_frequent", {"strategy": "most_frequent"})),
+    ):
+        if not indices:
+            continue
+        train_imputed[:, indices] = imputer.fit_transform(train_imputed[:, indices])
+        test_imputed[:, indices] = imputer.transform(test_imputed[:, indices])
+
+    return (
+        make_tabular_input_data_like(
+            train_data,
+            train_imputed,
+            feature_names=feature_names,
+            categorical_idx=categorical_idx,
+            numerical_idx=numerical_idx,
+        ),
+        make_tabular_input_data_like(
+            test_data,
+            test_imputed,
+            feature_names=feature_names,
+            categorical_idx=categorical_idx,
+            numerical_idx=numerical_idx,
+        ),
+        (
+            "Operation simple_imputation was executed as a 2D table data-boundary transform "
+            f"(numerical_columns={len(numerical_idx)}, categorical_columns={len(categorical_idx)}) "
+            "and removed from the executable graph."
+        ),
+    )
+
+
 def _apply_normalization_boundary(
     train_data: Any,
     test_data: Any,
@@ -614,6 +719,13 @@ def _apply_data_boundary_preprocessing(
         operation = node.get("operation")
         if operation == "one_hot_encoding":
             updated_train, updated_test, note = _apply_one_hot_boundary(updated_train, updated_test)
+            notes.append(f"Operation '{node.get('id')}' ({operation}) adapter: {note}")
+        elif operation == "simple_imputation":
+            updated_train, updated_test, note = _apply_simple_imputation_boundary(
+                updated_train,
+                updated_test,
+                node.get("params") or {},
+            )
             notes.append(f"Operation '{node.get('id')}' ({operation}) adapter: {note}")
         elif operation == "normalization":
             updated_train, updated_test, note = _apply_normalization_boundary(
