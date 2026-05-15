@@ -132,6 +132,7 @@ DATA_BOUNDARY_PREPROCESSING_OPS = {"one_hot_encoding", "label_encoding", "cat_fe
 EXECUTION_ADAPTER_OPS = TRAIN_ONLY_OPS | DATA_BOUNDARY_PREPROCESSING_OPS
 CATBOOST_OPS = {"catboost", "catboostreg"}
 LGBM_OPS = {"lgbm", "lgbmreg"}
+FEDOT_AUTOML_OPS = {"fedot_cls", "fedot_regr", "fedot_forecast"}
 N_JOBS_OPERATION_OPS = {
     "rf", "rfr", "xgboost", "xgbreg", "lgbm", "lgbmreg", "catboost", "catboostreg",
     "extra_trees", "extra_trees_reg", "isolation_forest_class", "isolation_forest_reg",
@@ -164,6 +165,10 @@ def _industrial_native_model_ops(graph: PipelineGraph) -> List[str]:
         for node in graph.nodes
         if is_industrial_native_model(node.operation)
     ]
+
+
+def _fedot_automl_model_ops(graph: PipelineGraph) -> List[str]:
+    return [node.operation for node in graph.nodes if node.operation in FEDOT_AUTOML_OPS]
 
 
 def _is_tuple_data(data: Any) -> bool:
@@ -216,7 +221,11 @@ def _graph_operation_summary(graph: PipelineGraph) -> str:
     return " -> ".join(node.operation for node in graph.nodes)
 
 
-def _graph_with_runtime_model_params(graph: PipelineGraph, n_jobs: int) -> PipelineGraph:
+def _graph_with_runtime_model_params(
+    graph: PipelineGraph,
+    n_jobs: int,
+    fedot_automl_timeout: Optional[int] = None,
+) -> PipelineGraph:
     """Attach runtime execution params that upstream repositories default too low."""
     adapted = deepcopy(graph)
     for node in adapted.nodes:
@@ -226,6 +235,9 @@ def _graph_with_runtime_model_params(graph: PipelineGraph, n_jobs: int) -> Pipel
         if node.operation in LGBM_OPS:
             params["use_eval_set"] = False
             params["early_stopping_rounds"] = None
+        if node.operation in FEDOT_AUTOML_OPS:
+            params.setdefault("timeout", max(1, int(fedot_automl_timeout or 5)))
+            params.setdefault("logging_level", 30)
         node.params = params
     return adapted
 
@@ -236,6 +248,8 @@ def _runtime_model_param_adapters(graph: PipelineGraph) -> List[str]:
         adapters.append("n_jobs_runtime_params")
     if any(node.operation in LGBM_OPS for node in graph.nodes):
         adapters.append("lgbm_eval_set_sanitizer")
+    if any(node.operation in FEDOT_AUTOML_OPS for node in graph.nodes):
+        adapters.append("fedot_automl_runtime_params")
     return adapters
 
 
@@ -630,13 +644,27 @@ def _load_finetune_train_test(
     forecast_length: Optional[int],
     test_size: float,
 ) -> tuple[Any, Any, str]:
-    if graph.task_type in ("classification", "regression") and preprocessing_nodes:
+    needs_fedot_input_data = (
+        graph.task_type in ("classification", "regression")
+        and (bool(preprocessing_nodes) or bool(_fedot_automl_model_ops(graph)))
+    )
+    if needs_fedot_input_data:
         input_data = load_input_data(csv_path, target_column, graph.task_type, forecast_length)
         if test_csv_path:
             test_data = load_input_data(test_csv_path, target_column, graph.task_type, forecast_length)
-            return input_data, test_data, "fedot_input_data_explicit_train_test_with_boundary_preprocessing"
+            boundary = (
+                "fedot_input_data_explicit_train_test_with_boundary_preprocessing"
+                if preprocessing_nodes
+                else "fedot_input_data_explicit_train_test_for_fedot_automl"
+            )
+            return input_data, test_data, boundary
         train, test = split_input_data(input_data, test_size=test_size)
-        return train, test, "fedot_input_data_split_with_boundary_preprocessing"
+        boundary = (
+            "fedot_input_data_split_with_boundary_preprocessing"
+            if preprocessing_nodes
+            else "fedot_input_data_split_for_fedot_automl"
+        )
+        return train, test, boundary
 
     industrial_data = load_industrial_tuple_data(csv_path, target_column, graph.task_type, forecast_length)
     if test_csv_path:
@@ -968,7 +996,11 @@ def _train_via_finetune(
         timeout=timeout,
     )
     n_jobs = _resolve_training_n_jobs(industrial_strategy_params)
-    executable_graph = _graph_with_runtime_model_params(executable_graph, n_jobs)
+    executable_graph = _graph_with_runtime_model_params(
+        executable_graph,
+        n_jobs,
+        fedot_automl_timeout=timeout,
+    )
     model_param_adapters = _runtime_model_param_adapters(executable_graph)
     _record_training_event(
         training_events,
@@ -1212,7 +1244,11 @@ def _train_direct(
         resolved_n_jobs,
     )
     executable_graph, preprocessing_nodes, train_only_nodes = _adapt_initial_assumption_graph(graph)
-    executable_graph = _graph_with_runtime_model_params(executable_graph, resolved_n_jobs)
+    executable_graph = _graph_with_runtime_model_params(
+        executable_graph,
+        resolved_n_jobs,
+        fedot_automl_timeout=5,
+    )
     input_data = load_input_data(csv_path, target_column, graph.task_type, forecast_length)
     if test_csv_path:
         train, val = input_data, load_input_data(test_csv_path, target_column, graph.task_type, forecast_length)

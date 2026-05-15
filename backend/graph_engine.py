@@ -440,6 +440,15 @@ def _operation_runtime_contract(operation: str) -> Dict[str, str]:
             ),
         }
     meta = _operation_meta(operation)
+    if operation in {"fedot_cls", "fedot_regr"}:
+        return {
+            "runtime_family": "fedot_automl_model",
+            "data_contract": "fedot_input_data",
+            "compatibility_note": (
+                "Fedot.Industrial AutoML wrapper node; MAFIS passes FEDOT InputData "
+                "rather than native Industrial (X, y) tuple data."
+            ),
+        }
     if _is_industrial_native_model(operation):
         return {
             "runtime_family": "fedot_industrial_model",
@@ -501,6 +510,8 @@ def _operation_execution_hints(operation: str) -> Dict[str, Any]:
         hints["runtime_adapter"] = "catboost_search_space_sanitizer"
     if operation in {"lgbm", "lgbmreg"}:
         hints["runtime_adapter"] = "lgbm_eval_set_sanitizer"
+    if operation in {"fedot_cls", "fedot_regr"}:
+        hints["runtime_adapter"] = "fedot_input_data_loader"
     return hints
 
 
