@@ -19,7 +19,7 @@ if _backend_dir not in sys.path:
 import numpy as np
 import pandas as pd
 from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import LabelEncoder, Normalizer, OneHotEncoder
+from sklearn.preprocessing import LabelEncoder, Normalizer, OneHotEncoder, StandardScaler
 
 from benchmarks import (
     DEFAULT_BENCHMARK_TARGET_COLUMN,
@@ -135,11 +135,22 @@ DATA_BOUNDARY_PREPROCESSING_OPS = {
     "cat_features",
     "simple_imputation",
     "normalization",
+    "scaling",
 }
 EXECUTION_ADAPTER_OPS = TRAIN_ONLY_OPS | DATA_BOUNDARY_PREPROCESSING_OPS
 CATBOOST_OPS = {"catboost", "catboostreg"}
 LGBM_OPS = {"lgbm", "lgbmreg"}
 FEDOT_AUTOML_OPS = {"fedot_cls", "fedot_regr", "fedot_forecast"}
+FEDOT_AUTOML_TABLE_OPERATIONS = {
+    "fedot_cls": [
+        "rf", "xgboost", "logit", "dt", "mlp", "lgbm", "catboost",
+        "scaling", "normalization", "simple_imputation", "kernel_pca",
+    ],
+    "fedot_regr": [
+        "treg", "xgbreg", "ridge", "lasso", "dtreg", "sgdr", "lgbmreg", "catboostreg",
+        "scaling", "normalization", "simple_imputation", "kernel_pca",
+    ],
+}
 N_JOBS_OPERATION_OPS = {
     "rf", "rfr", "xgboost", "xgbreg", "lgbm", "lgbmreg", "catboost", "catboostreg",
     "extra_trees", "extra_trees_reg", "isolation_forest_class", "isolation_forest_reg",
@@ -249,6 +260,9 @@ def _graph_with_runtime_model_params(
                 params.setdefault("problem", "classification")
             elif node.operation == "fedot_regr":
                 params.setdefault("problem", "regression")
+            table_operations = FEDOT_AUTOML_TABLE_OPERATIONS.get(node.operation)
+            if table_operations and "available_operations" not in params:
+                params["available_operations"] = table_operations
         node.params = params
     return adapted
 
@@ -707,6 +721,107 @@ def _apply_normalization_boundary(
     )
 
 
+def _scale_feature_matrix(
+    train_features: Any,
+    test_features: Any,
+) -> tuple[np.ndarray, np.ndarray]:
+    train_arr = _finite_float_features(train_features)
+    test_arr = _finite_float_features(test_features)
+    if train_arr.ndim < 2 or test_arr.ndim < 2:
+        raise ValueError(
+            f"Scaling boundary expects at least 2D features, got train_shape={train_arr.shape}, "
+            f"test_shape={test_arr.shape}"
+        )
+    if train_arr.ndim == 2 and test_arr.ndim == 2:
+        scaler = StandardScaler()
+        return scaler.fit_transform(train_arr), scaler.transform(test_arr)
+
+    train_shape = train_arr.shape
+    test_shape = test_arr.shape
+    scaler = StandardScaler()
+    train_flat = train_arr.reshape(train_shape[0], -1)
+    test_flat = test_arr.reshape(test_shape[0], -1)
+    return (
+        scaler.fit_transform(train_flat).reshape(train_shape),
+        scaler.transform(test_flat).reshape(test_shape),
+    )
+
+
+def _apply_scaling_boundary(
+    train_data: Any,
+    test_data: Any,
+) -> tuple[Any, Any, str]:
+    if _is_tuple_data(train_data):
+        train_features, train_target = train_data
+        test_features, test_target = test_data
+        try:
+            train_scaled, test_scaled = _scale_feature_matrix(train_features, test_features)
+        except ValueError as exc:
+            return (
+                train_data,
+                test_data,
+                f"Operation scaling was moved to the data boundary, but no feature change was applied: {exc}.",
+            )
+        return (
+            (train_scaled, train_target),
+            (test_scaled, test_target),
+            (
+                "Operation scaling was executed as a native Industrial tuple transform "
+                f"(train_shape={np.asarray(train_features).shape}, test_shape={np.asarray(test_features).shape}) "
+                "and removed from the executable initial_assumption graph."
+            ),
+        )
+
+    train_features = np.asarray(train_data.features)
+    test_features = np.asarray(test_data.features)
+    if train_features.ndim != 2 or test_features.ndim != 2:
+        return (
+            train_data,
+            test_data,
+            f"Operation scaling was moved to the data boundary, but features were not 2D "
+            f"(train_shape={train_features.shape}, test_shape={test_features.shape}); no feature change was applied.",
+        )
+
+    feature_names = _input_feature_names(train_data)
+    categorical_idx = [int(idx) for idx in _input_metadata_indices(train_data, "categorical_idx")]
+    numerical_idx = [int(idx) for idx in _input_metadata_indices(train_data, "numerical_idx")]
+    if not numerical_idx:
+        numerical_idx = [idx for idx in range(train_features.shape[1]) if idx not in set(categorical_idx)]
+    if not numerical_idx:
+        return (
+            train_data,
+            test_data,
+            "Operation scaling was moved to the data boundary, but no numerical columns were available; no feature change was applied.",
+        )
+
+    train_scaled = np.asarray(train_features, dtype=float).copy()
+    test_scaled = np.asarray(test_features, dtype=float).copy()
+    scaler = StandardScaler()
+    train_scaled[:, numerical_idx] = scaler.fit_transform(_finite_float_features(train_scaled[:, numerical_idx]))
+    test_scaled[:, numerical_idx] = scaler.transform(_finite_float_features(test_scaled[:, numerical_idx]))
+
+    return (
+        make_tabular_input_data_like(
+            train_data,
+            train_scaled,
+            feature_names=feature_names,
+            categorical_idx=categorical_idx,
+            numerical_idx=numerical_idx,
+        ),
+        make_tabular_input_data_like(
+            test_data,
+            test_scaled,
+            feature_names=feature_names,
+            categorical_idx=categorical_idx,
+            numerical_idx=numerical_idx,
+        ),
+        (
+            "Operation scaling was executed as a 2D table data-boundary transform "
+            f"(scaled_columns={len(numerical_idx)}) and removed from the executable initial_assumption graph."
+        ),
+    )
+
+
 def _apply_data_boundary_preprocessing(
     train_data: Any,
     test_data: Any,
@@ -733,6 +848,9 @@ def _apply_data_boundary_preprocessing(
                 updated_test,
                 node.get("params") or {},
             )
+            notes.append(f"Operation '{node.get('id')}' ({operation}) adapter: {note}")
+        elif operation == "scaling":
+            updated_train, updated_test, note = _apply_scaling_boundary(updated_train, updated_test)
             notes.append(f"Operation '{node.get('id')}' ({operation}) adapter: {note}")
         elif operation == "label_encoding":
             notes.append(
@@ -1278,7 +1396,7 @@ def _train_via_finetune(
         )
     if "boundary_preprocessing" in data_boundary:
         notes.append(
-            "Explicit categorical preprocessing node detected; backend used FEDOT InputData at the data boundary instead of executing the upstream encoder as a graph node."
+            "Explicit data-boundary preprocessing node detected; backend used FEDOT InputData at the data boundary instead of executing the upstream preprocessing node inside the Fedot.Industrial graph."
         )
     if patched_search_space:
         notes.append(

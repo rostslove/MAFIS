@@ -363,6 +363,8 @@ def _operation_meta(operation: str) -> str:
 
 
 def _is_industrial_native_model(operation: str) -> bool:
+    if operation in {"fedot_cls", "fedot_regr", "fedot_forecast"}:
+        return False
     if operation in {"bagging", "ensembled_featuresbagging"}:
         return False
     industrial_models = set(_repo_keys("INDUSTRIAL_CLF_AUTOML_MODEL"))
@@ -429,7 +431,7 @@ def _operation_runtime_contract(operation: str) -> Dict[str, str]:
                 "predict_for_fit output_mode handling."
             ),
         }
-    if operation in {"simple_imputation", "normalization"}:
+    if operation in {"simple_imputation", "normalization", "scaling"}:
         return {
             "runtime_family": "fedot_data_boundary_preprocessing",
             "data_contract": "table_boundary_transform",
@@ -505,6 +507,8 @@ def _operation_execution_hints(operation: str) -> Dict[str, Any]:
         hints["runtime_adapter"] = "data_boundary_simple_imputation"
     if operation == "normalization":
         hints["runtime_adapter"] = "data_boundary_normalization"
+    if operation == "scaling":
+        hints["runtime_adapter"] = "data_boundary_scaling"
     if operation == "resample":
         hints["train_only"] = True
         hints["runtime_adapter"] = "data_boundary_resampling"
