@@ -252,3 +252,4 @@ poetry run python -m py_compile ../industrial-learning-agent/backend/app.py
 - FastAPI is not used for the same reason; the backend uses Starlette directly.
 - The Docker backend mounts `./data` into `/app/data`, so files loaded by the frontend and backend
   must be visible in that shared volume.
+- Meta-ensembling methods and data-partinioning methods implementation: https://github.com/rostslove/Fedot.Industrial/tree/raf-ensembler-dev
