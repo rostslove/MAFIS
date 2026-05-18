@@ -1,99 +1,357 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-import asyncio
+import json
 import logging
-import tempfile
 import os
-from typing import Optional
+from pathlib import Path
+from typing import Any, Dict
 
-from orchestrator import run_orchestration
+import anyio
+import pandas as pd
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse, StreamingResponse
+from starlette.routing import Route
+
+from agents.base_agent import LLM_BASE_URL, LLM_MODEL
+from benchmarks import DEFAULT_BENCHMARK_ID, get_benchmark_catalog, prepare_benchmark_dataset
+from graph_engine import (
+    DEFAULT_GRAPHS,
+    FEDOT_IND_VERSION,
+    FEDOT_INDUSTRIAL_SOURCE,
+    INDUSTRIAL_GRAPH_TEMPLATES,
+    METRICS_BY_TASK,
+    OPERATIONS,
+    OPERATION_DESCRIPTIONS,
+    SUPPORTED_TASKS,
+    get_fedot_industrial_strategy_catalog,
+    get_operation_catalog,
+    get_training_strategies,
+    get_training_strategy_hints,
+)
+from orchestrator import (
+    mutate_graph_locally,
+    propose_architecture,
+    propose_revision_from_critic,
+    run_orchestration,
+    run_orchestration_stream,
+)
+from utils.path_utils import describe_missing_csv, normalize_csv_path
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="ML Architect System", version="1.0.0")
+
+AGENT_TOOLS = {
+    "architect": ["get_data_profile", "get_available_operations", "propose_graph", "mutate_graph", "visualize_graph"],
+    "engineer": ["train_graph"],
+    "critic": ["validate_graph", "get_node_importance", "explain_graph"],
+    "scribe": ["generate_report"],
+}
+
+TOOL_DESCRIPTIONS = {
+    "get_data_profile": "Profile dataset shape, target distribution and factual data issues",
+    "get_available_operations": "Return atomic graph operations allowed for a task type",
+    "propose_graph": "Validate a graph candidate and return Mermaid markup",
+    "mutate_graph": "Apply add/remove/replace/connect mutations to a graph",
+    "visualize_graph": "Render graph JSON to Mermaid markup",
+    "train_graph": "Pass the proposed graph to Fedot.Industrial as initial_assumption and finetune it under the selected industrial strategy",
+    "validate_graph": "Cross-validate a graph",
+    "get_node_importance": "Estimate node contribution by ablation",
+    "explain_graph": "Explain the last trained graph if model internals expose importances",
+    "generate_report": "Compile evaluation results into a final report summary",
+}
 
 
-class OrchestrationRequest(BaseModel):
-    csv_path: str
-    target_column: str
-    task_type: str = "classification"
-    fedot_url: str = "http://fedot-server:8000"
-    iterations: int = 2
-
-
-@app.get("/health")
-async def health():
-    """Health check endpoint"""
-    return {"status": "healthy", "service": "ml-architect-backend"}
-
-
-@app.get("/config")
-async def get_config():
-    """Get system configuration"""
-    return {
-        "agents": ["Architect", "Engineer", "Critic", "Describe"],
-        "llm_model": "llama2",
-        "ollama_host": os.getenv("OLLAMA_HOST", "http://localhost:11434"),
-        "fedot_host": os.getenv("FEDOT_HOST", "http://fedot-server:8000")
-    }
-
-
-@app.post("/orchestrate")
-async def orchestrate(request: OrchestrationRequest):    
+async def _json_body(request) -> Dict[str, Any]:
     try:
-        logger.info(f"Starting orchestration: {request.csv_path}")
-        
-        result = await run_orchestration(
-            csv_path=request.csv_path,
-            target_column=request.target_column,
-            task_type=request.task_type,
-            fedot_url=request.fedot_url,
-            iterations=request.iterations
+        data = await request.json()
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _error(message: str, status_code: int = 400) -> JSONResponse:
+    return JSONResponse({"detail": message}, status_code=status_code)
+
+
+async def health(request):
+    return JSONResponse({"status": "healthy", "service": "MAFIS"})
+
+
+async def get_config(request):
+    return JSONResponse({
+        "agents": ["Architect", "Engineer", "Critic", "Scribe"],
+        "llm_provider": "ollama-container",
+        "llm_model": LLM_MODEL,
+        "llm_base_url": LLM_BASE_URL,
+        "protocol": "MCP",
+        "transport": "local-adapter",
+        "product_name": "MultiAgentFedot.IndustrialSystem",
+        "short_name": "MAFIS",
+        "supported_tasks": SUPPORTED_TASKS,
+        "metrics_by_task": METRICS_BY_TASK,
+        "operations": OPERATIONS,
+        "operation_catalog": {task: get_operation_catalog(task) for task in SUPPORTED_TASKS},
+        "operation_descriptions": OPERATION_DESCRIPTIONS,
+        "industrial_strategies": {task: get_training_strategies(task) for task in SUPPORTED_TASKS},
+        "industrial_strategy_hints": {task: get_training_strategy_hints(task) for task in SUPPORTED_TASKS},
+        "fedot_industrial_strategy_catalog": get_fedot_industrial_strategy_catalog(),
+        "default_graphs": DEFAULT_GRAPHS,
+        "industrial_graph_templates": INDUSTRIAL_GRAPH_TEMPLATES,
+        "llm_configured": bool(os.getenv("LLM_API_KEY") or LLM_BASE_URL),
+        "fedot_ind_version": FEDOT_IND_VERSION,
+        "fedot_industrial_source": FEDOT_INDUSTRIAL_SOURCE,
+        "benchmarks": get_benchmark_catalog(),
+        "default_benchmark": DEFAULT_BENCHMARK_ID,
+    })
+
+
+async def get_tools(request):
+    return JSONResponse({
+        agent: [
+            {"name": name, "description": TOOL_DESCRIPTIONS.get(name, "")}
+            for name in names
+        ]
+        for agent, names in AGENT_TOOLS.items()
+    })
+
+
+def _payload_strategy(payload: Dict[str, Any]):
+    name = (str(payload.get("industrial_strategy") or "default").strip() or "default").lower()
+    params = payload.get("industrial_strategy_params") or {}
+    if not isinstance(params, dict):
+        params = {}
+    return name, params
+
+
+async def dataset_path_load(request):
+    payload = await _json_body(request)
+    raw_path = str(payload.get("csv_path") or payload.get("path") or "").strip()
+    if not raw_path:
+        return _error("Train CSV path is required.", 400)
+    raw_test_path = str(payload.get("test_csv_path") or payload.get("test_path") or "").strip()
+
+    csv_path = normalize_csv_path(raw_path)
+    path = Path(csv_path)
+    if not path.exists() or not path.is_file():
+        return _error(describe_missing_csv(raw_path), 404)
+    test_path = None
+    test_csv_path = ""
+    if raw_test_path:
+        test_csv_path = normalize_csv_path(raw_test_path)
+        test_path = Path(test_csv_path)
+        if not test_path.exists() or not test_path.is_file():
+            return _error(describe_missing_csv(raw_test_path), 404)
+
+    try:
+        preview_rows = min(max(int(payload.get("preview_rows", 10) or 10), 1), 50)
+        preview_cols = min(max(int(payload.get("preview_columns", 10) or 10), 1), 50)
+        header = pd.read_csv(path, nrows=0)
+        columns = [str(column) for column in header.columns]
+        if not columns:
+            return _error("CSV has no columns.", 400)
+        test_row_count = None
+        if test_path is not None:
+            test_header = pd.read_csv(test_path, nrows=0)
+            test_columns = [str(column) for column in test_header.columns]
+            if test_columns != columns:
+                missing_in_test = [column for column in columns if column not in test_columns]
+                extra_in_test = [column for column in test_columns if column not in columns]
+                detail = "Test CSV columns must match train CSV columns exactly and in the same order."
+                if missing_in_test:
+                    detail += f" Missing: {', '.join(missing_in_test[:10])}."
+                if extra_in_test:
+                    detail += f" Extra: {', '.join(extra_in_test[:10])}."
+                return _error(
+                    detail,
+                    400,
+                )
+            with test_path.open("rb") as handle:
+                test_row_count = max(sum(1 for _ in handle) - 1, 0)
+
+        shown_columns = columns[:preview_cols]
+        preview = pd.read_csv(path, usecols=shown_columns, nrows=preview_rows)
+
+        with path.open("rb") as handle:
+            row_count = max(sum(1 for _ in handle) - 1, 0)
+
+        return JSONResponse({
+            "csv_path": csv_path,
+            "test_csv_path": test_csv_path,
+            "csv_filename": path.name,
+            "test_csv_filename": test_path.name if test_path is not None else "",
+            "n_samples": row_count,
+            "n_test_samples": test_row_count,
+            "n_features": max(len(columns) - 1, 0),
+            "n_columns": len(columns),
+            "columns": columns,
+            "preview_columns": shown_columns,
+            "preview_records": preview.to_dict(orient="records"),
+            "size_mb": round(path.stat().st_size / (1024 * 1024), 2),
+        })
+    except Exception as exc:
+        logger.exception("Dataset path loading failed")
+        return _error(str(exc), 500)
+
+
+async def architect_chat(request):
+    payload = await _json_body(request)
+    strategy_name, strategy_params = _payload_strategy(payload)
+    try:
+        result = await propose_architecture(
+            csv_path=payload.get("csv_path", ""),
+            test_csv_path=payload.get("test_csv_path") or None,
+            target_column=payload.get("target_column", ""),
+            task_type=payload.get("task_type", "classification"),
+            message=payload.get("message", ""),
+            current_graph=payload.get("current_graph"),
+            forecast_length=payload.get("forecast_length"),
+            primary_metric=payload.get("primary_metric"),
+            test_size=_payload_test_size(payload),
+            industrial_strategy=strategy_name,
+            industrial_strategy_params=strategy_params,
         )
-        
-        return JSONResponse(content=result)
-    
-    except Exception as e:
-        logger.error(f"Orchestration failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        if result.get("error"):
+            return JSONResponse(result, status_code=400)
+        return JSONResponse(result)
+    except Exception as exc:
+        logger.exception("Architect chat failed")
+        return _error(str(exc), 500)
 
 
-@app.post("/orchestrate/file")
-async def orchestrate_file(
-    file: UploadFile = File(...),
-    target_column: str = None,
-    task_type: str = "classification"
-):    
-    if not target_column:
-        raise HTTPException(status_code=400, detail="target_column required")
-    
+async def architect_revise(request):
+    payload = await _json_body(request)
+    strategy_name, strategy_params = _payload_strategy(payload)
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
-            content = await file.read()
-            tmp.write(content)
-            tmp_path = tmp.name
-        
+        result = await propose_revision_from_critic(
+            csv_path=payload.get("csv_path", ""),
+            test_csv_path=payload.get("test_csv_path") or None,
+            target_column=payload.get("target_column", ""),
+            task_type=payload.get("task_type", "classification"),
+            current_graph=payload.get("current_graph") or {},
+            critic_feedback=payload.get("critic_feedback") or {},
+            message=payload.get("message", ""),
+            forecast_length=payload.get("forecast_length"),
+            primary_metric=payload.get("primary_metric"),
+            test_size=_payload_test_size(payload),
+            selected_mutations=payload.get("selected_mutations"),
+            industrial_strategy=strategy_name,
+            industrial_strategy_params=strategy_params,
+        )
+        if result.get("error"):
+            return JSONResponse(result, status_code=400)
+        return JSONResponse(result)
+    except Exception as exc:
+        logger.exception("Architect revision failed")
+        return _error(str(exc), 500)
+
+
+async def graph_mutate(request):
+    payload = await _json_body(request)
+    try:
+        result = mutate_graph_locally(payload.get("graph", {}), payload.get("mutation", {}))
+        return JSONResponse(result)
+    except Exception as exc:
+        return _error(str(exc), 400)
+
+
+def _payload_test_size(payload: Dict[str, Any]) -> float:
+    try:
+        ts = float(payload.get("test_size", 0.2))
+    except (TypeError, ValueError):
+        ts = 0.2
+    return min(max(ts, 0.05), 0.5)
+
+
+async def orchestrate(request):
+    payload = await _json_body(request)
+    strategy_name, strategy_params = _payload_strategy(payload)
+    try:
+        result = await run_orchestration(
+            csv_path=payload.get("csv_path", ""),
+            test_csv_path=payload.get("test_csv_path") or None,
+            target_column=payload.get("target_column", ""),
+            task_type=payload.get("task_type", "classification"),
+            iterations=int(payload.get("iterations", 1) or 1),
+            initial_graph=payload.get("initial_graph"),
+            forecast_length=payload.get("forecast_length"),
+            primary_metric=payload.get("primary_metric"),
+            test_size=_payload_test_size(payload),
+            industrial_strategy=strategy_name,
+            industrial_strategy_params=strategy_params,
+            previous_evaluations=payload.get("previous_evaluations") or [],
+        )
+        return JSONResponse(result)
+    except Exception as exc:
+        logger.exception("Orchestration failed")
+        return _error(str(exc), 500)
+
+
+async def benchmark_load(request):
+    payload = await _json_body(request)
+    try:
+        benchmark_id = str(payload.get("benchmark_id") or DEFAULT_BENCHMARK_ID)
+        result = await anyio.to_thread.run_sync(
+            lambda: prepare_benchmark_dataset(benchmark_id, payload)
+        )
+        return JSONResponse(result)
+    except Exception as exc:
+        logger.exception("Benchmark dataset preparation failed")
+        return _error(str(exc), 500)
+
+
+async def orchestrate_stream(request):
+    payload = await _json_body(request)
+    strategy_name, strategy_params = _payload_strategy(payload)
+
+    async def event_generator():
         try:
-            result = await run_orchestration(
-                csv_path=tmp_path,
-                target_column=target_column,
-                task_type=task_type,
-                fedot_url=os.getenv("FEDOT_HOST", "http://fedot-server:8000"),
-                iterations=2
-            )
-            
-            return JSONResponse(content=result)
-        
-        finally:
-            os.unlink(tmp_path)
-    
-    except Exception as e:
-        logger.error(f"File orchestration failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+            async for evt in run_orchestration_stream(
+                csv_path=payload.get("csv_path", ""),
+                test_csv_path=payload.get("test_csv_path") or None,
+                target_column=payload.get("target_column", ""),
+                task_type=payload.get("task_type", "classification"),
+                iterations=int(payload.get("iterations", 1) or 1),
+                initial_graph=payload.get("initial_graph"),
+                forecast_length=payload.get("forecast_length"),
+                primary_metric=payload.get("primary_metric"),
+                test_size=_payload_test_size(payload),
+                industrial_strategy=strategy_name,
+                industrial_strategy_params=strategy_params,
+                previous_evaluations=payload.get("previous_evaluations") or [],
+            ):
+                yield f"data: {json.dumps(evt, default=str, ensure_ascii=False)}\n\n"
+        except Exception as exc:
+            logger.exception("Streaming orchestration failed")
+            error = {"event": "error", "message": str(exc)}
+            yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+routes = [
+    Route("/health", health, methods=["GET"]),
+    Route("/config", get_config, methods=["GET"]),
+    Route("/tools", get_tools, methods=["GET"]),
+    Route("/datasets/path/load", dataset_path_load, methods=["POST"]),
+    Route("/architect/chat", architect_chat, methods=["POST"]),
+    Route("/architect/revise", architect_revise, methods=["POST"]),
+    Route("/graph/mutate", graph_mutate, methods=["POST"]),
+    Route("/orchestrate", orchestrate, methods=["POST"]),
+    Route("/orchestrate/stream", orchestrate_stream, methods=["POST"]),
+    Route("/benchmarks/load", benchmark_load, methods=["POST"]),
+]
+
+app = Starlette(debug=False, routes=routes)
 
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8001)
